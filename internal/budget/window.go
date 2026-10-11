@@ -1,11 +1,11 @@
 package budget
 
 import (
-	"path"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/h-a-forster/keyleash/internal/glob"
 	"github.com/h-a-forster/keyleash/internal/money"
 )
 
@@ -23,15 +23,15 @@ type charge struct {
 
 // scopeMatches reports whether a limit/concurrency scope applies to a request
 // charged against scopes for model. Explicit scopes match exactly; a
-// "model:<glob>" scope also matches when the glob matches the model. A
-// malformed glob matches everything (fail closed).
+// "model:<glob>" scope also matches when the glob matches the model (package
+// glob: '*' crosses '/', case-insensitive). A malformed glob matches
+// everything (fail closed).
 func scopeMatches(scope string, scopes []string, model string) bool {
 	if slices.Contains(scopes, scope) {
 		return true
 	}
-	if glob, ok := strings.CutPrefix(scope, ScopeModelPrefix); ok {
-		m, err := path.Match(glob, model)
-		return m || err != nil
+	if pat, ok := strings.CutPrefix(scope, ScopeModelPrefix); ok {
+		return !glob.Valid(pat) || glob.Match(pat, model)
 	}
 	return false
 }

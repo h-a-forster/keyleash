@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
 
+	"github.com/h-a-forster/keyleash/internal/money"
 	"github.com/h-a-forster/keyleash/internal/provider"
 )
 
@@ -50,13 +52,21 @@ func malformed(format string, args ...any) error {
 // InputTokensEstimate is ceil(len(body)/3), raised to the model's context
 // window when the request pulls in content the body does not contain
 // (server-side files, cached content, stored conversations, server tools),
-// plus a fixed allowance per image referenced by URL.
+// plus a fixed allowance per image referenced by URL. If the model has no
+// known context window, InputTokensEstimate is UnboundedInputTokens and the
+// request is unpriced.
 //
 // When the request multiplies its own cost (OpenAI n>1, Gemini
-// candidateCount>1, or an opted-in premium service tier / speed), Inspect
-// folds that factor into InputTokensEstimate and MaxOutputTokens (which then
-// already include any thinking budget, with ThinkingTokens set to 0), so that
-// Estimate stays a pure function of RequestInfo.
+// candidateCount>1, or a premium service tier / speed), Inspect folds that
+// factor into InputTokensEstimate and MaxOutputTokens (which then already
+// include any thinking budget, with ThinkingTokens set to 0), so that
+// Estimate stays a pure function of RequestInfo. The tier factor is the
+// model's highest unless the request names a tier (see estimateTierPct).
+//
+// Per-call tool fees for declared tools (web search, file search, Gemini
+// grounding) are added at their worst case, converted to input tokens at the
+// model's highest input rate. A declared tool whose fee cannot be priced or
+// whose call count has no cap makes InputTokensEstimate UnboundedInputTokens.
 func (m *Meter) Inspect(p *provider.Provider, ep provider.Endpoint, path string, body []byte) (RequestInfo, error) {
 	info := RequestInfo{Kind: ep.Kind}
 	if !ep.Metered || ep.Kind == provider.KindFree {
@@ -208,22 +218,199 @@ func (m *Meter) Inspect(p *provider.Provider, ep provider.Endpoint, path string,
 	info.InputTokensEstimate = satAddTokens(info.InputTokensEstimate, satMulTokens(scan.imageURLs, imageURLTokens))
 
 	pr, priced := m.lookup(p.Name, info.Model)
-	if priced && scan.serverSide && pr.MaxInputTokens > info.InputTokensEstimate {
-		info.InputTokensEstimate = pr.MaxInputTokens
+	if !priced {
+		return info, nil // Estimate will report the model unpriced
+	}
+	if scan.serverSide {
+		if pr.MaxInputTokens <= 0 {
+			// The stored/fetched content cannot be bounded: unpriced.
+			info.InputTokensEstimate = UnboundedInputTokens
+			return info, nil
+		}
+		info.InputTokensEstimate = max(info.InputTokensEstimate, pr.MaxInputTokens)
+	}
+	fee, ok, err := toolFees(ep.Kind, obj, m.Pricing.feesFor(p.Name, pr), n)
+	if err != nil {
+		return info, err
+	}
+	if !ok {
+		info.InputTokensEstimate = UnboundedInputTokens
+		return info, nil
 	}
 
-	pct := int64(100)
-	if priced && tier != "" {
-		pct = max(pr.tierPct(tier), 100) // never reduce an estimate (flex)
-	}
-	if priced && (n > 1 || pct > 100) {
+	pct := estimateTierPct(ep.Kind, tier, pr)
+	if n > 1 || pct > 100 {
 		if out, ok := m.outputCeiling(info, pr); ok {
 			info.MaxOutputTokens = scaleTokens(satMulTokens(out, n), pct)
 			info.ThinkingTokens = 0
 		}
 		info.InputTokensEstimate = scaleTokens(info.InputTokensEstimate, pct)
 	}
+	if fee > 0 {
+		info.InputTokensEstimate = satAddTokens(info.InputTokensEstimate, feeTokens(fee, pr.longRates().maxInputRate()))
+	}
+	if info.InputTokensEstimate >= UnboundedInputTokens {
+		// Saturated arithmetic is still a (huge) bound: keep it priced.
+		info.InputTokensEstimate = UnboundedInputTokens - 1
+	}
 	return info, nil
+}
+
+// UnboundedInputTokens as RequestInfo.InputTokensEstimate means the
+// request's input or per-call fees cannot be bounded before it is sent
+// (server-side context on a model without a known context window, or a
+// declared tool whose fee cannot be priced or capped). Estimate then reports
+// priced=false so the caller applies its unknown-model policy.
+const UnboundedInputTokens int64 = math.MaxInt64
+
+// estimateTierPct is the service-tier multiplier an estimate must assume.
+// A request that names a tier gets that tier's multiplier (never below
+// standard, so flex does not lower an estimate; unknown names take the
+// model's highest). A request that leaves the tier unset (or "auto") may be
+// served at a project default the request does not show (OpenAI
+// service_tier=auto; Gemini reports the tier only in a response header), so
+// it takes the model's highest multiplier. Anthropic is the exception: fast
+// mode runs only when the request sets speed="fast"
+// (https://platform.claude.com/docs/en/build-with-claude/fast-mode).
+func estimateTierPct(kind, tier string, pr Price) int64 {
+	t := strings.ToLower(strings.TrimSpace(tier))
+	if t == "" || t == "auto" {
+		if kind == provider.KindAnthropicMessages {
+			return 100
+		}
+		return pr.maxTierPct()
+	}
+	return max(pr.tierPct(t), 100)
+}
+
+// feeTokens converts a fee to the number of input tokens that cost at least
+// as much at rate, so Estimate (a function of RequestInfo only) covers it.
+func feeTokens(fee money.Micros, rate money.PerMTok) int64 {
+	if fee <= 0 {
+		return 0
+	}
+	if rate <= 0 || int64(fee) > math.MaxInt64/1_000_000 {
+		return math.MaxInt64
+	}
+	num := int64(fee) * 1_000_000
+	return num/int64(rate) + 1 // +1 covers the remainder (and is harmless without one)
+}
+
+// toolFees is the worst-case per-call fee total for the tools a request
+// declares. ok is false when a declared tool (or content that may declare
+// tools server-side) has a fee that cannot be priced or bounded; the request
+// is then unpriced.
+func toolFees(kind string, obj *jsonObject, fees Fees, n int64) (money.Micros, bool, error) {
+	var total money.Micros
+	tools, err := obj.objectArray("tools")
+	if err != nil {
+		return 0, false, err
+	}
+	switch kind {
+	case provider.KindAnthropicMessages:
+		for _, t := range tools {
+			typ, err := t.string("type")
+			if err != nil {
+				return 0, false, err
+			}
+			switch {
+			case strings.HasPrefix(typ, "web_search"):
+				uses, ok, err := t.int("max_uses")
+				if err != nil {
+					return 0, false, err
+				}
+				if !ok {
+					return 0, false, nil // no cap on searches
+				}
+				total = satAdd(total, mulMicros(fees.WebSearchRequest, uses))
+			case strings.HasPrefix(typ, "code_execution"):
+				// Billed per container-hour, not per request.
+				return 0, false, nil
+			}
+		}
+
+	case provider.KindOpenAIChat:
+		if _, ok := obj.get("web_search_options"); ok {
+			return 0, false, nil // search-model fees are not in the table
+		}
+
+	case provider.KindOpenAIResponses:
+		if _, ok := obj.get("prompt"); ok {
+			// A stored prompt can declare tools the body does not show.
+			return 0, false, nil
+		}
+		var rate money.Micros
+		feeTool := false
+		for _, t := range tools {
+			typ, err := t.string("type")
+			if err != nil {
+				return 0, false, err
+			}
+			switch {
+			case strings.HasPrefix(typ, "web_search"):
+				feeTool, rate = true, max(rate, fees.WebSearchCall)
+			case strings.HasPrefix(typ, "file_search"):
+				feeTool, rate = true, max(rate, fees.FileSearchCall)
+			case strings.HasPrefix(typ, "code_interpreter"), strings.HasPrefix(typ, "image_generation"):
+				// Container sessions and image-model tokens are billed
+				// outside the response's usage.
+				return 0, false, nil
+			case typ == "shell":
+				_, env := t.get("environment")
+				_, ctr := t.get("container")
+				if env || ctr {
+					return 0, false, nil // hosted container
+				}
+			}
+		}
+		if feeTool {
+			calls, ok, err := obj.int("max_tool_calls")
+			if err != nil {
+				return 0, false, err
+			}
+			if !ok {
+				return 0, false, nil // no cap on built-in tool calls
+			}
+			total = mulMicros(rate, calls)
+		}
+
+	case provider.KindGeminiGenerate:
+		search, maps := false, false
+		for _, t := range tools {
+			for _, k := range t.keys {
+				if _, ok := t.get(k); !ok {
+					continue
+				}
+				switch k {
+				case "googleSearch", "google_search", "googleSearchRetrieval", "google_search_retrieval":
+					search = true
+				case "googleMaps", "google_maps":
+					maps = true
+				}
+			}
+		}
+		if _, ok, err := obj.either("cachedContent", "cached_content"); err != nil {
+			return 0, false, err
+		} else if ok {
+			// Cached content can carry its own tools.
+			search, maps = true, true
+		}
+		for _, g := range []struct {
+			used          bool
+			query, prompt money.Micros
+		}{{search, fees.GoogleSearchQuery, fees.GoogleSearchPrompt}, {maps, fees.GoogleMapsQuery, fees.GoogleMapsPrompt}} {
+			if !g.used {
+				continue
+			}
+			if g.query > 0 || g.prompt <= 0 {
+				// Per-query billing has no request-side cap; no fee at
+				// all means the price is unknown.
+				return 0, false, nil
+			}
+			total = satAdd(total, mulMicros(g.prompt, n))
+		}
+	}
+	return total, true, nil
 }
 
 func (m *Meter) lookup(prov, model string) (Price, bool) {
@@ -343,6 +530,28 @@ func (o *jsonObject) either(a, b string) (json.RawMessage, bool, error) {
 		return va, true, nil
 	}
 	return vb, okb, nil
+}
+
+// objectArray returns the elements of an array of objects (nil when the key
+// is absent or null).
+func (o *jsonObject) objectArray(k string) ([]*jsonObject, error) {
+	raw, ok := o.get(k)
+	if !ok {
+		return nil, nil
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
+		return nil, malformed("%q must be an array", k)
+	}
+	out := make([]*jsonObject, 0, len(elems))
+	for _, e := range elems {
+		eo, err := parseObject(e)
+		if err != nil {
+			return nil, malformed("%q element: %v", k, err)
+		}
+		out = append(out, eo)
+	}
+	return out, nil
 }
 
 func (o *jsonObject) set(k string, v json.RawMessage) {

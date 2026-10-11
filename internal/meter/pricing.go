@@ -64,6 +64,9 @@ type Price struct {
 	ValidUntil string
 	// Note is free-form provenance (tier rules, rounding).
 	Note string
+	// Fees are model-specific per-call fees. A non-zero field overrides the
+	// provider's fee of the same name (see Pricing.feesFor).
+	Fees Fees
 }
 
 // LongContext is the higher rate set for prompts above ThresholdTokens
@@ -75,11 +78,61 @@ type LongContext struct {
 }
 
 // Fees are per-call charges that are not token based, in micro-USD per call.
+// Zero means the fee does not apply (or, on a model, that the provider's
+// fee is inherited).
 type Fees struct {
 	// WebSearchRequest is Anthropic's server-side web search charge.
 	WebSearchRequest money.Micros
 	// WebSearchCall is OpenAI's Responses API web search tool charge.
 	WebSearchCall money.Micros
+	// FileSearchCall is OpenAI's Responses API file search tool charge.
+	FileSearchCall money.Micros
+	// GoogleSearchQuery / GoogleMapsQuery are Gemini 3+ grounding charges
+	// per search query the model executes.
+	GoogleSearchQuery, GoogleMapsQuery money.Micros
+	// GoogleSearchPrompt / GoogleMapsPrompt are Gemini 2.5 grounding
+	// charges per grounded prompt (request).
+	GoogleSearchPrompt, GoogleMapsPrompt money.Micros
+}
+
+// feeNames maps the JSON fee names to their Fees field.
+var feeNames = map[string]func(*Fees) *money.Micros{
+	"web_search_request":   func(f *Fees) *money.Micros { return &f.WebSearchRequest },
+	"web_search_call":      func(f *Fees) *money.Micros { return &f.WebSearchCall },
+	"file_search_call":     func(f *Fees) *money.Micros { return &f.FileSearchCall },
+	"google_search_query":  func(f *Fees) *money.Micros { return &f.GoogleSearchQuery },
+	"google_maps_query":    func(f *Fees) *money.Micros { return &f.GoogleMapsQuery },
+	"google_search_prompt": func(f *Fees) *money.Micros { return &f.GoogleSearchPrompt },
+	"google_maps_prompt":   func(f *Fees) *money.Micros { return &f.GoogleMapsPrompt },
+}
+
+// overlay returns f with every non-zero field of o replacing f's.
+func (f Fees) overlay(o Fees) Fees {
+	for _, get := range feeNames {
+		if v := *get(&o); v != 0 {
+			*get(&f) = v
+		}
+	}
+	return f
+}
+
+func parseFees(where string, in map[string]string) (Fees, error) {
+	var f Fees
+	for k, v := range in {
+		get, ok := feeNames[k]
+		if !ok {
+			return f, fmt.Errorf("%s: unknown fee %q", where, k)
+		}
+		m, err := money.Parse(v)
+		if err != nil {
+			return f, fmt.Errorf("%s fee %q: %w", where, k, err)
+		}
+		if m < 0 {
+			return f, fmt.Errorf("%s fee %q must not be negative", where, k)
+		}
+		*get(&f) = m
+	}
+	return f, nil
 }
 
 // Pricing is an immutable pricing table. Safe for concurrent use.
@@ -199,6 +252,11 @@ func (p *Pricing) fees(provider string) Fees {
 	return Fees{}
 }
 
+// feesFor returns the provider's fees with the model's own fees on top.
+func (p *Pricing) feesFor(provider string, pr Price) Fees {
+	return p.fees(provider).overlay(pr.Fees)
+}
+
 // Models lists the exact and pattern ids priced for a provider, sorted.
 func (p *Pricing) Models(provider string) []string {
 	if p == nil {
@@ -271,6 +329,7 @@ type priceFileJSON struct {
 	Tiers              map[string]int64  `json:"tiers"`
 	RegionalPremiumPct int64             `json:"regional_premium_pct"`
 	ValidUntil         string            `json:"valid_until"`
+	Fees               map[string]string `json:"fees"`
 	SourceURL          string            `json:"source_url"`
 	AsOf               string            `json:"as_of"`
 	Note               string            `json:"note"`
@@ -342,18 +401,14 @@ func (p *Pricing) merge(over *pricingFile) error {
 }
 
 func applyProvider(pp *providerPrices, name string, pf *providerFileJSON, strict bool) error {
-	for k, v := range pf.Fees {
-		m, err := money.Parse(v)
+	if len(pf.Fees) > 0 {
+		f, err := parseFees(name, pf.Fees)
 		if err != nil {
-			return fmt.Errorf("%s fee %q: %w", name, k, err)
+			return err
 		}
-		switch k {
-		case "web_search_request":
-			pp.fees.WebSearchRequest = m
-		case "web_search_call":
-			pp.fees.WebSearchCall = m
-		default:
-			return fmt.Errorf("%s: unknown fee %q", name, k)
+		// Each listed fee replaces the previous value, "$0" included.
+		for k := range pf.Fees {
+			*feeNames[k](&pp.fees) = *feeNames[k](&f)
 		}
 	}
 	for rawID, pj := range pf.Models {
@@ -524,6 +579,9 @@ func (pj *priceFileJSON) toPrice(strict bool) (Price, error) {
 		}
 	}
 	pr.ValidUntil = pj.ValidUntil
+	if pr.Fees, err = parseFees("model", pj.Fees); err != nil {
+		return pr, err
+	}
 	pr.Source, pr.AsOf, pr.Note = pj.SourceURL, pj.AsOf, pj.Note
 	if pr.AsOf != "" {
 		if _, err := time.Parse("2006-01-02", pr.AsOf); err != nil || !dateRe.MatchString(pr.AsOf) {

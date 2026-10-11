@@ -36,6 +36,10 @@ const (
 	tagSize  = chacha20poly1305.Overhead
 	nonceLen = chacha20poly1305.NonceSizeX
 
+	x25519Size = 32
+	// maxRSABits bounds hello public keys accepted from disk.
+	maxRSABits = 16384
+
 	// KDF parameter bounds accepted from disk. They are wide on purpose so
 	// `rekey` can raise parameters, but stop a crafted file from asking for
 	// absurd memory or time during unlock.
@@ -49,6 +53,13 @@ const (
 	SlotRecovery   = "recovery"
 	SlotHello      = "hello"
 	SlotDPAPI      = "dpapi"
+)
+
+// Hello slot paddings (spec §5.2). The padding is recorded per slot and
+// covered by the header MAC.
+const (
+	PaddingOAEPSHA256 = "oaep-sha256"
+	PaddingPKCS1v15   = "pkcs1v15"
 )
 
 // Entry kinds.
@@ -103,11 +114,17 @@ type kdfV1 struct {
 }
 
 // slotV1 is one key slot. Every slot type seals the DEK with
-// XChaCha20-Poly1305 under a slot KEK and the slot AAD; the types differ in
-// how the KEK is obtained:
-//   - passphrase, recovery: KEK = Argon2id(secret, KDF.Salt, ...)
-//   - hello: KEK is random; KEKBlob = RSA-OAEP-SHA256(hello public key, KEK)
-//   - dpapi: KEK is random; KEKBlob = CryptProtectData(KEK, entropy=vault_id)
+// XChaCha20-Poly1305 under a fresh per-wrap KEK and the slot AAD. Every slot
+// can be re-wrapped to a new DEK from public, file-resident material alone
+// (no user secret, no prompt), which is what makes re-keying possible:
+//   - passphrase, recovery: Argon2id(secret, KDF) is an X25519 private
+//     scalar; Pub is its public key. Each wrap draws an ephemeral X25519 key;
+//     KEKBlob is its public key and KEK = HKDF-SHA256(X25519(eph, Pub),
+//     info "keyleash/v1/slot-kek\x00" || KEKBlob || Pub).
+//   - hello: Pub is the RSA public key (PKCS#1 DER). KEK is random and
+//     KEKBlob = RSA-<Padding>(Pub, KEK).
+//   - dpapi: KEK is random and KEKBlob = CryptProtectData(KEK,
+//     entropy = vault_id).
 type slotV1 struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
@@ -115,7 +132,9 @@ type slotV1 struct {
 	Created  string `json:"created"`
 	KDF      *kdfV1 `json:"kdf,omitempty"`
 	HelloKey string `json:"hello_key,omitempty"`
-	KEKBlob  b64    `json:"kek_blob,omitempty"`
+	Padding  string `json:"padding,omitempty"`
+	Pub      b64    `json:"pub,omitempty"`
+	KEKBlob  b64    `json:"kek_blob"`
 	Nonce    b64    `json:"nonce"`
 	Wrapped  b64    `json:"wrapped"`
 }
@@ -144,6 +163,7 @@ func (f *fileV1) clone() *fileV1 {
 			k.Salt = bytes.Clone(s.KDF.Salt)
 			ns.KDF = &k
 		}
+		ns.Pub = bytes.Clone(s.Pub)
 		ns.KEKBlob = bytes.Clone(s.KEKBlob)
 		ns.Nonce = bytes.Clone(s.Nonce)
 		ns.Wrapped = bytes.Clone(s.Wrapped)
@@ -170,7 +190,8 @@ func (f *fileV1) clone() *fileV1 {
 //	u32(len(slots)), then per slot in file order:
 //	  str(id) str(type) str(label) str(created)
 //	  u8(0) if no kdf, else u8(1) str(alg) bytes(salt) u32(t) u32(m_kib) u32(p)
-//	  str(hello_key) bytes(kek_blob) bytes(nonce) bytes(wrapped)
+//	  str(hello_key) str(padding) bytes(pub)
+//	  bytes(kek_blob) bytes(nonce) bytes(wrapped)
 //	u32(len(entries)), then per entry in file order:
 //	  str(id) str(provider) str(kind) str(label) str(created) str(rotated)
 //	  str(fingerprint) bytes(nonce) bytes(ciphertext)
@@ -202,6 +223,8 @@ func headerMACInput(f *fileV1) []byte {
 			w.u32(uint32(s.KDF.Threads))
 		}
 		w.str(s.HelloKey)
+		w.str(s.Padding)
+		w.bytes(s.Pub)
 		w.bytes(s.KEKBlob)
 		w.bytes(s.Nonce)
 		w.bytes(s.Wrapped)
@@ -332,7 +355,8 @@ func validateSlot(s *slotV1) error {
 	}
 	switch s.Type {
 	case SlotPassphrase, SlotRecovery:
-		if s.KDF == nil || s.HelloKey != "" || len(s.KEKBlob) != 0 {
+		if s.KDF == nil || s.HelloKey != "" || s.Padding != "" ||
+			len(s.Pub) != x25519Size || len(s.KEKBlob) != x25519Size {
 			return corrupt("bad %s slot fields", s.Type)
 		}
 		if err := validateKDF(s.KDF); err != nil {
@@ -345,8 +369,19 @@ func validateSlot(s *slotV1) error {
 		if !validKeyName(s.HelloKey) {
 			return corrupt("bad hello key name")
 		}
+		if s.Padding != PaddingOAEPSHA256 && s.Padding != PaddingPKCS1v15 {
+			return corrupt("bad hello padding")
+		}
+		pub, err := parseHelloPub(s.Pub)
+		if err != nil {
+			return corrupt("bad hello public key")
+		}
+		if len(s.KEKBlob) != pub.Size() {
+			return corrupt("bad hello slot fields")
+		}
 	case SlotDPAPI:
-		if s.KDF != nil || s.HelloKey != "" || len(s.KEKBlob) == 0 || len(s.KEKBlob) > 4096 {
+		if s.KDF != nil || s.HelloKey != "" || s.Padding != "" || len(s.Pub) != 0 ||
+			len(s.KEKBlob) == 0 || len(s.KEKBlob) > 4096 {
 			return corrupt("bad dpapi slot fields")
 		}
 	default:

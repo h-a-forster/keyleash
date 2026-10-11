@@ -17,6 +17,12 @@ func PrevPath(path string) string {
 	return strings.TrimSuffix(path, filepath.Ext(path)) + ".prev"
 }
 
+// SeqPath returns the anti-rollback sidecar kept next to a vault file: the
+// vault path with its extension replaced by ".seq" (spec §5.4).
+func SeqPath(path string) string {
+	return strings.TrimSuffix(path, filepath.Ext(path)) + ".seq"
+}
+
 // SecureDir creates dir if needed and restricts it to the current user (and
 // SYSTEM on Windows): DACL on Windows, mode 0700 on Unix. The daemon should
 // call it on its data directory.
@@ -66,51 +72,107 @@ func loadWithFallback(path string) (f *fileV1, fromPrev bool, err error) {
 	return pf, true, nil
 }
 
-// writeAtomic replaces path with data: write a temp file in the same
-// directory with owner-only permissions, fsync, move the current file to
-// .prev (when keepPrev), rename the temp file into place, then fsync the
-// directory where supported. A crash at any point leaves either the old
-// file, or no main file and a valid .prev, or the new file.
-func writeAtomic(path string, data []byte, keepPrev bool) (err error) {
-	dir := filepath.Dir(path)
+// writeMode selects what writeAtomic does with the .prev copy.
+type writeMode int
+
+const (
+	// writeKeepPrev moves the current main file to .prev (normal writes).
+	writeKeepPrev writeMode = iota
+	// writeNoPrev replaces the main file and leaves .prev alone (used when
+	// the main file is corrupt and the state was loaded from .prev).
+	writeNoPrev
+	// writeRekey replaces the main file and then replaces .prev with a copy
+	// of the new state, so no file left by this write holds the old DEK.
+	writeRekey
+)
+
+// errPrevNotScrubbed is returned by writeAtomic in writeRekey mode when the
+// main file was replaced but .prev could not be replaced or removed. The new
+// state is committed.
+var errPrevNotScrubbed = errors.New("vault: previous-version file not replaced")
+
+// writeTemp writes data to a new owner-only temp file in dir and fsyncs it.
+func writeTemp(dir string, data []byte) (name string, err error) {
 	tmp, err := os.CreateTemp(dir, ".keyleash-vault-*.tmp")
 	if err != nil {
-		return fmt.Errorf("vault: create temp file: %w", err)
+		return "", fmt.Errorf("vault: create temp file: %w", err)
 	}
-	tmpName := tmp.Name()
+	name = tmp.Name()
 	defer func() {
 		if err != nil {
 			_ = tmp.Close()
-			_ = os.Remove(tmpName)
+			_ = os.Remove(name)
 		}
 	}()
-	if err = restrictPath(tmpName, false); err != nil {
-		return fmt.Errorf("vault: restrict temp file: %w", err)
+	if err = restrictPath(name, false); err != nil {
+		return "", fmt.Errorf("vault: restrict temp file: %w", err)
 	}
 	if _, err = tmp.Write(data); err != nil {
-		return fmt.Errorf("vault: write: %w", err)
+		return "", fmt.Errorf("vault: write: %w", err)
 	}
 	if err = tmp.Sync(); err != nil {
-		return fmt.Errorf("vault: fsync: %w", err)
+		return "", fmt.Errorf("vault: fsync: %w", err)
 	}
 	if err = tmp.Close(); err != nil {
-		return fmt.Errorf("vault: close: %w", err)
+		return "", fmt.Errorf("vault: close: %w", err)
 	}
-	if keepPrev {
+	return name, nil
+}
+
+// writeAtomic replaces path with data: write a temp file in the same
+// directory with owner-only permissions, fsync, handle .prev according to
+// mode, rename the temp file into place, then fsync the directory where
+// supported. A crash at any point leaves either the old file, or no main
+// file and a valid .prev, or the new file.
+//
+// In writeRekey mode a second temp copy is written before the main rename
+// and renamed over .prev right after it, so the window in which .prev still
+// holds the pre-re-key state is a single rename. If that last step fails,
+// .prev is removed; if removal also fails, errPrevNotScrubbed is returned
+// even though the main file now holds the new state. Removed files may
+// persist on disk sectors; that is outside what the vault can control.
+func writeAtomic(path string, data []byte, mode writeMode) error {
+	dir := filepath.Dir(path)
+	tmpName, err := writeTemp(dir, data)
+	if err != nil {
+		return err
+	}
+	var prevTmp string
+	switch mode {
+	case writeKeepPrev:
 		if _, serr := os.Lstat(path); serr == nil {
-			if err = os.Rename(path, PrevPath(path)); err != nil {
+			if err := os.Rename(path, PrevPath(path)); err != nil {
+				_ = os.Remove(tmpName)
 				return fmt.Errorf("vault: keep previous version: %w", err)
 			}
 		} else if !errors.Is(serr, fs.ErrNotExist) {
-			err = fmt.Errorf("vault: stat: %w", serr)
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("vault: stat: %w", serr)
+		}
+	case writeRekey:
+		if prevTmp, err = writeTemp(dir, data); err != nil {
+			_ = os.Remove(tmpName)
 			return err
 		}
 	}
-	if err = os.Rename(tmpName, path); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		if prevTmp != "" {
+			_ = os.Remove(prevTmp)
+		}
 		return fmt.Errorf("vault: replace: %w", err)
+	}
+	var scrubErr error
+	if prevTmp != "" {
+		if err := os.Rename(prevTmp, PrevPath(path)); err != nil {
+			_ = os.Remove(prevTmp)
+			if rerr := os.Remove(PrevPath(path)); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+				scrubErr = errPrevNotScrubbed
+			}
+		}
 	}
 	// The rename has happened; making the directory entry durable is best
 	// effort and its failure does not undo the write.
 	_ = syncDir(dir)
-	return nil
+	return scrubErr
 }

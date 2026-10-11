@@ -119,7 +119,8 @@ func TestEstimate(t *testing.T) {
 		priced bool
 	}{
 		{"unpriced model", "openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "nope", MaxOutputTokens: 1}, 0, false},
-		{"no ceiling at all", "openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-5.2-pro", InputTokensEstimate: 10}, 0, false},
+		{"no ceiling at all", "openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-4o-2024-05-13", InputTokensEstimate: 10}, 0, false},
+		{"unbounded input", "openai", RequestInfo{Kind: provider.KindOpenAIResponses, Model: "gpt-5", InputTokensEstimate: UnboundedInputTokens, MaxOutputTokens: 10}, 0, false},
 		// Opus 5.5: input at the 1h write rate $8, output $20, +10% regional.
 		{"anthropic", "anthropic", RequestInfo{Kind: provider.KindAnthropicMessages, Model: "claude-opus-5-5", InputTokensEstimate: 1000, MaxOutputTokens: 1000}, 30_809, true}, // (28000+8 rounding allowance)*110%
 		// Interleaved thinking budget above max_tokens bounds output.
@@ -131,7 +132,7 @@ func TestEstimate(t *testing.T) {
 		// Gemini adds an explicit thinking budget; embeddings have no output.
 		{"gemini thinking", "gemini", RequestInfo{Kind: provider.KindGeminiGenerate, Model: "gemini-2.5-flash", MaxOutputTokens: 100, ThinkingTokens: 100}, 510, true}, // +8, +2 per modality rate
 		{"gemini embed uses top modality", "gemini", RequestInfo{Kind: provider.KindGeminiEmbed, Model: "gemini-embedding-2", InputTokensEstimate: 1000}, 12_014, true},
-		{"huge request saturates", "openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-5.4-pro", InputTokensEstimate: math.MaxInt64, MaxOutputTokens: math.MaxInt64}, maxMicros, true},
+		{"huge request saturates", "openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-5.4-pro", InputTokensEstimate: UnboundedInputTokens - 1, MaxOutputTokens: math.MaxInt64}, maxMicros, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -142,7 +143,7 @@ func TestEstimate(t *testing.T) {
 		})
 	}
 	m.AssumeMaxOutputTokens = 10
-	if got, ok := m.Estimate("openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-5.2-pro"}); !ok || got != tokCost(168_000_000, 10)+roundingAllowance {
+	if got, ok := m.Estimate("openai", RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-4o-2024-05-13"}); !ok || got != tokCost(15_000_000, 10)+roundingAllowance {
 		t.Fatalf("policy ceiling: %d %v", got, ok)
 	}
 	var nilM *Meter

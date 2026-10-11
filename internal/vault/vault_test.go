@@ -859,8 +859,17 @@ func TestCrashRecovery(t *testing.T) {
 		if !v2.RecoveredFromPrev() || v2.Seq() != 2 {
 			t.Fatalf("recovered=%v seq=%d", v2.RecoveredFromPrev(), v2.Seq())
 		}
+		// The sidecar knows seq 3 was written: .prev is a rollback.
+		if err := v2.UnlockPassphrase(testPass); !errors.Is(err, ErrRollback) || v2.IsUnlocked() {
+			t.Fatalf("unlock of .prev with newer sidecar = %v", err)
+		}
+		v2.AcceptRollback()
 		if err := v2.UnlockPassphrase(testPass); err != nil {
 			t.Fatal(err)
+		}
+		// Accepting rewrites the state above the recorded seq.
+		if v2.RecoveredFromPrev() || v2.Seq() != 4 {
+			t.Fatalf("after accept: recovered=%v seq=%d", v2.RecoveredFromPrev(), v2.Seq())
 		}
 		if string(mustSecret(t, v2, a.ID)) != "secret-a" {
 			t.Fatal("secret mismatch")
@@ -872,18 +881,18 @@ func TestCrashRecovery(t *testing.T) {
 		if _, err := v2.AddEntry("gemini", KindAPIKey, "c", []byte("secret-c")); err != nil {
 			t.Fatal(err)
 		}
-		if v2.RecoveredFromPrev() || v2.Seq() != 3 {
+		if v2.RecoveredFromPrev() || v2.Seq() != 5 {
 			t.Fatal("state after repair")
 		}
-		if f, err := readFile(path); err != nil || f.Seq != 3 {
+		if f, err := readFile(path); err != nil || f.Seq != 5 {
 			t.Fatalf("main after repair: %v", err)
 		}
-		if f, err := readFile(PrevPath(path)); err != nil || f.Seq != 2 {
+		if f, err := readFile(PrevPath(path)); err != nil || f.Seq != 4 {
 			t.Fatalf("prev after repair: %v", err)
 		}
 	})
 
-	t.Run("main missing", func(t *testing.T) {
+	t.Run("main missing after newer write", func(t *testing.T) {
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)
 		}
@@ -891,8 +900,28 @@ func TestCrashRecovery(t *testing.T) {
 		if err != nil || !v3.RecoveredFromPrev() {
 			t.Fatalf("Open: %v", err)
 		}
-		if err := v3.UnlockPassphrase(testPass); err != nil {
+		if err := v3.UnlockPassphrase(testPass); !errors.Is(err, ErrRollback) {
+			t.Fatalf("unlock = %v", err)
+		}
+	})
+
+	t.Run("crash between renames", func(t *testing.T) {
+		// writeAtomic moved main to .prev, then crashed before renaming the
+		// new file into place; the sidecar still records the .prev seq.
+		v, path, _ := newTestVault(t)
+		if _, err := v.AddEntry("anthropic", KindAPIKey, "a", []byte("x")); err != nil {
 			t.Fatal(err)
+		}
+		v.Lock()
+		if err := os.Rename(path, PrevPath(path)); err != nil {
+			t.Fatal(err)
+		}
+		v2, err := Open(path)
+		if err != nil || !v2.RecoveredFromPrev() || v2.Seq() != 2 {
+			t.Fatalf("Open: %v", err)
+		}
+		if err := v2.UnlockPassphrase(testPass); err != nil {
+			t.Fatalf("unlock = %v", err)
 		}
 	})
 

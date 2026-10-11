@@ -189,11 +189,15 @@ func satAddTokens(a, b int64) int64 {
 // modality, cache write), output at the output ceiling (declared max, else
 // the model's ceiling, else AssumeMaxOutputTokens) plus any thinking budget
 // not already inside it, and the regional premium where a model has one.
-// Service-tier premiums the request opts into are already folded into info by
-// Inspect. priced is false when the model has no price or no output ceiling
-// can be determined; the caller must then apply its unknown-model policy.
+// Service-tier premiums and tool fees are already folded into info by
+// Inspect. priced is false when the model has no price, no output ceiling
+// can be determined, or InputTokensEstimate is UnboundedInputTokens; the
+// caller must then apply its unknown-model policy.
 func (m *Meter) Estimate(provider string, info RequestInfo) (cost money.Micros, priced bool) {
 	if m == nil || m.Pricing == nil {
+		return 0, false
+	}
+	if info.InputTokensEstimate >= UnboundedInputTokens {
 		return 0, false
 	}
 	pr, ok := m.Pricing.Lookup(provider, info.Model)
@@ -288,6 +292,18 @@ type usageDetail struct {
 	// webSearchRequests (Anthropic) and webSearchCalls (OpenAI) are billable
 	// tool invocations.
 	webSearchRequests, webSearchCalls int64
+	// fileSearchCalls are OpenAI file_search tool calls.
+	fileSearchCalls int64
+	// Gemini grounding, resolved against the model's fees by the parser:
+	// search queries (Gemini 3+ bills per query) and grounded prompts
+	// (Gemini 2.5 bills per prompt).
+	searchQueries, searchPrompts, mapsPrompts int64
+}
+
+// hasFees reports whether d carries any per-call tool charges.
+func (d usageDetail) hasFees() bool {
+	return d.webSearchRequests > 0 || d.webSearchCalls > 0 || d.fileSearchCalls > 0 ||
+		d.searchQueries > 0 || d.searchPrompts > 0 || d.mapsPrompts > 0
 }
 
 // needsDetailPricing reports whether d carries facts Cost(Usage) cannot see.
@@ -295,7 +311,7 @@ func (d usageDetail) needsDetailPricing(pr Price) bool {
 	if pr.tierPct(d.tier) != 100 || (d.regional && pr.RegionalPremiumPct > 0) {
 		return true
 	}
-	if d.webSearchRequests > 0 || d.webSearchCalls > 0 {
+	if d.hasFees() {
 		return true
 	}
 	if d.split5m && d.cacheWrite5m > 0 && pr.CacheWrite5m > 0 && pr.CacheWrite5m != pr.CacheWrite {
@@ -354,6 +370,10 @@ func priceUsage(pr Price, d usageDetail, fees Fees) money.Micros {
 	if d.webSearchCalls > 0 {
 		total = satAdd(total, mulMicros(fees.WebSearchCall, d.webSearchCalls))
 	}
+	total = satAdd(total, mulMicros(fees.FileSearchCall, d.fileSearchCalls))
+	total = satAdd(total, mulMicros(fees.GoogleSearchQuery, d.searchQueries))
+	total = satAdd(total, mulMicros(fees.GoogleSearchPrompt, d.searchPrompts))
+	total = satAdd(total, mulMicros(fees.GoogleMapsPrompt, d.mapsPrompts))
 	return total
 }
 

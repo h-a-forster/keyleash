@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -50,14 +51,26 @@ const (
 	uoiName              = 2
 )
 
-type osSource struct{}
-
-// NewOSSource returns the Windows presence source:
+// OSSource is the Windows presence Source returned by NewOSSource and
+// NewOSSourceWithOptions.
 //
-//   - IdleFor: GetLastInputInfo compared with the low 32 bits of
-//     GetTickCount64, subtracted modulo 2^32 so the 49.7-day tick wrap is
-//     handled (idle spans longer than 49.7 days are not representable).
-//     The value is session-wide input, not per-process.
+//   - IdleFor (default, CountInjected=false): time since the last PHYSICAL
+//     keyboard/mouse event, observed with low-level hooks (WH_KEYBOARD_LL,
+//     WH_MOUSE_LL) on a dedicated thread. Events flagged LLKHF_INJECTED /
+//     LLMHF_INJECTED (or the lower-integrity injected bits) are ignored, so
+//     an automation or computer-use agent driving the desktop with
+//     SendInput does not keep the owner "present". The baseline is taken
+//     from GetLastInputInfo at start, so a freshly started daemon is not
+//     instantly idle. The result is never less than the GetLastInputInfo
+//     idle time. If the hooks stop delivering events (Windows silently
+//     removes a low-level hook whose callback times out, or after Close),
+//     idle time only grows: the failure mode is Away, never present.
+//     Remote-desktop tools that inject input (Parsec, Sunshine, some VNC
+//     servers) look idle in this mode; set CountInjected for them. RDP
+//     input is typically delivered as physical input and is counted.
+//   - IdleFor (CountInjected=true, or Degraded): GetLastInputInfo compared
+//     with the low 32 bits of GetTickCount64, subtracted modulo 2^32 so the
+//     49.7-day tick wrap is handled. This counts injected input.
 //   - ScreenLocked: WTSQuerySessionInformation(WTSSessionInfoEx) lock flag
 //     for the caller's session (a disconnected session counts as locked).
 //     If that is unavailable or reports "unknown", it falls back to
@@ -67,9 +80,116 @@ type osSource struct{}
 //
 // The daemon must run in the user's interactive session; in session 0
 // (a service) these signals are meaningless.
-func NewOSSource() Source { return osSource{} }
+type OSSource struct {
+	countInjected  bool
+	hooks          *inputHooks // nil when countInjected or degraded
+	degradedReason string
+	closed         atomic.Bool
+}
 
-func (osSource) IdleFor() (time.Duration, error) {
+// Options configures NewOSSourceWithOptions.
+type Options struct {
+	// CountInjected makes injected (synthetic) input count as presence,
+	// using GetLastInputInfo instead of low-level hooks. Needed when the
+	// owner works through a remote-desktop tool that injects input.
+	CountInjected bool
+}
+
+// NewOSSource returns the default Windows presence source
+// (CountInjected=false). If even GetLastInputInfo is unavailable, the
+// returned Source fails every IdleFor call, which the Monitor treats as
+// idle (fail closed).
+func NewOSSource() Source {
+	s, err := NewOSSourceWithOptions(Options{})
+	if err != nil {
+		return errSource{err}
+	}
+	return s
+}
+
+// NewOSSourceWithOptions returns an *OSSource (see its doc). With
+// CountInjected false it installs low-level input hooks; if they cannot be
+// installed it falls back to GetLastInputInfo and Degraded reports true
+// with a reason. It returns an error only when GetLastInputInfo itself is
+// unusable. Call Close on the returned *OSSource to remove the hooks.
+func NewOSSourceWithOptions(opts Options) (Source, error) {
+	s := &OSSource{countInjected: opts.CountInjected}
+	gli, err := gliIdle()
+	if err != nil {
+		return nil, err
+	}
+	if opts.CountInjected {
+		return s, nil
+	}
+	// Baseline before the hooks exist: a fresh daemon is not instantly idle.
+	notePhysical(tickCount64() - gli.Milliseconds())
+	h, err := startInputHooks()
+	if err != nil {
+		s.degradedReason = "low-level input hooks unavailable, injected input counts as presence: " + err.Error()
+		return s, nil
+	}
+	s.hooks = h
+	return s, nil
+}
+
+// Degraded reports whether physical-input detection was requested but is
+// unavailable, so IdleFor falls back to GetLastInputInfo (which counts
+// injected input).
+func (s *OSSource) Degraded() bool { return s.degradedReason != "" }
+
+// DegradedReason explains Degraded; empty when not degraded.
+func (s *OSSource) DegradedReason() string { return s.degradedReason }
+
+// Close removes the input hooks and stops their thread. Afterwards IdleFor
+// returns an error (treated as idle). Safe to call more than once.
+func (s *OSSource) Close() error {
+	s.closed.Store(true)
+	if s.hooks != nil {
+		return s.hooks.close()
+	}
+	return nil
+}
+
+func (s *OSSource) IdleFor() (time.Duration, error) {
+	if s.closed.Load() {
+		return 0, errHooksClosed
+	}
+	gli, err := gliIdle()
+	if err != nil {
+		return 0, err
+	}
+	if s.hooks == nil {
+		return gli, nil
+	}
+	// If the hook thread has died, lastPhysicalTick stops advancing and
+	// the reported idle time keeps growing (fail closed).
+	return physicalIdle(tickCount64(), lastPhysicalTick.Load(), gli), nil
+}
+
+// physicalIdle is the idle time from the last hook-observed physical input
+// tick, never less than the GetLastInputInfo idle time.
+func physicalIdle(now, lastPhysical int64, gli time.Duration) time.Duration {
+	d := time.Duration(0)
+	if now > lastPhysical {
+		d = time.Duration(now-lastPhysical) * time.Millisecond
+	}
+	if gli > d {
+		d = gli
+	}
+	return d
+}
+
+func (s *OSSource) ScreenLocked() (bool, error) { return screenLocked() }
+
+// errSource fails every call; used when the OS source cannot be built.
+type errSource struct{ err error }
+
+func (e errSource) IdleFor() (time.Duration, error) { return 0, e.err }
+func (e errSource) ScreenLocked() (bool, error)     { return screenLocked() }
+
+// gliIdle returns the session-wide idle time from GetLastInputInfo
+// (counts injected input).
+func gliIdle() (time.Duration, error) {
 	if err := procGetLastInputInfo.Find(); err != nil {
 		return 0, fmt.Errorf("presence: GetLastInputInfo unavailable: %w", err)
 	}
@@ -96,7 +216,7 @@ func idleFromTicks(now64 uint64, last32 uint32) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-func (osSource) ScreenLocked() (bool, error) {
+func screenLocked() (bool, error) {
 	locked, known, wtsErr := wtsLocked()
 	if wtsErr == nil && known {
 		return locked, nil

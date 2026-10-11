@@ -13,10 +13,10 @@ package budget
 import (
 	"errors"
 	"fmt"
-	"path"
 	"strings"
 	"time"
 
+	"github.com/h-a-forster/keyleash/internal/glob"
 	"github.com/h-a-forster/keyleash/internal/money"
 )
 
@@ -56,20 +56,35 @@ func (w Window) rolling() time.Duration {
 	return 0
 }
 
-// Scope prefixes. A scope is "global" or one of these prefixes followed by a
-// non-empty name; "model:" is followed by a path.Match glob.
+// Scopes. A scope is one of the bare scopes "global" or "away", or one of the
+// prefixes below followed by a non-empty name:
+//
+//	global            every request (always added by Reserve)
+//	away              the daemon's away mode (spec §8); reset with ResetSession
+//	provider:<name>   one upstream provider
+//	pass:<id>         one pass
+//	session:<id>      one unlock session
+//	grant:<id>        one unattended grant (spec §8); reset with ResetSession
+//	away:<name>       a named away-mode bucket (e.g. per pass)
+//	model:<glob>      models matching a glob (see package glob: '*' matches
+//	                  any run including '/', case-insensitive)
+//
+// Only model scopes match implicitly (by Meta.Model); every other scope
+// applies to a reservation only when the caller passes it to Reserve.
 const (
 	ScopeGlobal         = "global"
+	ScopeAway           = "away"
 	ScopeProviderPrefix = "provider:"
 	ScopePassPrefix     = "pass:"
 	ScopeSessionPrefix  = "session:"
+	ScopeGrantPrefix    = "grant:"
+	ScopeAwayPrefix     = "away:"
 	ScopeModelPrefix    = "model:"
 )
 
 // Limit caps spend for one scope over one window.
 type Limit struct {
-	// Scope is "global", "provider:<name>", "pass:<id>", "session:<id>" or
-	// "model:<glob>".
+	// Scope is any scope accepted by ValidateScope.
 	Scope string
 	// Window is the period the limit is measured over.
 	Window Window
@@ -94,20 +109,20 @@ func (l Limit) Validate() error {
 	return nil
 }
 
-// ValidateScope checks a scope string's syntax.
+// ValidateScope checks a scope string's syntax (see the Scope constants).
+// A model scope must hold a glob.Valid pattern.
 func ValidateScope(s string) error {
-	if s == ScopeGlobal {
+	if s == ScopeGlobal || s == ScopeAway {
 		return nil
 	}
-	for _, p := range []string{ScopeProviderPrefix, ScopePassPrefix, ScopeSessionPrefix, ScopeModelPrefix} {
+	for _, p := range []string{ScopeProviderPrefix, ScopePassPrefix, ScopeSessionPrefix,
+		ScopeGrantPrefix, ScopeAwayPrefix, ScopeModelPrefix} {
 		if rest, ok := strings.CutPrefix(s, p); ok {
 			if rest == "" {
 				return fmt.Errorf("budget: scope %q has an empty name", s)
 			}
-			if p == ScopeModelPrefix {
-				if _, err := path.Match(rest, ""); err != nil {
-					return fmt.Errorf("budget: scope %q: bad model glob", s)
-				}
+			if p == ScopeModelPrefix && !glob.Valid(rest) {
+				return fmt.Errorf("budget: scope %q: bad model glob", s)
 			}
 			return nil
 		}

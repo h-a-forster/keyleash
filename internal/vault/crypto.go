@@ -162,7 +162,8 @@ func fingerprint(dek, secret []byte) (string, error) {
 	return hex.EncodeToString(m.Sum(nil)[:8]), nil
 }
 
-// argon2KEK derives a slot KEK with the slot's stored parameters.
+// argon2KEK derives Argon2id(secret) with the slot's stored parameters: the
+// X25519 private scalar of a passphrase or recovery slot (see slotV1).
 func argon2KEK(secret []byte, k *kdfV1) (*secmem.Buffer, error) {
 	if err := validateKDF(k); err != nil {
 		return nil, err
@@ -177,7 +178,7 @@ func argon2KEK(secret []byte, k *kdfV1) (*secmem.Buffer, error) {
 	return buf, nil
 }
 
-// newKDF picks parameters for a new slot and derives its KEK. Starting from
+// newKDF picks parameters for a new slot and derives its Argon2id output. Starting from
 // kdfDefaults, it raises Time when one derivation is faster than kdfTarget.
 func newKDF(secret []byte) (*kdfV1, *secmem.Buffer, error) {
 	salt, err := randBytes(saltSize)

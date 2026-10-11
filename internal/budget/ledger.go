@@ -1,11 +1,13 @@
 package budget
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,6 +63,7 @@ type Ledger struct {
 	closed     bool
 	persistErr error
 	w          *writer
+	tornAtOpen int // torn final lines cut by Open; read-only afterwards
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -70,12 +73,13 @@ type Ledger struct {
 // Reservation is an amount held against limits while a request is in flight.
 // Exactly one of Settle or Release should be called.
 type Reservation struct {
-	l      *Ledger
-	id     string
-	scopes []string
-	meta   Meta
-	amount money.Micros
-	done   bool // guarded by l.mu
+	l       *Ledger
+	id      string
+	scopes  []string
+	meta    Meta
+	amount  money.Micros
+	created time.Time // set under l.mu when the reservation is taken
+	done    bool      // guarded by l.mu
 }
 
 // ID is the reservation's record id (Meta.RequestID or a random id).
@@ -86,8 +90,9 @@ func (r *Reservation) Amount() money.Micros { return r.amount }
 
 // Open loads the ledger in opts.Dir, replaying the current month's file (and
 // the last day of the previous month's) to rebuild windows. A truncated final
-// line (crash mid-write) is discarded and cut from the file; any other
-// corruption is an error.
+// line (crash mid-write) is discarded and cut from the file (and counted by
+// VerifyIntegrity); any other corruption is an error. Open does not verify
+// the hash chain: call VerifyIntegrity once the MAC key is available.
 func Open(opts Options) (*Ledger, error) {
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: ledger dir is required", ErrInvalid)
@@ -114,12 +119,17 @@ func Open(opts Options) (*Ledger, error) {
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
-	hist, err := replay(opts.Dir, opts.Clock.Now(), opts.Location)
+	hist, torn, err := replay(opts.Dir, opts.Clock.Now(), opts.Location)
+	if err != nil {
+		return nil, err
+	}
+	head, torn2, err := chainHead(opts.Dir)
 	if err != nil {
 		return nil, err
 	}
 	l.hist = hist
-	l.w = newWriter(opts.Dir)
+	l.tornAtOpen = torn + torn2
+	l.w = newWriter(opts.Dir, head)
 	go l.flusher(opts.FlushInterval)
 	return l, nil
 }
@@ -280,6 +290,7 @@ func (l *Ledger) Reserve(scopes []string, amount money.Micros, meta Meta) (*Rese
 				return ErrTripped
 			}
 		}
+		r.created = now
 		l.active[r] = struct{}{}
 		return nil
 	}()
@@ -446,9 +457,11 @@ func (l *Ledger) Status() []LimitStatus {
 	return out
 }
 
-// ResetSession starts a new session window for sessionScope (e.g. "global" or
-// "session:<id>" on unlock): session limits on that exact scope count only
-// spend settled from now on.
+// ResetSession starts a new session window for sessionScope: session limits
+// on exactly that scope count only spend settled from now on. It accepts any
+// scope string, e.g. "global" or "session:<id>" on unlock, "away" on entering
+// Away (away limits are session-window limits on "away"), "grant:<id>" when an
+// unattended grant starts. In-flight reservations still count.
 func (l *Ledger) ResetSession(sessionScope string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -483,25 +496,109 @@ func (l *Ledger) ResetTrip() {
 func (l *Ledger) Flush() error {
 	l.w.mu.Lock()
 	defer l.w.mu.Unlock()
+	return l.flushWLocked()
+}
+
+// flushWLocked is Flush with l.w.mu held.
+func (l *Ledger) flushWLocked() error {
 	l.mu.Lock()
 	batch := l.w.take()
 	l.mu.Unlock()
-	if err := l.w.writeLocked(batch); err != nil {
+	if len(batch) == 0 && !l.w.unsynced {
+		return nil
+	}
+	n, err := l.w.writeLocked(batch)
+	if err != nil {
 		l.mu.Lock()
-		l.w.putBack(batch)
+		l.w.putBack(batch[n:])
 		if l.persistErr == nil {
 			l.persistErr = err
 		}
 		l.mu.Unlock()
 		return err
 	}
-	if len(batch) > 0 {
-		// Everything that failed earlier was put back and is now on disk.
-		l.mu.Lock()
-		l.persistErr = nil
-		l.mu.Unlock()
-	}
+	// Everything that failed earlier was put back (or re-synced) and is now
+	// on disk.
+	l.mu.Lock()
+	l.persistErr = nil
+	l.mu.Unlock()
 	return nil
+}
+
+// SetMACKey makes every record enqueued from now on carry
+// mac = HMAC-SHA256(key, SHA-256(record body)); see VerifyIntegrity. The key
+// is copied; an empty key stops adding macs. The daemon calls it after
+// unlock with a key derived from the vault key, before serving requests.
+func (l *Ledger) SetMACKey(key []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	clear(l.w.macKey)
+	l.w.macKey = nil
+	if len(key) > 0 {
+		l.w.macKey = slices.Clone(key)
+	}
+}
+
+// InFlightInfo describes one in-flight reservation. Meta never holds secrets.
+type InFlightInfo struct {
+	ID     string
+	Scopes []string
+	Amount money.Micros
+	Age    time.Duration
+	Meta   Meta
+}
+
+// InFlight lists in-flight reservations, oldest first, so the daemon can
+// surface stuck ones (and expire them with ExpireInFlight).
+func (l *Ledger) InFlight() []InFlightInfo {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.clock.Now()
+	out := make([]InFlightInfo, 0, len(l.active))
+	for r := range l.active {
+		out = append(out, InFlightInfo{ID: r.id, Scopes: slices.Clone(r.scopes), Amount: r.amount,
+			Age: max(0, now.Sub(r.created)), Meta: r.meta})
+	}
+	slices.SortFunc(out, func(a, b InFlightInfo) int {
+		if a.Age != b.Age {
+			return cmp.Compare(b.Age, a.Age)
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return out
+}
+
+// ExpireInFlight settles every reservation older than maxAge at its reserved
+// amount, marked estimated (fail closed: the request may have reached
+// upstream). The holder's later Settle returns ErrAlreadySettled and its
+// actual cost is not recorded. It returns how many were expired; the error
+// is the first non-ErrAlreadySettled settle error (e.g. ErrClosed).
+func (l *Ledger) ExpireInFlight(maxAge time.Duration) (int, error) {
+	l.mu.Lock()
+	now := l.clock.Now()
+	var stale []*Reservation
+	for r := range l.active {
+		if now.Sub(r.created) > maxAge {
+			stale = append(stale, r)
+		}
+	}
+	l.mu.Unlock()
+	slices.SortFunc(stale, func(a, b *Reservation) int { return a.created.Compare(b.created) })
+	n := 0
+	var first error
+	for _, r := range stale {
+		switch err := r.Settle(r.amount, true); {
+		case err == nil:
+			n++
+		case errors.Is(err, ErrAlreadySettled):
+		default:
+			n++ // charged in memory even when it could not be written
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	return n, first
 }
 
 // Close stops the background flusher, flushes pending records and closes the
@@ -514,8 +611,12 @@ func (l *Ledger) Close() error {
 	<-l.done
 	err := l.Flush()
 	l.w.mu.Lock()
-	cerr := l.w.closeLocked()
+	cerr := l.w.closeLocked(true)
 	l.w.mu.Unlock()
+	l.mu.Lock()
+	clear(l.w.macKey)
+	l.w.macKey = nil
+	l.mu.Unlock()
 	return errors.Join(err, cerr)
 }
 

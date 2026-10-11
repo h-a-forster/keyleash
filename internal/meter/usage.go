@@ -100,6 +100,11 @@ type usageParser struct {
 	finished   bool // gemini: a candidate reported finishReason
 	usageFinal bool // gemini: usage seen at/after the finishing chunk
 	headerTier string
+	// unpricedTool is set when the response shows a tool whose charge is
+	// not in the usage and cannot be priced: Final then reports ok=false.
+	unpricedTool bool
+	// ground is Gemini grounding seen per candidate index.
+	ground map[int]*geminiGround
 }
 
 // ObserveResponseHeader implements HeaderObserver.
@@ -324,11 +329,11 @@ type anthUsage struct {
 		Ephemeral5m *int64 `json:"ephemeral_5m_input_tokens"`
 		Ephemeral1h *int64 `json:"ephemeral_1h_input_tokens"`
 	} `json:"cache_creation"`
-	ServerToolUse *struct {
-		WebSearchRequests *int64 `json:"web_search_requests"`
-	} `json:"server_tool_use"`
-	Speed        *string `json:"speed"`
-	InferenceGeo *string `json:"inference_geo"`
+	// ServerToolUse counts server tool invocations by name
+	// ("web_search_requests", "code_execution_requests", ...).
+	ServerToolUse map[string]json.RawMessage `json:"server_tool_use"`
+	Speed         *string                    `json:"speed"`
+	InferenceGeo  *string                    `json:"inference_geo"`
 }
 
 type anthEnvelope struct {
@@ -363,14 +368,16 @@ type oaiUsage struct {
 }
 
 type oaiResponseObj struct {
-	Object      string    `json:"object"`
-	Model       string    `json:"model"`
-	ServiceTier string    `json:"service_tier"`
-	Status      string    `json:"status"`
-	Usage       *oaiUsage `json:"usage"`
-	Output      []struct {
-		Type string `json:"type"`
-	} `json:"output"`
+	Object      string          `json:"object"`
+	Model       string          `json:"model"`
+	ServiceTier string          `json:"service_tier"`
+	Status      string          `json:"status"`
+	Usage       *oaiUsage       `json:"usage"`
+	Output      []oaiOutputItem `json:"output"`
+}
+
+type oaiOutputItem struct {
+	Type string `json:"type"`
 }
 
 type oaiEnvelope struct {
@@ -399,9 +406,27 @@ type geminiUsage struct {
 	ToolUsePromptTokensDetails []geminiModality `json:"toolUsePromptTokensDetails"`
 }
 
+type geminiGroundingMetadata struct {
+	WebSearchQueries []string        `json:"webSearchQueries"`
+	SearchEntryPoint json.RawMessage `json:"searchEntryPoint"`
+	GroundingChunks  []struct {
+		Maps json.RawMessage `json:"maps"`
+	} `json:"groundingChunks"`
+	GoogleMapsWidgetContextToken string `json:"googleMapsWidgetContextToken"`
+}
+
+// geminiGround is what a candidate's grounding metadata showed so far.
+type geminiGround struct {
+	search  bool
+	queries int64 // most non-empty webSearchQueries seen in one chunk
+	maps    bool
+}
+
 type geminiEnvelope struct {
 	Candidates []struct {
-		FinishReason string `json:"finishReason"`
+		Index             int                      `json:"index"`
+		FinishReason      string                   `json:"finishReason"`
+		GroundingMetadata *geminiGroundingMetadata `json:"groundingMetadata"`
 	} `json:"candidates"`
 	UsageMetadata *geminiUsage    `json:"usageMetadata"`
 	ModelVersion  string          `json:"modelVersion"`
@@ -492,12 +517,27 @@ func (u *usageParser) mergeAnthropic(a *anthUsage) {
 		u.d.split5m = true
 		u.d.cacheWrite5m = *cc.Ephemeral5m
 	}
-	if st := a.ServerToolUse; st != nil && st.WebSearchRequests != nil {
-		if *st.WebSearchRequests < 0 {
+	for name, raw := range a.ServerToolUse {
+		if isNull(raw) {
+			continue
+		}
+		n, err := intValue(name, raw, false)
+		if err != nil {
 			u.failed = true
 			return
 		}
-		u.d.webSearchRequests = *st.WebSearchRequests
+		switch name {
+		case "web_search_requests":
+			u.d.webSearchRequests = n // cumulative in message_delta
+		case "web_fetch_requests", "tool_search_requests":
+			// No charge beyond tokens.
+		default:
+			// code_execution_requests (billed per container-hour) or a
+			// server tool this table does not know: cannot be priced.
+			if n > 0 {
+				u.unpricedTool = true
+			}
+		}
 	}
 	if a.Speed != nil {
 		if *a.Speed == "standard" {
@@ -536,15 +576,14 @@ func (u *usageParser) handleOpenAI(data []byte) {
 	case e.Object == "response":
 		// Non-streamed Responses API body.
 		u.stopped = true
-		u.applyResponseObj(&oaiResponseObj{Object: e.Object, Model: e.Model, ServiceTier: e.ServiceTier, Usage: e.Usage})
 		var out struct {
-			Output []struct {
-				Type string `json:"type"`
-			} `json:"output"`
+			Output []oaiOutputItem `json:"output"`
 		}
-		if json.Unmarshal(data, &out) == nil {
-			u.d.webSearchCalls = countWebSearch(out.Output)
+		if err := json.Unmarshal(data, &out); err != nil {
+			u.failed = true
+			return
 		}
+		u.applyResponseObj(&oaiResponseObj{Object: e.Object, Model: e.Model, ServiceTier: e.ServiceTier, Usage: e.Usage, Output: out.Output})
 	default:
 		// Chat Completions (body or chunk) and Embeddings.
 		if e.Model != "" {
@@ -559,16 +598,22 @@ func (u *usageParser) handleOpenAI(data []byte) {
 	}
 }
 
-func countWebSearch(items []struct {
-	Type string `json:"type"`
-}) int64 {
-	var n int64
+// applyOutputItems counts billable built-in tool calls in a Responses API
+// output list. Tools billed outside the response's usage (code interpreter
+// containers, image generation) cannot be priced here.
+func (u *usageParser) applyOutputItems(items []oaiOutputItem) {
+	var web, file int64
 	for _, it := range items {
-		if it.Type == "web_search_call" {
-			n++
+		switch it.Type {
+		case "web_search_call":
+			web++
+		case "file_search_call":
+			file++
+		case "code_interpreter_call", "image_generation_call":
+			u.unpricedTool = true
 		}
 	}
-	return n
+	u.d.webSearchCalls, u.d.fileSearchCalls = web, file
 }
 
 func (u *usageParser) applyResponseObj(r *oaiResponseObj) {
@@ -578,7 +623,7 @@ func (u *usageParser) applyResponseObj(r *oaiResponseObj) {
 	if r.ServiceTier != "" {
 		u.d.tier = r.ServiceTier
 	}
-	u.d.webSearchCalls = countWebSearch(r.Output)
+	u.applyOutputItems(r.Output)
 	if r.Usage != nil {
 		u.applyOpenAIUsage(r.Usage)
 	}
@@ -672,6 +717,9 @@ func (u *usageParser) handleGemini(data []byte) {
 		if c.FinishReason != "" && c.FinishReason != "FINISH_REASON_UNSPECIFIED" {
 			finishing = true
 		}
+		if gm := c.GroundingMetadata; gm != nil {
+			u.observeGrounding(c.Index, gm)
+		}
 	}
 	if finishing {
 		u.finished = true
@@ -725,6 +773,84 @@ func (u *usageParser) handleGemini(data []byte) {
 	u.d.modIn, u.d.modCR = in, cr
 }
 
+func (u *usageParser) observeGrounding(idx int, gm *geminiGroundingMetadata) {
+	if u.ground == nil {
+		u.ground = map[int]*geminiGround{}
+	}
+	g := u.ground[idx]
+	if g == nil {
+		if len(u.ground) >= maxGroundCandidates {
+			u.failed = true
+			return
+		}
+		g = &geminiGround{}
+		u.ground[idx] = g
+	}
+	var q int64
+	for _, s := range gm.WebSearchQueries {
+		if strings.TrimSpace(s) != "" {
+			q++
+		}
+	}
+	if q > 0 || (len(gm.SearchEntryPoint) > 0 && !isNull(gm.SearchEntryPoint)) {
+		g.search = true
+	}
+	g.queries = max(g.queries, q)
+	if gm.GoogleMapsWidgetContextToken != "" {
+		g.maps = true
+	}
+	for _, c := range gm.GroundingChunks {
+		if len(c.Maps) > 0 && !isNull(c.Maps) {
+			g.maps = true
+		}
+	}
+}
+
+// maxGroundCandidates bounds the per-candidate grounding state.
+const maxGroundCandidates = 64
+
+// resolveGrounding turns observed Gemini grounding into billable counts
+// under the model's fees. It returns false when grounding was used but its
+// fee cannot be determined (no fee in the table, or per-query billing
+// without a reported query count).
+func (u *usageParser) resolveGrounding(d *usageDetail, fees Fees) bool {
+	for _, g := range u.ground {
+		if g.search {
+			switch {
+			case fees.GoogleSearchQuery > 0:
+				if g.queries == 0 {
+					return false
+				}
+				d.searchQueries = satAddTokens(d.searchQueries, g.queries)
+			case fees.GoogleSearchPrompt > 0:
+				d.searchPrompts++
+			default:
+				return false
+			}
+		}
+		if g.maps {
+			switch {
+			case fees.GoogleMapsQuery > 0:
+				return false // Maps query counts are not reported
+			case fees.GoogleMapsPrompt > 0:
+				d.mapsPrompts++
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (u *usageParser) grounded() bool {
+	for _, g := range u.ground {
+		if g.search || g.maps {
+			return true
+		}
+	}
+	return false
+}
+
 // Final reports the usage once the body is complete.
 func (u *usageParser) Final() (Usage, bool) {
 	u.mu.Lock()
@@ -754,6 +880,10 @@ func (u *usageParser) Final() (Usage, bool) {
 	if u.failed || !u.gotUsage {
 		return Usage{}, false
 	}
+	if u.unpricedTool {
+		// A tool billed outside token usage ran: charge the reservation.
+		return Usage{}, false
+	}
 	switch u.kind {
 	case provider.KindAnthropicMessages:
 		if !u.started || !u.stopped {
@@ -776,9 +906,12 @@ func (u *usageParser) Final() (Usage, bool) {
 	if out.ProviderCostMicros > 0 {
 		return out, true
 	}
-	hasExtras := !isStandardTier(u.d.tier) || u.d.regional || u.d.webSearchRequests > 0 || u.d.webSearchCalls > 0
+	hasExtras := !isStandardTier(u.d.tier) || u.d.regional || u.d.hasFees()
 	pr, ok := u.m.lookup(u.prov, out.Model)
 	if !ok {
+		if u.grounded() {
+			return Usage{}, false // grounding fees cannot be priced
+		}
 		if hasExtras && out.Model == "" {
 			// The price-changing detail cannot be applied without a model;
 			// the caller would otherwise price the request too cheaply.
@@ -788,11 +921,11 @@ func (u *usageParser) Final() (Usage, bool) {
 	}
 	d := u.d
 	d.Usage = out
+	fees := u.m.Pricing.feesFor(u.prov, pr)
+	if !u.resolveGrounding(&d, fees) {
+		return Usage{}, false
+	}
 	if d.needsDetailPricing(pr) {
-		var fees Fees
-		if u.m != nil {
-			fees = u.m.Pricing.fees(u.prov)
-		}
 		// A zero cost (no tokens, no fees) is left to Cost, which agrees.
 		out.ProviderCostMicros = int64(priceUsage(pr, d, fees))
 	}

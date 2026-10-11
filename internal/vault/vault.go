@@ -16,7 +16,6 @@ package vault
 import (
 	"context"
 	"crypto/rsa"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,6 +53,26 @@ var (
 	ErrExists = errors.New("vault: vault already exists")
 	// ErrInvalid: an argument failed validation.
 	ErrInvalid = errors.New("vault: invalid argument")
+	// ErrRollback: the secret was correct and the file authentic, but the
+	// anti-rollback sidecar records a newer state than the file on disk (or
+	// cannot be read, or names another vault). The vault stays locked. It is
+	// only returned after the DEK has been recovered, so it reveals nothing
+	// to someone without a slot secret. See AcceptRollback.
+	ErrRollback = errors.New("vault: vault file is older than the last recorded state (possible rollback)")
+	// ErrChanged: the vault was re-keyed by a concurrent operation while an
+	// unlock of the already-unlocked vault was in progress. Retry.
+	ErrChanged = errors.New("vault: vault changed during unlock")
+	// ErrOAEPUnsupported is the error a HelloKey's Decrypt must return (or
+	// wrap, matched with errors.Is) when the key storage provider cannot do
+	// RSA-OAEP-SHA256. internal/winhello has its own sentinel
+	// (winhello.ErrOAEPUnsupported); the daemon's adapter must map it to
+	// this one, or hello slot creation fails instead of falling back.
+	ErrOAEPUnsupported = errors.New("vault: hello key does not support RSA-OAEP-SHA256")
+	// ErrPrevNotScrubbed: a re-keying change (RemoveSlot, RotateRecovery) IS
+	// committed and the vault holds the new DEK, but the .prev copy, which
+	// still holds the old DEK, could neither be replaced nor removed. The
+	// caller should tell the user to delete it.
+	ErrPrevNotScrubbed = errPrevNotScrubbed
 )
 
 // MinPassphraseLen is the shortest passphrase accepted for a new slot.
@@ -62,23 +81,38 @@ const MinPassphraseLen = 8
 // minRSABits is the smallest Hello public key accepted.
 const minRSABits = 2048
 
-// HelloKey is a Windows Hello (Microsoft Passport KSP) RSA key. It is
-// implemented by internal/winhello. Decrypt must perform RSA-OAEP with
-// SHA-256 (MGF1-SHA-256, empty label), prompting the user.
+// HelloKey is a Windows Hello (Microsoft Passport KSP) RSA key, normally an
+// adapter around internal/winhello. Decrypt must perform RSA-OAEP with
+// SHA-256 (MGF1-SHA-256, empty label), prompting the user, and must return
+// an error matching ErrOAEPUnsupported when the provider cannot do OAEP.
 type HelloKey interface {
 	KeyName() string
 	PublicKey() (*rsa.PublicKey, error)
 	Decrypt(ctx context.Context, ciphertext []byte, prompt string) ([]byte, error)
 }
 
+// HelloKeyPKCS1 is optionally implemented by a HelloKey whose provider can
+// decrypt RSA PKCS#1 v1.5. It is used only when Decrypt reports
+// ErrOAEPUnsupported while a hello slot is being created, and afterwards
+// for slots recorded with PaddingPKCS1v15 (spec §5.2).
+type HelloKeyPKCS1 interface {
+	DecryptPKCS1v15(ctx context.Context, ciphertext []byte, prompt string) ([]byte, error)
+}
+
 // SlotSpec describes a slot to create. Type is "passphrase", "hello" or
 // "dpapi" (recovery slots are created by Create and RotateRecovery).
 // Passphrase is read but not retained or modified; the caller wipes it.
+//
+// Creating a hello slot performs a test unwrap through Hello, which prompts
+// the user (HelloPrompt is shown; Context cancels it, nil means
+// context.Background). The test runs before the vault lock is taken.
 type SlotSpec struct {
-	Type       string
-	Label      string
-	Passphrase []byte
-	Hello      HelloKey
+	Type        string
+	Label       string
+	Passphrase  []byte
+	Hello       HelloKey
+	HelloPrompt string
+	Context     context.Context
 }
 
 // SlotInfo is public slot metadata.
@@ -89,6 +123,8 @@ type SlotInfo struct {
 	Created time.Time
 	// HelloKey is the KSP key name for hello slots.
 	HelloKey string
+	// Padding is PaddingOAEPSHA256 or PaddingPKCS1v15 for hello slots.
+	Padding string
 	// Convenience is true for slots any same-user process can open (dpapi).
 	Convenience bool
 }
@@ -113,6 +149,9 @@ type Vault struct {
 	f        *fileV1        // current authenticated (or, while locked, parsed) state; never mutated in place
 	dek      *secmem.Buffer // nil while locked
 	fromPrev bool           // f was loaded from the .prev copy
+
+	acceptRollback bool   // AcceptRollback armed for the next strong unlock
+	seqFloor       uint64 // the next commit's seq must exceed this
 }
 
 func nowString() string { return time.Now().UTC().Truncate(time.Second).Format(time.RFC3339) }
@@ -123,7 +162,8 @@ func parseTime(s string) time.Time {
 }
 
 func checkPath(path string) (string, error) {
-	if path == "" || strings.EqualFold(filepath.Ext(path), ".prev") {
+	ext := filepath.Ext(path)
+	if path == "" || strings.EqualFold(ext, ".prev") || strings.EqualFold(ext, ".seq") {
 		return "", fmt.Errorf("%w: vault path", ErrInvalid)
 	}
 	abs, err := filepath.Abs(path)
@@ -163,6 +203,17 @@ func Create(path string, first SlotSpec) (v *Vault, recoveryCode string, err err
 		}
 	}
 
+	// Secret-dependent and interactive work (Argon2id, Hello prompt) first.
+	fp, err := prepareSlot(first)
+	if err != nil {
+		return nil, "", err
+	}
+	defer fp.destroy()
+	rp, code, err := prepareRecovery()
+	if err != nil {
+		return nil, "", err
+	}
+
 	dek, err := secmem.New(dekSize)
 	if err != nil {
 		return nil, "", err
@@ -186,15 +237,20 @@ func Create(path string, first SlotSpec) (v *Vault, recoveryCode string, err err
 		VaultID: id,
 		Created: nowString(),
 	}
-	s, err := buildSlot(f.VaultID, dek.Bytes(), first)
+	s, err := fp.wrap(f.VaultID, dek.Bytes())
 	if err != nil {
 		return nil, "", err
 	}
-	rs, code, err := buildRecoverySlot(f.VaultID, dek.Bytes())
+	rs, err := rp.wrap(f.VaultID, dek.Bytes())
 	if err != nil {
 		return nil, "", err
 	}
 	f.Slots = []slotV1{s, rs}
+	// A leftover sidecar from an earlier vault at this path would make the
+	// new vault look rolled back if the first sidecar write failed.
+	if err := os.Remove(SeqPath(path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, "", fmt.Errorf("vault: remove stale sidecar: %w", err)
+	}
 	v = &Vault{path: path, f: &fileV1{Seq: 0}, dek: dek}
 	if err := v.commitLocked(f); err != nil {
 		return nil, "", err
@@ -205,8 +261,10 @@ func Create(path string, first SlotSpec) (v *Vault, recoveryCode string, err err
 
 // Open reads and structurally validates the vault at path and returns it
 // locked. If the main file is missing or corrupt (an interrupted write), the
-// .prev copy is used and RecoveredFromPrev reports true; the next write
-// replaces the main file.
+// .prev copy is used and RecoveredFromPrev reports true; callers should
+// surface that to the user. If the anti-rollback sidecar shows that a newer
+// state than .prev had been written, unlock fails with ErrRollback. The
+// next write replaces the main file.
 func Open(path string) (*Vault, error) {
 	path, err := checkPath(path)
 	if err != nil {
@@ -274,6 +332,7 @@ func slotInfo(s *slotV1) SlotInfo {
 		Label:       s.Label,
 		Created:     parseTime(s.Created),
 		HelloKey:    s.HelloKey,
+		Padding:     s.Padding,
 		Convenience: s.Type == SlotDPAPI,
 	}
 }
@@ -364,22 +423,69 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 		}
 		return ErrTampered
 	}
+	// Anti-rollback, only now that the caller has proven a slot secret.
+	sc, err := checkSidecar(v.path, f, dek.Bytes())
+	if err != nil {
+		dek.Destroy()
+		return err
+	}
 
 	v.mu.Lock()
 	if v.f != f {
 		// Only possible when the vault was already unlocked and was written
-		// meanwhile; the DEK is the same, but fail closed and re-verify.
+		// meanwhile. A plain write keeps the DEK; a re-key does not.
 		if ok, err := verifyHeaderMAC(dek.Bytes(), v.f); err != nil || !ok {
 			v.mu.Unlock()
 			dek.Destroy()
-			return ErrTampered
+			return ErrChanged
 		}
 	}
+	accept := false
+	if slotType != SlotDPAPI {
+		accept = v.acceptRollback
+		v.acceptRollback = false
+	}
 	old := v.dek
+	if sc.rollback && !accept {
+		v.dek = nil
+		v.mu.Unlock()
+		old.Destroy()
+		dek.Destroy()
+		return fmt.Errorf("%w (file seq %d, recorded seq %d)", ErrRollback, f.Seq, sc.seq)
+	}
 	v.dek = dek
+	if sc.rollback {
+		// Owner override: make the accepted state the newest one. This also
+		// rewrites the main file and the sidecar.
+		v.seqFloor = max(v.seqFloor, sc.seq)
+		if err := v.commitLocked(v.f.clone()); err != nil {
+			v.dek = nil
+			v.mu.Unlock()
+			old.Destroy()
+			dek.Destroy()
+			return err
+		}
+	} else if !sc.current {
+		// Missing, stale or unauthentic record: refresh it (best effort).
+		_ = writeSidecar(v.path, v.f.VaultID, v.f.Seq, dek.Bytes())
+	}
 	v.mu.Unlock()
 	old.Destroy()
 	return nil
+}
+
+// AcceptRollback arms a one-shot owner override for ErrRollback: the next
+// unlock with a passphrase, recovery code or Windows Hello (not DPAPI, which
+// needs no user presence) accepts the on-disk state even though the sidecar
+// records a newer one, and immediately rewrites it with a seq above the
+// recorded one. The override is consumed by that next successful strong
+// unlock whether or not a rollback is present. Callers must only arm it on
+// an explicit user request; afterwards the user should review Slots, since a
+// rolled-back file can contain slots that had been removed.
+func (v *Vault) AcceptRollback() {
+	v.mu.Lock()
+	v.acceptRollback = true
+	v.mu.Unlock()
 }
 
 // UnlockPassphrase unlocks with a passphrase slot. p is not retained.
@@ -388,7 +494,7 @@ func (v *Vault) UnlockPassphrase(p []byte) error {
 		return ErrWrongSecret
 	}
 	return v.unlock(SlotPassphrase, func(s *slotV1) (*secmem.Buffer, error) {
-		return argon2KEK(p, s.KDF)
+		return passphraseKEK(p, s)
 	})
 }
 
@@ -401,14 +507,14 @@ func (v *Vault) UnlockRecovery(code string) error {
 	}
 	defer secret.Destroy()
 	return v.unlock(SlotRecovery, func(s *slotV1) (*secmem.Buffer, error) {
-		return argon2KEK(secret.Bytes(), s.KDF)
+		return passphraseKEK(secret.Bytes(), s)
 	})
 }
 
 // UnlockHello unlocks with the hello slot bound to h.KeyName(), asking h to
-// decrypt the slot's wrapped KEK (which prompts the user). Errors from h
-// (cancellation, device failure) are returned wrapped; ErrWrongSecret means
-// no hello slot for that key opened.
+// decrypt the slot's wrapped KEK (which prompts the user) with the padding
+// recorded in the slot. Errors from h (cancellation, device failure) are
+// returned wrapped; ErrWrongSecret means no hello slot for that key opened.
 func (v *Vault) UnlockHello(ctx context.Context, h HelloKey, prompt string) error {
 	if h == nil {
 		return fmt.Errorf("%w: nil hello key", ErrInvalid)
@@ -418,7 +524,20 @@ func (v *Vault) UnlockHello(ctx context.Context, h HelloKey, prompt string) erro
 		if s.HelloKey != name {
 			return nil, errSkipSlot
 		}
-		plain, err := h.Decrypt(ctx, s.KEKBlob, prompt)
+		var plain []byte
+		var err error
+		switch s.Padding {
+		case PaddingOAEPSHA256:
+			plain, err = h.Decrypt(ctx, s.KEKBlob, prompt)
+		case PaddingPKCS1v15:
+			p1, ok := h.(HelloKeyPKCS1)
+			if !ok {
+				return nil, fmt.Errorf("%w: hello slot needs PKCS#1 v1.5 decryption", ErrInvalid)
+			}
+			plain, err = p1.DecryptPKCS1v15(ctx, s.KEKBlob, prompt)
+		default:
+			return nil, errSkipSlot
+		}
 		if err != nil {
 			return nil, fmt.Errorf("vault: hello decrypt: %w", err)
 		}
@@ -482,88 +601,6 @@ func checkSpec(spec SlotSpec) error {
 	return nil
 }
 
-// buildSlot creates a non-recovery slot wrapping dek.
-func buildSlot(vaultID string, dek []byte, spec SlotSpec) (slotV1, error) {
-	if err := checkSpec(spec); err != nil {
-		return slotV1{}, err
-	}
-	id, err := randHex(idHexLen / 2)
-	if err != nil {
-		return slotV1{}, err
-	}
-	s := slotV1{ID: slotIDPrefix + id, Type: spec.Type, Label: spec.Label, Created: nowString()}
-	var kek *secmem.Buffer
-	switch spec.Type {
-	case SlotPassphrase:
-		s.KDF, kek, err = newKDF(spec.Passphrase)
-		if err != nil {
-			return slotV1{}, err
-		}
-	case SlotHello:
-		pub, err := spec.Hello.PublicKey()
-		if err != nil {
-			return slotV1{}, fmt.Errorf("vault: hello public key: %w", err)
-		}
-		if pub == nil || pub.N == nil || pub.N.BitLen() < minRSABits {
-			return slotV1{}, fmt.Errorf("%w: hello key must be RSA >= %d bits", ErrInvalid, minRSABits)
-		}
-		if kek, err = randomKEK(); err != nil {
-			return slotV1{}, err
-		}
-		blob, err := rsa.EncryptOAEP(sha256.New(), randReader(), pub, kek.Bytes(), nil)
-		if err != nil {
-			kek.Destroy()
-			return slotV1{}, fmt.Errorf("vault: hello wrap: %w", err)
-		}
-		s.HelloKey = spec.Hello.KeyName()
-		s.KEKBlob = blob
-	case SlotDPAPI:
-		if kek, err = randomKEK(); err != nil {
-			return slotV1{}, err
-		}
-		blob, err := dpapiProtect(kek.Bytes(), []byte(vaultID))
-		if err != nil {
-			kek.Destroy()
-			return slotV1{}, fmt.Errorf("vault: dpapi wrap: %w", err)
-		}
-		s.KEKBlob = blob
-	}
-	defer kek.Destroy()
-	s.Nonce, s.Wrapped, err = seal(kek.Bytes(), dek, slotAAD(vaultID, s.ID, s.Type))
-	if err != nil {
-		return slotV1{}, err
-	}
-	return s, nil
-}
-
-// buildRecoverySlot creates a recovery slot and returns its code.
-func buildRecoverySlot(vaultID string, dek []byte) (slotV1, string, error) {
-	secret, err := secmem.New(recoverySecretLen)
-	if err != nil {
-		return slotV1{}, "", err
-	}
-	defer secret.Destroy()
-	if _, err := readRandInto(secret.Bytes()); err != nil {
-		return slotV1{}, "", err
-	}
-	id, err := randHex(idHexLen / 2)
-	if err != nil {
-		return slotV1{}, "", err
-	}
-	s := slotV1{ID: slotIDPrefix + id, Type: SlotRecovery, Label: "recovery code", Created: nowString()}
-	var kek *secmem.Buffer
-	s.KDF, kek, err = newKDF(secret.Bytes())
-	if err != nil {
-		return slotV1{}, "", err
-	}
-	defer kek.Destroy()
-	s.Nonce, s.Wrapped, err = seal(kek.Bytes(), dek, slotAAD(vaultID, s.ID, s.Type))
-	if err != nil {
-		return slotV1{}, "", err
-	}
-	return s, formatRecoveryCode(secret.Bytes()), nil
-}
-
 func randomKEK() (*secmem.Buffer, error) {
 	k, err := secmem.New(32)
 	if err != nil {
@@ -576,12 +613,26 @@ func randomKEK() (*secmem.Buffer, error) {
 	return k, nil
 }
 
-// commitLocked authenticates nf as the next version and writes it. The
-// caller holds v.mu for writing (or exclusively owns v) and v.dek is set.
-// On failure the in-memory state is unchanged.
+// commitLocked authenticates nf as the next version under v.dek and writes
+// it. The caller holds v.mu for writing (or exclusively owns v) and v.dek is
+// set. On failure the in-memory state is unchanged.
 func (v *Vault) commitLocked(nf *fileV1) error {
-	nf.Seq = v.f.Seq + 1
-	mac, err := headerMAC(v.dek.Bytes(), nf)
+	mode := writeKeepPrev
+	if v.fromPrev {
+		// The main file is corrupt; do not move it over the good .prev.
+		mode = writeNoPrev
+	}
+	return v.commitWith(nf, v.dek.Bytes(), mode)
+}
+
+// commitWith authenticates nf under dek, writes it with mode and installs it
+// as v.f. When only the .prev scrub of a re-key failed it installs the state
+// and returns errPrevNotScrubbed. It then records the new seq in the
+// anti-rollback sidecar (best effort: a failure only weakens detection, and
+// the next unlock rewrites a stale record).
+func (v *Vault) commitWith(nf *fileV1, dek []byte, mode writeMode) error {
+	nf.Seq = max(v.f.Seq, v.seqFloor) + 1
+	mac, err := headerMAC(dek, nf)
 	if err != nil {
 		return err
 	}
@@ -593,20 +644,94 @@ func (v *Vault) commitLocked(nf *fileV1) error {
 	if err != nil {
 		return fmt.Errorf("vault: encode: %w", err)
 	}
-	if err := writeAtomic(v.path, append(data, '\n'), !v.fromPrev); err != nil {
-		return err
+	werr := writeAtomic(v.path, append(data, '\n'), mode)
+	if werr != nil && !errors.Is(werr, errPrevNotScrubbed) {
+		return werr
 	}
 	v.f = nf
 	v.fromPrev = false
-	return nil
+	_ = writeSidecar(v.path, nf.VaultID, nf.Seq, dek)
+	return werr
+}
+
+// rekeyLocked commits nf under a fresh random DEK. Every entry is re-sealed
+// under the new entry key with a new nonce (fingerprint recomputed), every
+// slot in nf is re-wrapped from its public material (no secret, no prompt),
+// and .prev is replaced with a copy of the new state (writeRekey). Slots not
+// in nf never see the new DEK, so a removed slot, or an old copy of the file
+// opened with it, yields only the old DEK. The caller holds v.mu for writing
+// and v.dek is set. If it fails before the main file is replaced, file, state
+// and DEK are unchanged.
+//
+// Re-keying changes everything derived from the DEK: entry fingerprints and
+// DeriveKey outputs (e.g. the audit-anchor key).
+func (v *Vault) rekeyLocked(nf *fileV1) error {
+	newDEK, err := secmem.New(dekSize)
+	if err != nil {
+		return err
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			newDEK.Destroy()
+		}
+	}()
+	if _, err := readRandInto(newDEK.Bytes()); err != nil {
+		return err
+	}
+	oldKey, err := deriveSubkey(v.dek.Bytes(), infoEntry)
+	if err != nil {
+		return err
+	}
+	defer oldKey.Destroy()
+	for i := range nf.Entries {
+		e := &nf.Entries[i]
+		pt, err := openToBuffer(oldKey.Bytes(), e.Nonce, e.Ciphertext, entryAAD(nf.VaultID, e.ID, e.Provider, e.Kind))
+		if errors.Is(err, errAuth) {
+			return ErrTampered
+		}
+		if err != nil {
+			return err
+		}
+		err = sealEntry(newDEK.Bytes(), nf.VaultID, e, pt.Bytes())
+		pt.Destroy()
+		if err != nil {
+			return err
+		}
+	}
+	for i := range nf.Slots {
+		if err := wrapSlot(nf.VaultID, &nf.Slots[i], newDEK.Bytes()); err != nil {
+			return err
+		}
+	}
+	// writeRekey also when recovered from .prev: .prev holds the old DEK.
+	werr := v.commitWith(nf, newDEK.Bytes(), writeRekey)
+	if werr != nil && !errors.Is(werr, errPrevNotScrubbed) {
+		return werr
+	}
+	old := v.dek
+	v.dek = newDEK
+	installed = true
+	old.Destroy()
+	return werr
 }
 
 // AddSlot adds a passphrase, hello or dpapi slot. The vault must be
 // unlocked; the caller is responsible for the step-up check (spec §5.2).
+// Argon2id and the Hello test unwrap (one prompt) run before the vault lock
+// is taken. Adding a slot does not re-key.
 func (v *Vault) AddSlot(spec SlotSpec) (SlotInfo, error) {
 	if err := checkSpec(spec); err != nil {
 		return SlotInfo{}, err
 	}
+	if !v.IsUnlocked() {
+		return SlotInfo{}, ErrLocked
+	}
+	p, err := prepareSlot(spec)
+	if err != nil {
+		return SlotInfo{}, err
+	}
+	defer p.destroy()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.dek == nil {
@@ -615,9 +740,7 @@ func (v *Vault) AddSlot(spec SlotSpec) (SlotInfo, error) {
 	if len(v.f.Slots) >= maxSlots {
 		return SlotInfo{}, fmt.Errorf("%w: too many slots", ErrInvalid)
 	}
-	// KDF work happens under the write lock; slot changes are rare and
-	// interactive, and this keeps the DEK from being wiped mid-wrap.
-	s, err := buildSlot(v.f.VaultID, v.dek.Bytes(), spec)
+	s, err := p.wrap(v.f.VaultID, v.dek.Bytes())
 	if err != nil {
 		return SlotInfo{}, err
 	}
@@ -629,17 +752,26 @@ func (v *Vault) AddSlot(spec SlotSpec) (SlotInfo, error) {
 	return slotInfo(&s), nil
 }
 
-// RotateRecovery replaces every recovery slot with a new one and returns the
-// new code. The old code stops working once this returns.
+// RotateRecovery replaces every recovery slot with a new one, re-keys the
+// vault (see rekeyLocked) and returns the new code. Once it returns, the old
+// code opens neither the live file nor .prev. Copies of the vault file taken
+// before the rotation (backups) still open with the old code and reveal the
+// entries as they were then, but never the new DEK. ErrPrevNotScrubbed
+// comes with the new code: the rotation is committed but a stale .prev
+// remains.
 func (v *Vault) RotateRecovery() (string, error) {
+	if !v.IsUnlocked() {
+		return "", ErrLocked
+	}
+	p, code, err := prepareRecovery()
+	if err != nil {
+		return "", err
+	}
+	defer p.destroy()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.dek == nil {
 		return "", ErrLocked
-	}
-	rs, code, err := buildRecoverySlot(v.f.VaultID, v.dek.Bytes())
-	if err != nil {
-		return "", err
 	}
 	nf := v.f.clone()
 	kept := nf.Slots[:0]
@@ -648,15 +780,24 @@ func (v *Vault) RotateRecovery() (string, error) {
 			kept = append(kept, s)
 		}
 	}
-	nf.Slots = append(kept, rs)
-	if err := v.commitLocked(nf); err != nil {
+	nf.Slots = append(kept, p.s)
+	if err := v.rekeyLocked(nf); err != nil {
+		if errors.Is(err, errPrevNotScrubbed) {
+			return code, err
+		}
 		return "", err
 	}
 	return code, nil
 }
 
-// RemoveSlot removes a slot. It returns ErrLastSlot if no non-convenience
-// (non-dpapi) slot would remain.
+// RemoveSlot removes a slot and re-keys the vault (see rekeyLocked), so the
+// removed slot opens neither the live file nor .prev. Copies taken before
+// the removal still open with it and reveal the entries as they were then,
+// but never the new DEK. It returns ErrLastSlot if no non-convenience
+// (non-dpapi) slot would remain. ErrPrevNotScrubbed means the removal is
+// committed but a stale .prev remains. Re-wrapping a remaining dpapi slot
+// needs DPAPI, so on other systems removing a slot from a vault that still
+// has one fails with an error wrapping errors.ErrUnsupported.
 func (v *Vault) RemoveSlot(id string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -679,7 +820,7 @@ func (v *Vault) RemoveSlot(id string) error {
 		return ErrLastSlot
 	}
 	nf.Slots = append(nf.Slots[:idx], nf.Slots[idx+1:]...)
-	return v.commitLocked(nf)
+	return v.rekeyLocked(nf)
 }
 
 func checkEntryArgs(provider, kind, label string, secret []byte) error {
@@ -853,10 +994,13 @@ func (v *Vault) Fingerprint(secret []byte) (string, error) {
 // DeriveKey returns a 32-byte HKDF-SHA256 subkey of the DEK for another
 // component (e.g. InfoAuditAnchor). info must start with "keyleash/v1/",
 // have something after the prefix, and must not be one of the vault's own
-// infos (entry, header-mac). The caller should wipe the result.
+// infos (entry, header-mac, seq-sidecar, slot-kek*). The caller should
+// wipe the result. The result changes when the vault is re-keyed
+// (RemoveSlot, RotateRecovery).
 func (v *Vault) DeriveKey(info string) ([]byte, error) {
 	if !strings.HasPrefix(info, derivePrefix) || len(info) == len(derivePrefix) ||
-		info == infoEntry || info == infoHeaderMAC || !validLabelNoLimit(info) || len(info) > 256 {
+		info == infoEntry || info == infoHeaderMAC || info == infoSidecar ||
+		strings.HasPrefix(info, infoSlotKEK) || !validLabelNoLimit(info) || len(info) > 256 {
 		return nil, fmt.Errorf("%w: derive info", ErrInvalid)
 	}
 	v.mu.RLock()

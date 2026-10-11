@@ -4,6 +4,7 @@
     {"role": "user", "content": [{"type": "input_text", "text": "Find the current stable Go version and list two notable changes from its release notes."}]}
   ],
   "tools": [{"type": "web_search"}],
+  "max_tool_calls": 4,
   "reasoning": {"effort": "medium"},
   "max_output_tokens": 2000,
   "stream": true

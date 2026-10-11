@@ -34,12 +34,12 @@ func TestInspectFields(t *testing.T) {
 		},
 		{
 			name: "openai chat takes the larger limit", prov: "openai", path: "/v1/chat/completions",
-			body: `{"model":"gpt-5","max_tokens":10,"max_completion_tokens":300,"messages":[]}`,
+			body: `{"model":"gpt-5","max_tokens":10,"max_completion_tokens":300,"service_tier":"default","messages":[]}`,
 			want: RequestInfo{Kind: provider.KindOpenAIChat, Model: "gpt-5", MaxOutputTokens: 300},
 		},
 		{
 			name: "openai responses", prov: "openai", path: "/v1/responses",
-			body: `{"model":"gpt-5.4","max_output_tokens":777,"stream":false,"input":"hi"}`,
+			body: `{"model":"gpt-5.4","max_output_tokens":777,"stream":false,"service_tier":"default","input":"hi"}`,
 			want: RequestInfo{Kind: provider.KindOpenAIResponses, Model: "gpt-5.4", MaxOutputTokens: 777},
 		},
 		{
@@ -49,12 +49,12 @@ func TestInspectFields(t *testing.T) {
 		},
 		{
 			name: "gemini snake case and dynamic thinking", prov: "gemini", path: "/v1beta/models/gemini-2.5-pro:generateContent",
-			body: `{"contents":[],"generation_config":{"max_output_tokens":64,"thinking_config":{"thinking_budget":-1}}}`,
+			body: `{"contents":[],"service_tier":"standard","generation_config":{"max_output_tokens":64,"thinking_config":{"thinking_budget":-1}}}`,
 			want: RequestInfo{Kind: provider.KindGeminiGenerate, Model: "gemini-2.5-pro", MaxOutputTokens: 64},
 		},
 		{
 			name: "gemini stream from path", prov: "gemini", path: "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
-			body: `{"contents":[],"generationConfig":{"maxOutputTokens":64,"thinkingConfig":{"thinkingBudget":32}}}`,
+			body: `{"contents":[],"serviceTier":"standard","generationConfig":{"maxOutputTokens":64,"thinkingConfig":{"thinkingBudget":32}}}`,
 			want: RequestInfo{Kind: provider.KindGeminiGenerate, Model: "gemini-2.5-pro", Stream: true, MaxOutputTokens: 64, ThinkingTokens: 32},
 		},
 		{
@@ -80,7 +80,7 @@ func TestInspectFields(t *testing.T) {
 func TestInspectInputEstimateCeil(t *testing.T) {
 	m := &Meter{Pricing: DefaultPricing()}
 	for _, pad := range []int{0, 1, 2, 3, 4} {
-		body := `{"model":"gpt-5","messages":[],"x":"` + strings.Repeat("a", pad) + `"}`
+		body := `{"model":"gpt-5","service_tier":"default","messages":[],"x":"` + strings.Repeat("a", pad) + `"}`
 		info, err := inspect(t, m, "openai", "POST", "/v1/chat/completions", body)
 		if err != nil {
 			t.Fatal(err)
@@ -182,7 +182,7 @@ func TestGeminiModelFromPath(t *testing.T) {
 func TestInspectFoldsMultipliers(t *testing.T) {
 	m := &Meter{Pricing: DefaultPricing(), AssumeMaxOutputTokens: 4096}
 	// n=3 with no declared limit: the model ceiling (128000) times n.
-	info, err := inspect(t, m, "openai", "POST", "/v1/chat/completions", `{"model":"gpt-5.4-mini","n":3,"messages":[]}`)
+	info, err := inspect(t, m, "openai", "POST", "/v1/chat/completions", `{"model":"gpt-5.4-mini","n":3,"service_tier":"default","messages":[]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestInspectFoldsMultipliers(t *testing.T) {
 	}
 	// Gemini candidateCount=2 plus an explicit thinking budget.
 	info, err = inspect(t, m, "gemini", "POST", "/v1beta/models/gemini-2.5-pro:generateContent",
-		`{"generationConfig":{"maxOutputTokens":100,"candidateCount":2,"thinkingConfig":{"thinkingBudget":50}}}`)
+		`{"serviceTier":"standard","generationConfig":{"maxOutputTokens":100,"candidateCount":2,"thinkingConfig":{"thinkingBudget":50}}}`)
 	if err != nil {
 		t.Fatal(err)
 	}
