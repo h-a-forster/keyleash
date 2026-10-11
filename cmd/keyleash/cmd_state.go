@@ -95,8 +95,17 @@ func printStatus(w io.Writer, st client.Status, passes []client.PassInfo, passes
 	if !st.AuditHealthy {
 		fmt.Fprintln(w, "audit:      FAILING (writes to the audit log failed)")
 	}
+	if st.ApprovalMethod != "" {
+		fmt.Fprintf(w, "step-up:    %s\n", st.ApprovalMethod)
+	}
 	if st.PendingApprovals > 0 {
 		fmt.Fprintf(w, "approvals:  %d pending (keyleash approvals)\n", st.PendingApprovals)
+	}
+	if len(st.ConfigChanges) > 0 {
+		fmt.Fprintln(w, "config:     changed since last accepted (`keyleash resume` accepts):")
+		for _, ch := range st.ConfigChanges {
+			fmt.Fprintf(w, "              %s\n", ch)
+		}
 	}
 	if passesOK {
 		fmt.Fprintf(w, "passes:     %d active\n", len(passes))
@@ -256,6 +265,9 @@ func runUnlock(ctx context.Context, a *app, args []string) error {
 	for _, w := range st.Warnings {
 		fmt.Fprintf(a.stderr, "warning: %s\n", w)
 	}
+	for _, ch := range st.ConfigChanges {
+		fmt.Fprintf(a.stderr, "config change: %s\n", ch)
+	}
 	if st.State == client.StateTripped {
 		fmt.Fprintf(a.stderr, "warning: keyleash is tripped (%s); check `keyleash status`, then run: keyleash resume\n", st.TripReason)
 	}
@@ -380,7 +392,12 @@ In bash, write amounts as 20 or '$20' ("$20" would be expanded by the shell).`,
 		}
 		defer c.Close()
 		fmt.Fprintln(a.stderr, "Waiting for step-up approval...")
-		g, err := c.Away(ctx, client.AwayRequest{Budget: budget.v, For: dur.v, Pass: *passID})
+		var g client.Grant
+		err = a.withStepUp(ctx, c, func(ctx context.Context) error {
+			var err error
+			g, err = c.Away(ctx, client.AwayRequest{Budget: budget.v, For: dur.v, Pass: *passID})
+			return err
+		})
 		if err != nil {
 			return err
 		}
@@ -405,7 +422,12 @@ var cmdResume = &command{
 		}
 		defer c.Close()
 		fmt.Fprintln(a.stderr, "Waiting for step-up approval...")
-		st, err := c.Resume(ctx)
+		var st client.Status
+		err = a.withStepUp(ctx, c, func(ctx context.Context) error {
+			var err error
+			st, err = c.Resume(ctx)
+			return err
+		})
 		if err != nil {
 			return err
 		}

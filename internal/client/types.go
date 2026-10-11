@@ -35,6 +35,12 @@ const (
 	CodeForbidden     = "forbidden"
 	CodeUnsupported   = "unsupported"
 	CodeInternal      = "internal"
+	// CodeConfined: the caller is a process under an active run pass (or
+	// its PID could not be verified); it may only read status and revoke
+	// its own pass (spec §12).
+	CodeConfined = "confined"
+	// CodeRateLimited: too many wrong secrets; retry later.
+	CodeRateLimited = "rate_limited"
 )
 
 // ErrorBody is the JSON body of every non-2xx admin response.
@@ -75,6 +81,12 @@ type Status struct {
 	Integrity string `json:"integrity,omitempty"`
 	// Warnings are human-readable notices (recovered vault, stale .prev, ...).
 	Warnings []string `json:"warnings,omitempty"`
+	// ApprovalMethod is the daemon's approval.method.
+	ApprovalMethod string `json:"approval_method,omitempty"`
+	// ConfigChanges lists the config keys changed since the last accepted
+	// config ("key: old -> new"); non-empty while Tripped with reason
+	// "config_changed" until `keyleash resume` accepts them.
+	ConfigChanges []string `json:"config_changes,omitempty"`
 }
 
 // VaultInfo is vault metadata for status. It never contains secrets.
@@ -223,6 +235,9 @@ type KeyInfo struct {
 	// Authenticated is false while the vault is locked: the metadata has
 	// not been verified yet.
 	Authenticated bool `json:"authenticated"`
+	// Active is true for the provider's active key: the one new passes are
+	// mapped to (changed only by `keyleash keys use`, a step-up).
+	Active bool `json:"active,omitempty"`
 }
 
 // AddKeyRequest is the body of POST /v1/keys. Secret is wiped after use.
@@ -261,6 +276,18 @@ type Approval struct {
 	Created  time.Time    `json:"created"`
 	Deadline time.Time    `json:"deadline"`
 	Waiters  int          `json:"waiters"`
+	// Requester is the verified PID of the admin caller that triggered the
+	// request (0: a proxied request or unknown); RequesterImage its image.
+	Requester      int    `json:"requester_pid,omitempty"`
+	RequesterImage string `json:"requester_image,omitempty"`
+	// Scope, Window and Limit name the exceeded limit of an over_limit
+	// request. GrantMax and GrantMaxFor cap a grant attached to approving
+	// it (0: no grant possible).
+	Scope       string        `json:"scope,omitempty"`
+	Window      string        `json:"window,omitempty"`
+	Limit       money.Micros  `json:"limit_micros,omitempty"`
+	GrantMax    money.Micros  `json:"grant_max_micros,omitempty"`
+	GrantMaxFor time.Duration `json:"grant_max_for_ns,omitempty"`
 }
 
 // ApprovalGrant is an allowance attached to an approval.
@@ -269,10 +296,16 @@ type ApprovalGrant struct {
 	For    time.Duration `json:"for_ns"`
 }
 
-// DecideRequest is the body of POST /v1/approvals/{id}.
+// DecideRequest is the body of POST /v1/approvals/{id}. Approving requires
+// Secret: the vault passphrase or recovery code, re-verified by the vault
+// (spec §9); denying needs none. Secret is wiped by both sides after use.
 type DecideRequest struct {
 	Approved bool           `json:"approved"`
 	Grant    *ApprovalGrant `json:"grant,omitempty"`
+	// Method is "passphrase" or "recovery" ("" tries the recovery-code
+	// format first, then the passphrase).
+	Method string `json:"method,omitempty"`
+	Secret []byte `json:"secret,omitempty"`
 }
 
 // AuditRecord is one audit log record.

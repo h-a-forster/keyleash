@@ -516,3 +516,33 @@ func TestReturnedPassIsACopy(t *testing.T) {
 		t.Fatal("caller mutated store state")
 	}
 }
+
+func TestEntriesMappingPersistsAndValidates(t *testing.T) {
+	clk := newClock()
+	s, path := openTemp(t, clk)
+	p := basePass(clk)
+	p.Entries = map[string]string{"anthropic": "e_1"}
+	_, issued, err := s.Issue(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Entries["anthropic"] = "mutated"
+	if issued.Entries["anthropic"] != "e_1" {
+		t.Fatal("caller mutation leaked into the issued pass")
+	}
+	s2, err := OpenStore(path, clk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.Get(issued.ID)
+	if !ok || got.Entries["anthropic"] != "e_1" {
+		t.Fatalf("mapping not persisted: %+v", got.Entries)
+	}
+	for _, bad := range []map[string]string{{"nope": "e_1"}, {"anthropic": ""}, {"Anthropic": "e_1"}} {
+		q := basePass(clk)
+		q.Entries = bad
+		if _, _, err := s.Issue(q); err == nil {
+			t.Errorf("Issue accepted entries %v", bad)
+		}
+	}
+}

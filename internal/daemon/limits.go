@@ -2,15 +2,13 @@ package daemon
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/config"
+	"github.com/h-a-forster/keyleash/internal/glob"
 	"github.com/h-a-forster/keyleash/internal/money"
 )
-
-// DefaultFallbackAmount is reserved for an unpriced request when no
-// request-window limit applies (docs/DAEMON.md Gate.Admit step 3).
-const DefaultFallbackAmount = 2 * money.Dollar
 
 // applyLimits rebuilds every ledger limit and concurrency cap.
 func (d *Daemon) applyLimits() {
@@ -50,7 +48,7 @@ func addWindows(out []budget.Limit, scope string, l config.Limits) []budget.Limi
 }
 
 // buildLimitsLocked derives the ledger limits from config, active passes,
-// the active grant and approval overlays (docs/DAEMON.md "Scopes").
+// the active away grant and the pass grants of over-limit approvals (docs/DAEMON.md "Scopes").
 func (d *Daemon) buildLimitsLocked() []budget.Limit {
 	var out []budget.Limit
 	c := d.cfg
@@ -76,14 +74,9 @@ func (d *Daemon) buildLimitsLocked() []budget.Limit {
 	if g := d.st.grant; g != nil {
 		out = append(out, budget.Limit{Scope: budget.ScopeGrantPrefix + g.id, Window: budget.WindowSession, Amount: g.amount})
 	}
-	for _, o := range d.st.overlays {
-		if !now.Before(o.until) {
-			continue
-		}
-		for i := range out {
-			if out[i].Scope == o.scope && out[i].Window == o.window {
-				out[i].Amount += o.amount
-			}
+	for _, pg := range d.st.passGrants {
+		if now.Before(pg.until) {
+			out = append(out, budget.Limit{Scope: budget.ScopeGrantPrefix + pg.id, Window: budget.WindowSession, Amount: pg.amount})
 		}
 	}
 	return out
@@ -119,23 +112,22 @@ func (d *Daemon) concurrencyLocked() map[string]int {
 	return want
 }
 
-// fallbackAmountLocked is the reservation for an unpriced request: the
-// smallest request-window limit among global, provider and pass scopes, or
-// DefaultFallbackAmount.
-func (d *Daemon) fallbackAmountLocked(providerName, passID string) money.Micros {
+// requestLimitLocked is the smallest per-request limit that applies to a
+// request (global, provider, model or pass scope), or 0 when none does. It
+// is the reservation for a request whose cost cannot be bounded (spec §7.5).
+func (d *Daemon) requestLimitLocked(providerName, model, passID string) money.Micros {
 	amt := money.Micros(0)
 	for _, l := range d.buildLimitsLocked() {
 		if l.Window != budget.WindowRequest {
 			continue
 		}
-		if l.Scope == budget.ScopeGlobal || l.Scope == budget.ScopeProviderPrefix+providerName || l.Scope == budget.ScopePassPrefix+passID {
-			if amt == 0 || l.Amount < amt {
-				amt = l.Amount
-			}
+		match := l.Scope == budget.ScopeGlobal || l.Scope == budget.ScopeProviderPrefix+providerName || l.Scope == budget.ScopePassPrefix+passID
+		if pat, ok := strings.CutPrefix(l.Scope, budget.ScopeModelPrefix); ok {
+			match = !glob.Valid(pat) || glob.Match(pat, model)
 		}
-	}
-	if amt <= 0 {
-		return DefaultFallbackAmount
+		if match && (amt == 0 || l.Amount < amt) {
+			amt = l.Amount
+		}
 	}
 	return amt
 }

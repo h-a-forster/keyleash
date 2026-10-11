@@ -23,7 +23,8 @@ terminal. Logs go to stderr and never contain keys, passes or passphrases.
 
 With approval.method = "console", step-up prompts are asked in this
 terminal. When the daemon has no terminal (started in the background),
-console approvals wait for 'keyleash approvals approve|deny <id>' instead.
+console approvals wait for 'keyleash approvals approve|deny <id>' instead
+(approving there asks for your passphrase or recovery code).
 
 --background starts the daemon detached from this terminal, logging to
 daemon.log in the data directory, and returns once it answers.`,

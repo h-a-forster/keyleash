@@ -6,13 +6,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/approval"
 	"github.com/h-a-forster/keyleash/internal/audit"
 	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/client"
+	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
 	"github.com/h-a-forster/keyleash/internal/presence"
 	"github.com/h-a-forster/keyleash/internal/secmem"
@@ -35,6 +38,10 @@ const (
 	TripVelocity  = "velocity"
 	TripIntegrity = "integrity"
 	TripAudit     = "audit"
+	// TripAuditIntegrity: audit.Verify failed after unlock (chain or anchor).
+	TripAuditIntegrity = "audit_integrity"
+	// TripConfig: config.toml changed since the last accepted config.
+	TripConfig = "config_changed"
 )
 
 // stateData is everything guarded by Daemon.mu. Lock order: Daemon.mu
@@ -51,8 +58,18 @@ type stateData struct {
 	// Latest presence readings (edge-triggered events folded into flags).
 	idle, screenLocked bool
 
-	grant    *grantInfo
-	overlays []overlay
+	grant *grantInfo
+	// passGrants are allowances carried by over-limit approvals, each
+	// scoped to the requesting pass and one exceeded limit.
+	passGrants []passGrant
+
+	// configChanges lists config keys changed since the last accepted
+	// config; configPending is that config, accepted by resume.
+	configChanges []string
+	configPending *pendingConfig
+	// auditBad is set when audit.Verify failed after unlock; resume
+	// archives the rejected log and starts a new chain.
+	auditBad bool
 
 	keys *integrityKeys
 	// integrityOK is false after a failed ledger/state verification until
@@ -63,7 +80,7 @@ type stateData struct {
 	rollback        bool
 	prevNotScrubbed bool
 
-	lastAnchor, lastSave, lastExpire, lastSweep time.Time
+	lastAnchor, lastSave, lastExpire, lastSweep, lastCheckpoint time.Time
 
 	// concScopes are scopes with a concurrency cap set on the ledger.
 	concScopes map[string]bool
@@ -79,13 +96,20 @@ type grantInfo struct {
 	pass   string
 }
 
-// overlay raises one limit temporarily after an approved over_limit request.
-type overlay struct {
+// passGrant lets one pass exceed one limit by up to amount until until: its
+// reservations skip that limit and count against scope grant:<id> instead
+// (spec §9). It comes only from an approval decided with a vault secret.
+type passGrant struct {
+	id     string
+	pass   string
 	scope  string
 	window budget.Window
 	amount money.Micros
 	until  time.Time
 }
+
+// pendingConfig is a changed config awaiting the owner's acceptance.
+type pendingConfig struct{ hash, toml string }
 
 func newID(prefix string) string {
 	var b [8]byte
@@ -186,7 +210,8 @@ func unlockFailReason(err error) string {
 }
 
 // afterUnlock runs with unlockMu held and the vault unlocked: integrity keys,
-// ledger verification against the stored checkpoint, new session.
+// ledger verification against the checkpoint stored in the vault, audit
+// chain and anchor verification, the config check, and a new session.
 func (d *Daemon) afterUnlock(method string) error {
 	keys, created, err := d.loadIntegrityKeys()
 	if err != nil {
@@ -198,23 +223,44 @@ func (d *Daemon) afterUnlock(method string) error {
 	d.ledger.SetMACKey(keys.ledger.Bytes())
 
 	var problems []string
-	st, exists, serr := loadStateFile(filepath.Join(d.dataDir, StateFile), keys.state.Bytes(), d.vault.ID())
+	vs, vsExists, vserr := d.loadVaultState()
+	if vserr != nil {
+		problems = append(problems, "the daemon state in the vault cannot be read")
+		vs = &vaultState{Version: 1, ActiveKeys: map[string]string{}}
+		d.vsMu.Lock()
+		d.vs = vs.clone()
+		d.vsMu.Unlock()
+	} else if !vsExists {
+		// A vault from before the daemon-state entry: start the entry.
+		d.vsMu.Lock()
+		d.vs = vs.clone()
+		d.vsMu.Unlock()
+	}
+	// state.json holds only non-security bookkeeping now; a checkpoint in
+	// it is used once, to migrate a vault without the daemon-state entry.
+	st, stExists, serr := loadStateFile(filepath.Join(d.dataDir, StateFile), keys.state.Bytes(), d.vault.ID())
 	if serr != nil {
-		problems = append(problems, "state.json: "+serr.Error())
+		d.log.Warn("state.json ignored", "err", serr)
+		st, stExists = stateBody{}, false
 	}
 	nonEmpty, lerr := ledgerHasRecords(filepath.Join(d.dataDir, LedgerDir))
 	if lerr != nil {
 		problems = append(problems, "ledger: cannot list files")
 	}
-	if nonEmpty && !exists && serr == nil {
-		problems = append(problems, "state.json is missing but the ledger has records")
-	}
 	if nonEmpty && created {
 		problems = append(problems, "the integrity key was missing from the vault")
 	}
 	var cp *budget.Checkpoint
-	if exists && serr == nil {
+	switch {
+	case vsExists && vserr == nil:
+		cp = vs.Checkpoint
+		if cp == nil && nonEmpty {
+			problems = append(problems, "the ledger has records but the vault holds no checkpoint")
+		}
+	case !vsExists && stExists && st.Checkpoint != nil:
 		cp = st.Checkpoint
+	case !vsExists && nonEmpty:
+		problems = append(problems, "the ledger checkpoint is missing but the ledger has records")
 	}
 	in, verr := d.ledger.VerifyIntegrity(keys.ledger.Bytes(), budget.VerifyOptions{Checkpoint: cp})
 	if verr != nil {
@@ -223,6 +269,37 @@ func (d *Daemon) afterUnlock(method string) error {
 		problems = append(problems, in.Problems...)
 		if len(in.Problems) == 0 {
 			problems = append(problems, "ledger integrity check failed")
+		}
+	}
+
+	// The audit chain and its anchors (spec §11), with the anchor key.
+	var auditProblem string
+	d.withAudit(func(l *audit.Log) {
+		if ferr := l.Flush(); ferr != nil {
+			auditProblem = "audit log cannot be flushed"
+			return
+		}
+		rep, aerr := audit.Verify(filepath.Join(d.dataDir, AuditDir), keys.anchor.Bytes())
+		switch {
+		case rep.FirstBad != nil:
+			auditProblem = rep.FirstBad.String()
+		case aerr != nil:
+			auditProblem = "audit verification could not complete"
+		}
+	})
+
+	// The effective config against the last accepted one (spec §14).
+	var changes []string
+	var pending *pendingConfig
+	curTOML, cerr := d.cfg.Encode()
+	curHash, herr := d.cfg.Hash()
+	if cerr != nil || herr != nil {
+		problems = append(problems, "cannot encode the effective config")
+	} else if vs.ConfigHash != "" && vs.ConfigHash != curHash {
+		pending = &pendingConfig{hash: curHash, toml: curTOML}
+		var derr error
+		if changes, derr = config.Diff(vs.ConfigTOML, curTOML); derr != nil || len(changes) == 0 {
+			changes = []string{"config.toml changed (details unavailable)"}
 		}
 	}
 
@@ -238,10 +315,12 @@ func (d *Daemon) afterUnlock(method string) error {
 	if !d.st.integrityOK {
 		d.st.integrityMsg = "failed"
 	}
+	d.st.auditBad = auditProblem != ""
+	d.st.configChanges, d.st.configPending = changes, pending
 	for _, m := range st.ModelsSeen {
 		d.st.modelsSeen[m] = true
 	}
-	d.st.lastAnchor, d.st.lastSave, d.st.lastExpire = now, now, now
+	d.st.lastAnchor, d.st.lastSave, d.st.lastExpire, d.st.lastCheckpoint = now, now, now, now
 	for _, sc := range d.sessionScopesLocked() {
 		d.ledger.ResetSession(sc)
 	}
@@ -250,6 +329,10 @@ func (d *Daemon) afterUnlock(method string) error {
 	switch {
 	case !d.st.integrityOK:
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripIntegrity, "ledger or state verification failed"
+	case d.st.auditBad:
+		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripAuditIntegrity, "audit log verification failed"
+	case pending != nil:
+		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripConfig, "config.toml changed since it was last accepted"
 	case d.ledger.Tripped():
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripVelocity, "tripwire still active"
 	case d.isAuditBroken():
@@ -267,6 +350,7 @@ func (d *Daemon) afterUnlock(method string) error {
 	d.auditEvent("unlock", map[string]any{
 		"ok": true, "method": method, "session": sid, "state": string(state),
 		"recovered_from_prev": d.vault.RecoveredFromPrev(), "integrity_ok": len(problems) == 0,
+		"audit_ok": auditProblem == "", "config_changed": pending != nil,
 	})
 	if len(problems) > 0 {
 		if len(problems) > 8 {
@@ -274,6 +358,23 @@ func (d *Daemon) afterUnlock(method string) error {
 		}
 		d.log.Error("integrity verification failed after unlock; daemon tripped", "problems", problems)
 		d.auditEvent("trip", map[string]any{"reason": TripIntegrity, "problems": problems})
+	}
+	if auditProblem != "" {
+		d.log.Error("audit log verification failed after unlock; daemon tripped", "problem", auditProblem)
+		d.auditEvent("trip", map[string]any{"reason": TripAuditIntegrity, "problem": auditProblem})
+	}
+	if pending != nil {
+		d.log.Warn("config.toml changed since it was last accepted; daemon tripped until `keyleash resume`", "changes", changes)
+		d.auditEvent("config_change", map[string]any{"changes": changes, "accepted": false})
+		if len(problems) == 0 && auditProblem == "" {
+			d.auditEvent("trip", map[string]any{"reason": TripConfig})
+		}
+	}
+	// First unlock (or a migrated vault): record the config as accepted.
+	if cerr == nil && herr == nil && vserr == nil && (vs.ConfigHash == "" || !vsExists) {
+		if err := d.updateVaultState(func(s *vaultState) { s.ConfigHash, s.ConfigTOML = curHash, curTOML }); err != nil {
+			d.log.Error("recording the config in the vault failed", "err", err)
+		}
 	}
 	d.anchor()
 	d.saveState()
@@ -321,7 +422,8 @@ func (d *Daemon) lockHeld(reason string) {
 	d.st.awaySince = time.Time{}
 	d.st.leaseUntil = time.Time{}
 	d.st.grant = nil
-	d.st.overlays = nil
+	d.st.passGrants = nil
+	d.st.configChanges, d.st.configPending, d.st.auditBad = nil, nil, false
 	d.applyLimitsLocked()
 	d.mu.Unlock()
 
@@ -373,24 +475,47 @@ func (d *Daemon) trip(reason, detail string) {
 	}
 }
 
-// resume leaves Tripped after a step-up approval.
+// resume leaves Tripped after a step-up approval. It also accepts what the
+// trip reported: a failed ledger verification (the current ledger becomes
+// the checkpoint), a failed audit verification (the rejected log is moved to
+// audit/rejected-<time>/ and a new chain starts) and a changed config (it
+// becomes the accepted config).
 func (d *Daemon) resume(ctx context.Context) error {
 	d.mu.RLock()
 	state, reason, detail := d.st.state, d.st.tripReason, d.st.tripDetail
+	changes := append([]string(nil), d.st.configChanges...)
 	d.mu.RUnlock()
 	if state != StateTripped {
 		return statusErr(409, client.CodeConflict, "not tripped")
 	}
-	dec, err := d.stepUp(ctx, approval.Request{
-		Kind: "resume", Title: "Resume keyleash", Detail: "Tripped: " + reason + " (" + detail + ")",
-		CoalesceKey: "resume",
-	})
+	det := "Tripped: " + reason + " (" + detail + ")"
+	if len(changes) > 0 {
+		det += "; accept config changes: " + strings.Join(changes, "; ")
+	}
+	dec, err := d.stepUp(ctx, approval.Request{Kind: "resume", Title: "Resume keyleash", Detail: det})
 	if err != nil {
 		return err
 	}
 	if d.isAuditBroken() {
 		if err := d.reopenAudit(); err != nil {
 			return statusErr(503, client.CodeInternal, "the audit log still cannot be written; fix the disk and retry")
+		}
+	}
+	d.mu.RLock()
+	auditBad, pending := d.st.auditBad, d.st.configPending
+	d.mu.RUnlock()
+	archived := ""
+	if auditBad {
+		var aerr error
+		if archived, aerr = d.archiveAudit(); aerr != nil {
+			d.log.Error("archiving the rejected audit log failed", "err", aerr)
+			return statusErr(503, client.CodeInternal, "the rejected audit log could not be archived; check the data directory and retry")
+		}
+	}
+	if pending != nil {
+		if err := d.updateVaultState(func(s *vaultState) { s.ConfigHash, s.ConfigTOML = pending.hash, pending.toml }); err != nil {
+			d.log.Error("recording the accepted config failed", "err", err)
+			return statusErr(503, client.CodeInternal, "the accepted config could not be recorded in the vault")
 		}
 	}
 	d.ledger.ResetTrip()
@@ -405,22 +530,84 @@ func (d *Daemon) resume(ctx context.Context) error {
 	if accepted {
 		d.st.integrityMsg = "accepted by owner after failure"
 	}
+	d.st.auditBad = false
+	d.st.configChanges, d.st.configPending = nil, nil
 	d.st.state, d.st.tripReason, d.st.tripDetail = StateUnlocked, "", ""
 	if d.st.idle || d.st.screenLocked {
 		d.enterAwayLocked(now, "idle")
 	}
 	d.mu.Unlock()
-	d.auditEvent("resume", map[string]any{"approved_by": dec.Method, "reason": reason, "integrity_accepted": accepted})
+	f := map[string]any{"approved_by": dec.Method, "reason": reason, "integrity_accepted": accepted}
+	if archived != "" {
+		f["audit_archived"] = archived
+	}
+	if pending != nil {
+		f["config_accepted"] = changes
+		d.auditEvent("config_change", map[string]any{"changes": changes, "accepted": true})
+	}
+	d.auditEvent("resume", f)
 	d.saveState()
 	return nil
 }
 
-// stepUp asks the approval queue and maps the outcome to admin errors.
+// archiveAudit moves the current audit files to audit/rejected-<time>/ and
+// starts a fresh chain (after the owner accepted a failed verification).
+func (d *Daemon) archiveAudit() (string, error) {
+	var key []byte
+	d.mu.RLock()
+	if d.st.keys != nil {
+		key = append([]byte(nil), d.st.keys.anchor.Bytes()...)
+	}
+	d.mu.RUnlock()
+	defer secmem.Wipe(key)
+
+	dir := filepath.Join(d.dataDir, AuditDir)
+	name := "rejected-" + d.clk.Now().UTC().Format("20060102T150405Z")
+	d.auditMu.Lock()
+	defer d.auditMu.Unlock()
+	d.audit.Close()
+	reopen := func() error {
+		l, err := audit.Open(dir, d.clk)
+		if err != nil {
+			d.auditBroken = true
+			return err
+		}
+		if key != nil {
+			l.SetAnchorKey(key)
+		}
+		d.audit = l
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(dir, name), 0o700); err != nil {
+		return "", errors.Join(err, reopen())
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return "", errors.Join(err, reopen())
+	}
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		if err := os.Rename(filepath.Join(dir, e.Name()), filepath.Join(dir, name, e.Name())); err != nil {
+			return "", errors.Join(err, reopen())
+		}
+	}
+	return filepath.Join(AuditDir, name), reopen()
+}
+
+// stepUp asks the approval queue for an admin step-up and maps the outcome
+// to admin errors. Admin step-ups never coalesce (spec §9): only the caller
+// whose request triggered the prompt proceeds. The verified caller PID is
+// attached so the CLI can recognise its own request.
 func (d *Daemon) stepUp(ctx context.Context, req approval.Request) (approval.Decision, error) {
+	req.CoalesceKey = ""
+	req.Requester = callerFrom(ctx).pid
 	dec, err := d.queue.Request(ctx, req)
 	d.auditEvent("approval", map[string]any{
 		"kind": req.Kind, "approved": dec.Approved && err == nil, "method": dec.Method,
 		"pass": req.PassID, "model": req.Model, "amount_micros": int64(req.Amount),
+		"requester_pid": req.Requester, "detail": req.Detail,
 	})
 	switch {
 	case errors.Is(err, approval.ErrTimeout):
@@ -500,7 +687,7 @@ func (d *Daemon) stepPresence() { d.monitor.Step(d.onPresence) }
 
 // ---- housekeeping ----------------------------------------------------------
 
-// housekeep runs once a second: lease and away expiry, grant and overlay
+// housekeep runs once a second: lease and away expiry, grant and pass-grant
 // expiry, audit flush and anchors, checkpoint saves, stale reservations and
 // run passes whose process has exited.
 func (d *Daemon) housekeep() {
@@ -529,15 +716,16 @@ func (d *Daemon) housekeep() {
 		changed = true
 		d.auditEvent("limit_change", map[string]any{"change": "grant_expired", "grant": g.id})
 	}
-	kept := d.st.overlays[:0]
-	for _, o := range d.st.overlays {
-		if now.Before(o.until) {
-			kept = append(kept, o)
+	kept := d.st.passGrants[:0]
+	for _, g := range d.st.passGrants {
+		if now.Before(g.until) {
+			kept = append(kept, g)
 		} else {
 			changed = true
+			d.auditEvent("limit_change", map[string]any{"change": "pass_grant_expired", "grant": g.id, "pass": g.pass})
 		}
 	}
-	d.st.overlays = kept
+	d.st.passGrants = kept
 	if changed {
 		d.applyLimitsLocked()
 	}
@@ -596,12 +784,60 @@ func (d *Daemon) isAuditBroken() bool {
 	return d.auditBroken
 }
 
-// auditEvent appends one record. A record the log rejects as malformed or
-// secret-looking is a programming error (logged, not fatal). Any other
-// failure is a write failure: the audit record is the point, so the daemon
-// stops serving (Tripped) until the log can be reopened. Never call trip
+// securityAuditTypes are record types whose loss is not acceptable: if the
+// log rejects one even after sanitising, the daemon trips (spec §11).
+var securityAuditTypes = map[string]bool{
+	"request": true, "pass_issue": true, "approval": true, "unlock": true, "lock": true,
+	"trip": true, "key_add": true, "key_remove": true, "slot_change": true,
+}
+
+// maxAuditString bounds one string field; longer values are cut.
+const maxAuditString = 1024
+
+// sanitizeAudit replaces every string that looks like a secret with
+// audit.Redact's "[redacted:<hash prefix>]" and truncates overlong strings,
+// so a caller-controlled value (client image, model, pass name, label,
+// detail) cannot make Append drop a record.
+func sanitizeAudit(v any) any {
+	switch x := v.(type) {
+	case string:
+		s := audit.Redact(x)
+		if len(s) > maxAuditString {
+			s = strings.ToValidUTF8(s[:maxAuditString], "") + "...[truncated]"
+		}
+		return s
+	case []string:
+		out := make([]string, len(x))
+		for i, s := range x {
+			out[i] = sanitizeAudit(s).(string)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = sanitizeAudit(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[k] = sanitizeAudit(e)
+		}
+		return out
+	}
+	return v
+}
+
+// auditEvent appends one record after sanitising its string fields. If the
+// log still rejects it (secret-looking or too large), a security-relevant
+// record type trips the daemon; other types are logged. Any other failure is
+// a write failure: the audit record is the point, so the daemon stops
+// serving (Tripped) until the log can be reopened. Never call trip
 // synchronously from here: callers may hold d.mu.
 func (d *Daemon) auditEvent(typ string, fields map[string]any) {
+	if fields != nil {
+		fields = sanitizeAudit(fields).(map[string]any)
+	}
 	d.auditMu.Lock()
 	err := d.audit.Append(typ, fields)
 	d.auditMu.Unlock()
@@ -613,6 +849,9 @@ func (d *Daemon) auditEvent(typ string, fields map[string]any) {
 	}
 	if errors.Is(err, audit.ErrSecret) || errors.Is(err, audit.ErrTooLarge) {
 		d.log.Error("audit record rejected", "type", typ, "err", err)
+		if securityAuditTypes[typ] {
+			go d.trip(TripAudit, "a security audit record ("+typ+") was rejected")
+		}
 		return
 	}
 	d.markAuditBroken(err)
@@ -669,8 +908,9 @@ func (d *Daemon) anchor() {
 	d.mu.Unlock()
 }
 
-// saveState stores the ledger checkpoint in state.json (MAC'd). It is a
-// no-op while locked or while an integrity failure is unresolved.
+// saveState writes the ledger checkpoint into the daemon-state vault entry
+// (spec §7.7) and the non-security bookkeeping into state.json (MAC'd). It
+// is a no-op while locked or while an integrity failure is unresolved.
 func (d *Daemon) saveState() {
 	if err := d.ledger.Flush(); err != nil {
 		d.log.Warn("ledger flush before checkpoint", "err", err)
@@ -692,7 +932,10 @@ func (d *Daemon) saveState() {
 		models = append(models, m)
 	}
 	cp := d.ledger.Checkpoint()
-	body := stateBody{Version: 1, VaultID: d.vault.ID(), Saved: now.UTC(), Checkpoint: &cp, ModelsSeen: models}
+	if err := d.updateVaultState(func(s *vaultState) { s.Checkpoint = &cp }); err != nil {
+		d.log.Error("saving the ledger checkpoint to the vault failed", "err", err)
+	}
+	body := stateBody{Version: 1, VaultID: d.vault.ID(), Saved: now.UTC(), ModelsSeen: models}
 	if err := saveStateFile(filepath.Join(d.dataDir, StateFile), d.st.keys.state.Bytes(), body); err != nil {
 		d.log.Error("saving state.json failed", "err", err)
 	}

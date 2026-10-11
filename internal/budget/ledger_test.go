@@ -762,3 +762,44 @@ func TestErrorStringsCarryNoMeta(t *testing.T) {
 		t.Fatalf("error leaks meta: %v", err)
 	}
 }
+
+// TestReserveWithSkipAdmitsOnlyThatReservation: skipping a limit admits one
+// reservation over it without raising the limit for anyone else, and the
+// admitted spend still counts toward it.
+func TestReserveWithSkipAdmitsOnlyThatReservation(t *testing.T) {
+	l, _, _ := newTest(t)
+	l.SetLimits([]Limit{
+		{Scope: ScopeGlobal, Window: WindowRequest, Amount: 10},
+		{Scope: ScopeGlobal, Window: WindowDay, Amount: 100},
+		{Scope: "pass:a", Window: WindowDay, Amount: 1000},
+	})
+	if _, err := l.Reserve([]string{"pass:a"}, 50, Meta{}); !errors.Is(err, ErrExceeded) {
+		t.Fatalf("over request limit: %v", err)
+	}
+	skipReq := ReserveOptions{Skip: []LimitKey{{Scope: ScopeGlobal, Window: WindowRequest}}}
+	r, err := l.ReserveWith([]string{"pass:a"}, 50, Meta{}, skipReq)
+	if err != nil {
+		t.Fatalf("skipped request limit: %v", err)
+	}
+	// Other limits are still checked for the skipped reservation.
+	if _, err := l.ReserveWith([]string{"pass:a"}, 60, Meta{}, skipReq); !errors.Is(err, ErrExceeded) {
+		t.Fatalf("day limit must still apply: %v", err)
+	}
+	settle(t, r, 50)
+	// Nobody else gained anything: the next normal reservation still sees
+	// the request limit, and the admitted spend counts toward the day.
+	if _, err := l.Reserve([]string{"pass:b"}, 11, Meta{}); !errors.Is(err, ErrExceeded) {
+		t.Fatalf("request limit raised for others: %v", err)
+	}
+	checkSpent(t, l, ScopeGlobal, WindowDay, 50, 0)
+	if _, err := l.ReserveWith(nil, 51, Meta{}, ReserveOptions{Skip: []LimitKey{{Scope: ScopeGlobal, Window: WindowRequest}}}); !errors.Is(err, ErrExceeded) {
+		t.Fatalf("day limit after admitted spend: %v", err)
+	}
+	// Concurrency caps apply even to skipped reservations.
+	l.SetConcurrency(ScopeGlobal, 1)
+	r1 := reserve(t, l, nil, 1, Meta{})
+	if _, err := l.ReserveWith(nil, 1, Meta{}, skipReq); !errors.Is(err, ErrConcurrency) {
+		t.Fatalf("concurrency with skip: %v", err)
+	}
+	r1.Release()
+}

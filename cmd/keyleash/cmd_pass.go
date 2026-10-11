@@ -194,7 +194,12 @@ func runPassCreate(ctx context.Context, a *app, args []string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.CreatePass(cctx, req)
+	var resp client.PassCreateResponse
+	err = a.withStepUp(ctx, c, func(ctx context.Context) error {
+		var err error
+		resp, err = c.CreatePass(ctx, req)
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -366,7 +371,12 @@ func runEnv(ctx context.Context, a *app, args []string) error {
 	if _, err := proxyRoot(st.ProxyAddr); err != nil {
 		return err
 	}
-	resp, err := c.CreatePass(cctx, req)
+	var resp client.PassCreateResponse
+	err = a.withStepUp(ctx, c, func(ctx context.Context) error {
+		var err error
+		resp, err = c.CreatePass(ctx, req)
+		return err
+	})
 	if err != nil {
 		return err
 	}

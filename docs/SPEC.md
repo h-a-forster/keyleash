@@ -47,6 +47,7 @@ This document is normative for the engine. UI is out of scope here.
 | T7 | Key used elsewhere after a past leak | Old key stolen months ago | Optional usage reconciliation against provider usage APIs; panic revoke via admin APIs |
 | T8 | Tampering with records | Malware edits the audit log or ledger to hide spend | Hash-chained audit log; vault metadata authenticated with a key derived from the vault key |
 | T9 | Prompt injection asks the agent to reveal its key | "print your ANTHROPIC_API_KEY" | Agent only ever has a pass |
+| T10 | Agent drives the admin channel | An agent running as the owner calls the admin pipe to approve its own requests, mint passes, add its own key or raise limits | Admin access is never proof of presence: every step-up needs Windows Hello, the vault secret or the daemon's console (§9); processes inside a run pass are confined (§12) |
 
 Residual risk is stated plainly in the README.
 
@@ -222,6 +223,25 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   created by `keyleash run`, process-bound, revoked on exit), `admin` (none —
   the admin channel uses OS-level access control, not passes).
 - Passes only work while the daemon is Unlocked or Away (§8).
+- **Key mapping.** When a pass is issued, each provider it allows that has a
+  key is mapped to a vault entry (`entries`): the provider's *active* key,
+  which is its oldest `api_key` unless the owner chose another with the
+  step-up protected `keyleash keys use <id>`. The mapping never changes:
+  adding a key or changing the active key never redirects an existing pass,
+  and a pass whose mapped key was removed is refused (`no_key`) rather than
+  redirected. A provider without a key at issue time resolves to its active
+  key at request time.
+- **Creation needs a step-up** (§9), with one exception: a `run` pass bound to
+  the calling process itself (the admin channel's verified client PID, §12)
+  that stays within the defaults — providers that all have a key (`*` only
+  when every provider has one), lifetime ≤ `limits.pass.run_ttl`, every spend
+  limit ≤ `limits.pass.max_run_budget` (default $10; a `month` limit of that
+  amount is added when missing; with no limits requested the pass gets
+  `max_run_budget` per `session` and per `month`) and concurrency ≤
+  `limits.pass.concurrency`. A confined or unidentified caller cannot create
+  passes at all. While Away no pass can be created (run passes only with
+  `limits.away.allow_new_run_passes`), and a pass created while Away is
+  refused by the proxy under the same rule.
 
 ## 7. Spend control
 
@@ -258,6 +278,20 @@ Windows per limit: `request`, `minute`, `hour` (rolling), `day`, `month`
 4. If usage cannot be determined (stream cut, unknown format), the reservation
    is settled **at the reserved amount** and marked `estimated`. Fail-safe:
    uncertainty costs budget, never the reverse.
+5. A model without a price (§7.5) is reserved at the provider's **most
+   expensive** input and output rates (largest tier and regional multipliers)
+   for the same token bounds, and settled at those maximum rates for the
+   tokens the response reports (marked `estimated`).
+6. A request whose cost cannot be bounded at all reserves the smallest
+   per-request limit that applies to it (global, provider, model or pass) and
+   always needs approval; with no per-request limit it is refused
+   (`budget_exceeded`). It settles at the metered cost when the model is
+   priced, else as in 5. A worst case above a per-request limit is an ordinary
+   over-limit request.
+7. An approved over-limit request is admitted by skipping exactly the
+   limit(s) the owner saw **for that one reservation** (audited as
+   `limit_override`); the limit itself is never raised. Its charge still
+   counts toward the limit for every later request.
 
 This makes limits hard under concurrency: N parallel requests each hold their
 worst case until they settle.
@@ -274,13 +308,18 @@ worst case until they settle.
 
 - Model allow/deny globs at global, provider and pass level. Default deny
   list is empty; default policy for *unknown* models (not in the pricing table)
-  is `approve` (step-up), never "free".
-- A request is also treated as **unpriced** when its worst case cannot be
-  bounded: server-side context (`previous_response_id`, file ids, cached
-  content) on a model without a known context window, or declared tools with
-  per-call fees and no call cap (e.g. web search without `max_uses` /
-  `max_tool_calls`, code execution, image generation). If a response shows a
-  fee-bearing tool that cannot be priced, the reservation is charged in full.
+  is `approve` (step-up), never "free". `models.unknown` is `approve`, `deny`
+  or `allow`; whatever it says, an unknown model is reserved and charged at
+  the provider's maximum rates (§7.3), and refused while Away. Approvals for
+  the same pass, model and amount bucket (the reservation rounded up to a
+  power of two micro-dollars, shown in the prompt) coalesce.
+- A request is **unbounded** when its worst case cannot be bounded:
+  server-side context (`previous_response_id`, file ids, cached content) on a
+  model without a known context window, or declared tools with per-call fees
+  and no call cap (e.g. web search without `max_uses` / `max_tool_calls`,
+  code execution, image generation). It is handled as in §7.3 step 6 (and
+  refused while Away). If a response shows a fee-bearing tool that cannot be
+  priced, the reservation is charged in full.
 - When the request does not pin a service tier, the estimate assumes the
   model's most expensive tier, because accounts can default to a premium tier
   the request does not show.
@@ -305,7 +344,19 @@ worst case until they settle.
   under a vault-derived key. After unlock the daemon verifies the chain and
   MACs against its last stored checkpoint; any break, MAC failure or missing
   month trips the daemon, so deleting the ledger cannot silently reset spend.
-- Reservations live in memory only; a crash drops in-flight requests anyway.
+- The checkpoint (current month, record count, last hash, settled total and a
+  monotonic counter) lives in an authenticated **vault entry** (provider
+  `keyleash`, label `daemon-state`; hidden from `keyleash keys`), sealed under
+  the DEK and covered by the vault's MAC and anti-rollback sidecar. It is
+  written on lock, on shutdown and at least every 5 minutes while unlocked.
+  After unlock the ledger is verified against it: a missing or shorter ledger,
+  or records without a checkpoint, trip the daemon (`integrity`). The same
+  entry holds the accepted config (§14) and each provider's active key (§6).
+  `state.json` holds only non-security bookkeeping (models seen without a
+  price); deleting it changes nothing.
+- Reservations live in memory only. On shutdown, requests still in flight
+  after the grace period are charged at their reserved amount before the
+  ledger and checkpoint are written, so their spend survives the restart.
 
 ## 8. Presence and state machine
 
@@ -316,7 +367,17 @@ worst case until they settle.
    │                                                     │ away ≥ away_max, screen lock*
    └─────────────────────────────────────────────────────┘
  Unlocked/Away ──velocity tripwire──▶ Tripped ──step-up──▶ Unlocked
+ unlock ──ledger/audit verification failed, config changed──▶ Tripped
 ```
+
+Trip reasons: `velocity`, `integrity` (ledger or checkpoint verification),
+`audit_integrity` (audit chain or anchor verification after unlock),
+`config_changed` (config.toml differs from the last accepted config, §14),
+`audit` (the audit log cannot be written, or a security record was rejected,
+§11). `keyleash resume` (step-up) accepts what the trip reported: the current
+ledger becomes the checkpoint; a rejected audit log is moved to
+`audit/rejected-<time>/` and a new chain starts; a changed config becomes the
+accepted one.
 
 - **Locked**: DEK wiped. All proxied requests get `423 Locked` with a clear
   JSON error. Admin API works (status, unlock).
@@ -324,7 +385,8 @@ worst case until they settle.
 - **Away**: entered after `idle_after` (default 10 min) without keyboard/mouse
   input, or on screen lock (configurable: `screen_lock = "away" | "lock"`,
   default `away`). Existing passes keep working under **away limits** (default
-  $3 total, concurrency 2, no new `run` passes, no unknown models). After
+  $3 total, concurrency 2, no new passes — `run` passes only with
+  `allow_new_run_passes` — no unknown models, no unbounded requests). After
   `away_max` (default 2 h) → Locked.
 - **Unattended grant**: the owner can pre-authorise a long run before leaving:
   `keyleash away --budget 20 --for 8h [--pass <id>]`. Requires step-up. This
@@ -345,22 +407,58 @@ Screen lock: `WTSQuerySessionInformation` lock state, falling back to
 
 ## 9. Step-up approval
 
+**Principle: a step-up is proof of owner presence.** It is one of
+(a) a fresh Windows Hello confirmation performed by the daemon, (b) re-entry
+of a vault secret (passphrase or recovery code) verified by the vault itself
+(the unlocked vault re-derives the key from it; nothing is compared in the
+daemon), or (c) an answer typed into the daemon's own interactive console
+(its foreground terminal). Access to the admin channel is **never** a
+step-up: every process of the owner's OS user can reach it, including the
+agents keyleash governs. A plain "approve" over the admin API therefore
+approves nothing.
+
 Triggered by: unlock (Hello slot implies it), exceeding a limit with
-`on_exceed = "approve"`, unknown or newly-seen expensive model, leaving
-Tripped, unattended grants, reveal/export, slot changes, raising limits.
+`on_exceed = "approve"`, unknown models (`models.unknown = "approve"`),
+unbounded requests (§7.5), leaving Tripped (including accepting a changed
+config), unattended grants, creating a pass beyond the run-pass defaults
+(§6), adding a provider key (except the very first `api_key` in the vault),
+changing a provider's active key, removing a key, reveal/export, slot
+changes, rotating the recovery code, raising limits.
 
 ```
-Approver.Approve(ctx, Request{Kind, Title, Detail, Amount, PassID, Model}) → (Decision, error)
+Approver.Approve(ctx, Request{Kind, Title, Detail, Amount, PassID, Model, Requester, Scope, Window, Limit}) → (Decision, error)
 ```
 
-- `hello` approver: signs a fresh nonce with a Passport KSP key whose UI
-  policy forces a Windows Hello prompt; the prompt text describes the request.
-- `console` approver: TTY prompt (development / headless).
-- `deny` approver: always no (CI, servers).
-- Requests wait up to `approval_timeout` (default 60 s) holding the HTTP
-  request open; identical pending requests (same pass + reason) coalesce.
-- Approvals can carry a grant (e.g. "+$10 for this pass for 1 h") so one
-  approval does not become a prompt storm.
+- `approval.method = "hello"`: signs a fresh nonce with a Passport KSP key
+  whose UI policy forces a Windows Hello prompt; the prompt text describes
+  the request.
+- `"passphrase"` (the `init` default when Windows Hello is unavailable): the
+  daemon prompts nobody; the request waits for `POST /v1/approvals/{id}` with
+  `{approved: true, secret}` — the CLI's `keyleash approvals approve <id>`,
+  or the command that triggered it, asks for the passphrase or recovery code
+  at a hidden prompt.
+- `"console"`: TTY prompt in the daemon's foreground terminal; the
+  passphrase route works too.
+- `"deny"`: always no (CI, servers); nothing can be approved.
+- Approving over the admin API with a secret works with every method except
+  `deny`. Wrong secrets are audited (`approval_secret`) and rate limited:
+  after 5 failures each attempt waits 30 s, doubling up to 15 min (`429
+  rate_limited`). The secret is wiped after use. Denying needs no secret.
+- Requests wait up to `approval.timeout` (default 60 s) holding the HTTP
+  request open. **Admin step-ups never coalesce**: only the caller whose
+  request triggered the prompt proceeds, and the approval records that
+  caller's verified PID (`requester_pid`). Away grants never coalesce, and
+  their prompt shows the exact amount, duration and pass. Over-limit
+  approvals never coalesce: each admits exactly the request shown (§7.3).
+  Only unknown-model approvals with the same pass, model and amount bucket
+  coalesce (§7.5).
+- An over-limit approval may carry a grant ("this pass may exceed this limit
+  by up to $X for D"), set by the approver and shown with its caps: at most
+  `approval.grant_max_multiple` (default 5) times the exceeded limit, for at
+  most `approval.grant_max_duration` (default 24 h). The grant applies only to
+  the requesting pass and only to that limit; its spend is tracked in its own
+  scope (`grant:pg_<approval id>`), and when it is used up further requests
+  are refused (`budget_exceeded`).
 
 ## 10. Proxy
 
@@ -430,10 +528,22 @@ table, so the audit log answers "which program spent this".
   rebuild a consistent chain after editing.
 - Never contains secrets. Passes appear by id only. Keys appear by fingerprint
   only.
+- Caller-controlled fields (client image, model, pass name, labels, prompt
+  details) are sanitised before writing: a value that looks like a secret is
+  replaced by `[redacted:<first 12 hex of its SHA-256>]` and strings are cut at
+  1024 bytes, so a hostile value cannot make the log drop a record. If the log
+  still rejects a security-relevant record (`request`, `pass_issue`,
+  `approval`, `unlock`, `lock`, `trip`, `key_add`, `key_remove`,
+  `slot_change`), the daemon trips (`audit`).
 - Event types: `daemon_start`, `unlock`, `lock`, `away`, `present`, `trip`,
-  `approval`, `pass_issue`, `pass_revoke`, `request` (provider, model, pass,
-  client process, status, tokens, cost, estimated flag, latency, deny reason),
-  `limit_change`, `slot_change`, `panic`, `anchor`.
+  `approval`, `approval_secret`, `pass_issue`, `pass_revoke`, `request`
+  (provider, model, pass, client process, status, tokens, cost, estimated
+  flag, latency, deny reason), `limit_change`, `limit_override`, `key_add`,
+  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `panic`,
+  `anchor`.
+- After every unlock the daemon verifies the chain **and** the anchors with
+  the anchor key; a failure trips the daemon (`audit_integrity`) until the
+  owner resumes (§8).
 - `keyleash audit verify` checks the chain and anchors.
 
 ## 12. Admin channel
@@ -444,7 +554,18 @@ table, so the audit log answers "which program spent this".
   `panic`, `passes` (list/create/revoke), `limits` (get/set), `approvals`
   (list/decide), `usage`, `audit/tail`, `vault/entries` (list/add/remove/rotate),
   `vault/slots` (list/add/remove).
-- Mutating calls that weaken protection require step-up regardless of caller.
+- Mutating calls that weaken protection or spend more require a step-up
+  (§9) regardless of caller. Reaching the channel proves only that the caller
+  runs as the owner's OS user — as every agent does.
+- **Caller identity.** The daemon records the client PID of every admin
+  connection from the OS (Windows `GetNamedPipeClientProcessId`, Linux
+  `SO_PEERCRED`, macOS `LOCAL_PEERPID`).
+- **Confinement.** A caller that is the bound process of an active `run`
+  pass, or one of its descendants, is *confined*: it may only read
+  `GET /v1/status` and revoke its own pass; everything else gets `403
+  confined`. A caller whose PID cannot be determined may read, but every
+  mutating call gets `403 confined`. An error while checking a binding counts
+  as confined (fail closed).
 
 ## 13. CLI (v1)
 
@@ -454,7 +575,10 @@ keyleash daemon                     run the daemon (foreground)
 keyleash status                     state, lease, spend vs limits, active passes
 keyleash unlock | lock
 keyleash add <provider> [--label]   add a key (read from hidden prompt or stdin; never argv)
-keyleash keys                       list entries (masked, fingerprints)
+keyleash keys                       list entries (masked, fingerprints, active key marked)
+keyleash keys use <id>              make <id> its provider's active key for new passes (step-up)
+keyleash approvals [approve|deny <id>]
+                                    list or decide step-ups; approve asks for the passphrase or recovery code
 keyleash run [--budget $] [--ttl] [--models] -- <cmd…>
                                     ephemeral process-bound pass; env injected; revoked on exit
 keyleash env [--provider] [--shell] print base URL + pass exports for a shell (never keys)
@@ -501,6 +625,12 @@ concurrency = 8
 total = "$3"
 concurrency = 2
 
+[limits.pass]
+ttl = "24h"
+run_ttl = "12h"
+concurrency = 4
+max_run_budget = "$10"       # largest run-pass budget without a step-up (§6)
+
 [tripwire]
 window = "5m"
 threshold = "$5"
@@ -513,9 +643,20 @@ deny = []
 action = "deny"              # deny | approve
 
 [approval]
-method = "hello"             # hello | console | deny
+method = "hello"             # hello | passphrase | console | deny (§9)
 timeout = "60s"
+grant_max_multiple = 5       # over-limit grant cap: times the exceeded limit
+grant_max_duration = "24h"   # over-limit grant cap: duration (1m..168h)
 ```
+
+**Config changes need the owner.** config.toml is a plain file any process
+of the owner's user can edit, so the effective config is checked at every
+unlock against the last accepted one (its SHA-256 and text, stored in the
+daemon-state vault entry, §7.7). On the first unlock the current config is
+recorded. If it changed, the daemon audits `config_change` with the list of
+changed keys (`key: old -> new`), enters Tripped (`config_changed`), and
+`keyleash status` / `keyleash unlock` show the changes until `keyleash
+resume` (step-up) accepts them.
 
 ## 15. Later phases (designed for, not in v0.1)
 

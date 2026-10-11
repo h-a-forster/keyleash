@@ -507,8 +507,17 @@ func TestStateFileTamperTrips(t *testing.T) {
 		t.Fatal(r.status)
 	}
 	e.stop()
-	// Deleting state.json (to drop the checkpoint) is detected.
+	// state.json holds no security state any more: deleting it is harmless.
 	if err := os.Remove(filepath.Join(e.dir, StateFile)); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	e.unlock() // fatals unless Unlocked
+	e.stop()
+	// Deleting state.json and the whole ledger (to reset spend) is detected:
+	// the checkpoint lives in the vault (spec §7.7).
+	os.Remove(filepath.Join(e.dir, StateFile))
+	if err := os.RemoveAll(filepath.Join(e.dir, LedgerDir)); err != nil {
 		t.Fatal(err)
 	}
 	e.start()
@@ -715,30 +724,55 @@ func TestExternalApprovalViaAdmin(t *testing.T) {
 	if len(pending) != 1 || pending[0].Kind != "resume" {
 		t.Fatalf("pending = %+v", pending)
 	}
-	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true}); err != nil {
+	// Access to the admin channel alone never approves (spec §9).
+	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true}); !isAPI(err, 403, client.CodeForbidden) {
+		t.Fatalf("approve without secret: %v", err)
+	}
+	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true, Secret: []byte("not the passphrase")}); !isAPI(err, 401, client.CodeWrongSecret) {
+		t.Fatalf("approve with a wrong secret: %v", err)
+	}
+	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true, Secret: append([]byte(nil), testPassphrase...)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true}); !isAPI(err, 404, client.CodeNotFound) {
+	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true, Secret: append([]byte(nil), testPassphrase...)}); !isAPI(err, 404, client.CodeNotFound) {
 		t.Fatalf("second decision: %v", err)
 	}
+	e.assertNoSecrets()
 }
 
-func TestHelloApproverCannotBeApprovedOverAdmin(t *testing.T) {
-	e := newEnv(t, nil)
-	e.approver = helloLike{}
+func TestRecoveryCodeApprovesAndDenyNeedsNothing(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	e.approver = blockingApprover{}
 	e.restart()
-	if e.d.adminApprove {
-		t.Fatal("admin approvals must be deny-only with the hello approver")
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 423, proxy.ReasonTripped)
+	first := make(chan error, 1)
+	go func() { _, err := e.c.Resume(e.ctx()); first <- err }()
+	id := e.waitPending("resume")
+	if err := e.c.Decide(e.ctx(), id, client.DecideRequest{Approved: false}); err != nil {
+		t.Fatal(err)
 	}
-	if err := e.c.Decide(e.ctx(), "x", client.DecideRequest{Approved: true}); !isAPI(err, 403, client.CodeForbidden) {
-		t.Fatalf("approve: %v", err)
+	if err := <-first; !isAPI(err, 403, client.CodeStepUpDenied) {
+		t.Fatalf("denied resume: %v", err)
 	}
-	if err := e.c.Decide(e.ctx(), "x", client.DecideRequest{Approved: false}); !isAPI(err, 404, client.CodeNotFound) {
-		t.Fatalf("deny: %v", err)
+	second := make(chan error, 1)
+	go func() { _, err := e.c.Resume(e.ctx()); second <- err }()
+	id = e.waitPending("resume")
+	if err := e.c.Decide(e.ctx(), id, client.DecideRequest{Approved: true, Method: client.MethodRecovery, Secret: []byte(e.recovery)}); err != nil {
+		t.Fatal(err)
 	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if st := e.status(); st.State != client.StateUnlocked {
+		t.Fatalf("state = %s", st.State)
+	}
+	e.assertNoSecrets()
 }
 
 func TestSecondInstanceRefused(t *testing.T) {

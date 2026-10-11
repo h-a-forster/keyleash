@@ -29,8 +29,12 @@ prompt, or from the first line of standard input with --stdin:
 Putting the key itself on the command line is refused: arguments are
 visible to other processes and saved in shell history.
 
-Providers: anthropic, openai, openrouter, gemini. Requests use the newest
-key stored for a provider.`,
+Providers: anthropic, openai, openrouter, gemini. The very first key in
+the vault is stored right away; any further key needs a step-up approval
+(Windows Hello, or your passphrase or recovery code), so a process running
+as you cannot slip its own key in. Each pass keeps the key it was issued
+with; new passes use the provider's active key (its oldest key unless you
+chose another with 'keyleash keys use <id>').`,
 	run: runAdd,
 }
 
@@ -87,13 +91,19 @@ func (a *app) addKey(ctx context.Context, c *client.Client, providerName, label 
 	if warn != "" {
 		fmt.Fprintln(a.stderr, "warning: "+warn)
 	}
-	actx, cancel := withTimeout(ctx)
-	defer cancel()
-	info, err := c.AddKey(actx, providerName, label, key)
+	var info client.KeyInfo
+	err = a.withStepUp(ctx, c, func(ctx context.Context) error {
+		var err error
+		info, err = c.AddKey(ctx, providerName, label, key)
+		return err
+	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(a.stdout, "Added %s key %q (id %s, fingerprint %s).\n", info.Provider, info.Label, info.ID, info.Fingerprint)
+	if !info.Active && info.Kind == vault.KindAPIKey {
+		fmt.Fprintf(a.stderr, "note: %s already has an active key; new passes keep using it until you run: keyleash keys use %s\n", info.Provider, info.ID)
+	}
 	return nil
 }
 
@@ -138,14 +148,26 @@ func checkKeyInput(providerName string, key []byte) (warning string, err error) 
 
 var cmdKeys = &command{
 	name:    "keys",
-	args:    "[--json]",
-	summary: "list stored keys (masked: id, provider, label, fingerprint)",
+	args:    "[--json] | use <id>",
+	summary: "list stored keys (masked), or choose a provider's active key",
+	help: `
+  keyleash keys            list stored keys (masked: id, provider, label,
+                           fingerprint; * marks each provider's active key)
+  keyleash keys use <id>   make <id> its provider's active key: the key new
+                           passes use (step-up approval; existing passes
+                           keep the key they were issued with)`,
 	run: func(ctx context.Context, a *app, args []string) error {
 		fs := newFlagSet("keys")
 		asJSON := fs.Bool("json", false, "print JSON")
-		if pos, err := parseFlags(fs, args, true); err != nil {
+		pos, err := parseFlags(fs, args, true)
+		if err != nil {
 			return err
-		} else if len(pos) > 0 {
+		}
+		use := len(pos) > 0 && pos[0] == "use"
+		switch {
+		case use && len(pos) != 2:
+			return usagef("keys", "use takes exactly one key id (see 'keyleash keys')")
+		case !use && len(pos) > 0:
 			return usagef("keys", "unexpected argument")
 		}
 		c, err := a.client()
@@ -153,6 +175,19 @@ var cmdKeys = &command{
 			return err
 		}
 		defer c.Close()
+		if use {
+			var info client.KeyInfo
+			err := a.withStepUp(ctx, c, func(ctx context.Context) error {
+				var err error
+				info, err = c.UseKey(ctx, pos[1])
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(a.stdout, "New %s passes now use key %q (id %s, fingerprint %s).\n", info.Provider, info.Label, info.ID, info.Fingerprint)
+			return nil
+		}
 		cctx, cancel := withTimeout(ctx)
 		defer cancel()
 		keys, err := c.Keys(cctx)
@@ -172,7 +207,11 @@ var cmdKeys = &command{
 		authenticated := true
 		for _, k := range keys {
 			authenticated = authenticated && k.Authenticated
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", k.ID, k.Provider, k.Kind, k.Label, k.Fingerprint, fmtTime(k.Created, now))
+			id := k.ID
+			if k.Active {
+				id += " *"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", id, k.Provider, k.Kind, k.Label, k.Fingerprint, fmtTime(k.Created, now))
 		}
 		tw.Flush()
 		if !authenticated {
@@ -188,8 +227,9 @@ var cmdRmKey = &command{
 	summary: "remove a stored key (step-up approval)",
 	help: `
 Removes a key from the vault. This needs a step-up approval (Windows Hello,
-or the daemon console). Get the id from 'keyleash keys'. Removing a key does
-not revoke it at the provider; rotate it there if it may have leaked.`,
+or your passphrase or recovery code). Get the id from 'keyleash keys'.
+Passes issued with the key stop working. Removing a key does not revoke it
+at the provider; rotate it there if it may have leaked.`,
 	run: func(ctx context.Context, a *app, args []string) error {
 		fs := newFlagSet("rm-key")
 		pos, err := parseFlags(fs, args, true)
@@ -205,7 +245,7 @@ not revoke it at the provider; rotate it there if it may have leaked.`,
 		}
 		defer c.Close()
 		fmt.Fprintln(a.stderr, "Waiting for step-up approval...")
-		if err := c.RemoveKey(ctx, pos[0]); err != nil {
+		if err := a.withStepUp(ctx, c, func(ctx context.Context) error { return c.RemoveKey(ctx, pos[0]) }); err != nil {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Removed key %s.\n", pos[0])

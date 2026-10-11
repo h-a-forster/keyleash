@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/client"
+	"github.com/h-a-forster/keyleash/internal/daemon"
 	"github.com/h-a-forster/keyleash/internal/meter"
 )
 
@@ -351,5 +352,71 @@ func TestPortCheck(t *testing.T) {
 	}
 	if c := portCheck(n, nil); c.Level != levelFail {
 		t.Errorf("busy port: %+v", c)
+	}
+}
+
+// TestApprovalsApproveNeedsSecret: approving over the admin channel needs the
+// vault passphrase or recovery code; a waiting command points at the
+// approval it triggered; denying needs nothing.
+func TestApprovalsApproveNeedsSecret(t *testing.T) {
+	td := startTestDaemon(t, true, func(o *daemon.Options) { o.Approver = manualApprover{} })
+	if code, _, errOut := td.run(testPassphrase+"\n", "unlock", "--stdin"); code != 0 {
+		t.Fatalf("unlock: %q", errOut)
+	}
+	c := td.client()
+	defer c.Close()
+	waitPending := func() client.Approval {
+		t.Helper()
+		for i := 0; i < 500; i++ {
+			if list, _ := c.Approvals(t.Context()); len(list) == 1 {
+				return list[0]
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("no pending approval")
+		return client.Approval{}
+	}
+	type res struct {
+		code        int
+		out, errOut string
+	}
+	away := func() chan res {
+		ch := make(chan res, 1)
+		go func() {
+			code, out, errOut := td.run("", "away", "--budget", "1", "--for", "1h")
+			ch <- res{code, out, errOut}
+		}()
+		return ch
+	}
+
+	done := away()
+	ap := waitPending()
+	if ap.Requester != os.Getpid() || ap.Kind != "away_grant" {
+		t.Fatalf("approval = %+v", ap)
+	}
+	if code, _, errOut := td.run("not the passphrase\n", "approvals", "approve", ap.ID, "--stdin"); code != exitError || !strings.Contains(errOut, "wrong passphrase") {
+		t.Fatalf("wrong secret: %d %q", code, errOut)
+	}
+	if code, _, errOut := td.run(testPassphrase+"\n", "approvals", "approve", ap.ID, "--stdin"); code != 0 || !strings.Contains(errOut, "Approved "+ap.ID) {
+		t.Fatalf("approve: %d %q", code, errOut)
+	}
+	r := <-done
+	if r.code != 0 || !strings.Contains(r.out, "Grant g_") {
+		t.Fatalf("away: %d %q %q", r.code, r.out, r.errOut)
+	}
+	if strings.Contains(r.out+r.errOut, testPassphrase) {
+		t.Fatal("passphrase echoed")
+	}
+
+	done = away()
+	ap = waitPending()
+	if code, out, errOut := td.run("", "approvals", "deny", ap.ID); code != 0 || !strings.Contains(out, "Denied") {
+		t.Fatalf("deny: %d %q %q", code, out, errOut)
+	}
+	if r := <-done; r.code == 0 || !strings.Contains(r.errOut, "denied") {
+		t.Fatalf("denied away: %d %q", r.code, r.errOut)
+	}
+	if code, _, errOut := td.run(testPassphrase+"\n", "approvals", "approve", "nope", "--stdin"); code != exitError || !strings.Contains(errOut, "no such pending approval") {
+		t.Fatalf("unknown id: %d %q", code, errOut)
 	}
 }

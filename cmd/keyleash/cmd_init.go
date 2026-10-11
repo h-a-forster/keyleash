@@ -34,7 +34,7 @@ var helloAvailable = winhello.Available
 
 var cmdInit = &command{
 	name:    "init",
-	args:    "[--method auto|hello|passphrase] [--profile recommended|strict|relaxed] [--approval hello|console|deny] [--stdin] [--no-add]",
+	args:    "[--method auto|hello|passphrase] [--profile recommended|strict|relaxed] [--approval hello|passphrase|console|deny] [--stdin] [--no-add]",
 	summary: "create the vault, recovery code and recommended config",
 	help: `
 Creates the encrypted vault in the data directory ($KEYLEASH_HOME, or
@@ -47,9 +47,11 @@ group to confirm. A config.toml with the chosen profile is written (an
 existing one is kept). Finally keyleash offers to start the daemon and add
 your first provider key.
 
-Step-up approvals (unknown models, unattended grants, leaving Tripped) use
-Windows Hello when available; otherwise the daemon's console, where
-'keyleash approvals approve <id>' also works. Override with --approval.
+Step-up approvals (new keys, passes beyond the run defaults, unattended
+grants, leaving Tripped, ...) need proof that you are present: Windows Hello
+when available, otherwise your passphrase or recovery code, typed into
+'keyleash approvals approve <id>' (or the command that asked). Override
+with --approval (console: the daemon's own terminal also answers).
 
 --stdin reads the passphrase from the first line of standard input (for
 scripts); the recovery code is then printed without the re-type check.`,
@@ -60,7 +62,7 @@ func runInit(ctx context.Context, a *app, args []string) error {
 	fs := newFlagSet("init")
 	method := fs.String("method", "auto", "first key slot: auto, hello or passphrase")
 	profile := fs.String("profile", "recommended", "config profile: recommended, strict or relaxed")
-	approvalMethod := fs.String("approval", "", "step-up approver: hello, console or deny (default: hello if available, else console)")
+	approvalMethod := fs.String("approval", "", "step-up approver: hello, passphrase, console or deny (default: hello if available, else passphrase)")
 	fromStdin := fs.Bool("stdin", false, "read the passphrase from stdin (non-interactive)")
 	noAdd := fs.Bool("no-add", false, "do not offer to add a first key")
 	pos, err := parseFlags(fs, args, true)
@@ -107,7 +109,7 @@ func runInit(ctx context.Context, a *app, args []string) error {
 	appr := *approvalMethod
 	switch appr {
 	case "":
-		appr = "console"
+		appr = "passphrase"
 		if helloOK {
 			appr = "hello"
 		}
@@ -115,9 +117,9 @@ func runInit(ctx context.Context, a *app, args []string) error {
 		if !helloOK {
 			return fmt.Errorf("--approval hello needs Windows Hello, which is not available (%s)", helloWhy)
 		}
-	case "console", "deny":
+	case "passphrase", "console", "deny":
 	default:
-		return usagef("init", "--approval must be hello, console or deny")
+		return usagef("init", "--approval must be hello, passphrase, console or deny")
 	}
 
 	var pw []byte
@@ -330,9 +332,12 @@ func setApprovalMethod(path, method string) error {
 	var add strings.Builder
 	add.WriteString("\n# Set by `keyleash init`.")
 	switch method {
+	case "passphrase":
+		add.WriteString(" Step-up approvals need your passphrase or recovery code,\n")
+		add.WriteString("# typed into `keyleash approvals approve <id>`.\n")
 	case "console":
 		add.WriteString(" Step-up approvals are answered in the daemon's console\n")
-		add.WriteString("# or with `keyleash approvals approve <id>`.\n")
+		add.WriteString("# or with `keyleash approvals approve <id>` (passphrase or recovery code).\n")
 	case "deny":
 		add.WriteString(" Every step-up approval is denied.\n")
 	default:

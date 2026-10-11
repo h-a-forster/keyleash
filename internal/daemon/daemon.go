@@ -59,18 +59,19 @@ const (
 	InstanceLock = "daemon.lock"
 )
 
+// ShutdownGrace bounds the wait for in-flight requests at shutdown (a
+// variable so tests can shorten it).
+var ShutdownGrace = 30 * time.Second
+
 // Tunables of the daemon's background work.
 const (
 	// InFlightMaxAge is how old a reservation may get before it is settled
 	// at its reserved amount (fail closed). It exceeds the proxy's response
 	// header timeout plus its stream idle timeout.
 	InFlightMaxAge = 30 * time.Minute
-	// StateSaveEvery is how often the ledger checkpoint is saved while
+	// StateSaveEvery is how often the ledger checkpoint (vault) and state.json are saved while
 	// unlocked (it is also saved on lock and shutdown).
-	StateSaveEvery = 2 * time.Minute
-	// ShutdownGrace bounds the wait for in-flight requests at shutdown.
-	ShutdownGrace = 30 * time.Second
-
+	StateSaveEvery = VaultCheckpointEvery
 	expireEvery    = time.Minute
 	passSweepEvery = 30 * time.Second
 	housekeepTick  = time.Second
@@ -124,6 +125,11 @@ type Options struct {
 	// os.Stdin / os.Stderr).
 	ConsoleIn  io.Reader
 	ConsoleOut io.Writer
+	// AdminPeerPID returns the client PID of an admin connection (default:
+	// GetNamedPipeClientProcessId on Windows, SO_PEERCRED / LOCAL_PEERPID on
+	// Unix). An error means "unknown": the caller is then confined for
+	// mutating calls (spec §12).
+	AdminPeerPID func(net.Conn) (int, error)
 
 	// manualPresence (tests) disables the presence goroutine; tests drive
 	// the monitor with stepPresence.
@@ -148,10 +154,6 @@ type Daemon struct {
 	audit    *audit.Log
 	meter    *meter.Meter
 	queue    *approval.Queue
-	// adminApprove: pending approvals may be APPROVED over the admin API.
-	// False when the approver is Windows Hello: a same-user process must not
-	// be able to approve its own step-up request (it may always deny).
-	adminApprove bool
 
 	presSrc  presence.Source
 	osSource *presence.OSSource
@@ -165,6 +167,16 @@ type Daemon struct {
 	isDescendant   func(int, procinfo.Process) (bool, error)
 	lookupProcess  func(int) (procinfo.Process, error)
 	helloAvailable func() (bool, string)
+	adminPeerPID   func(net.Conn) (int, error)
+
+	// vsMu guards vs, the cached daemon-state vault entry (vaultstate.go).
+	vsMu sync.Mutex
+	vs   *vaultState
+
+	// secretMu guards the rate limit on secrets entered to approve.
+	secretMu        sync.Mutex
+	secretFails     int
+	secretLockUntil time.Time
 
 	// unlockMu serialises slow vault operations (unlock, re-key).
 	unlockMu sync.Mutex
@@ -260,6 +272,10 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if d.helloAvailable == nil {
 		d.helloAvailable = winhello.Available
 	}
+	d.adminPeerPID = opts.AdminPeerPID
+	if d.adminPeerPID == nil {
+		d.adminPeerPID = connPeerPID
+	}
 
 	var cleanup []func()
 	defer func() {
@@ -345,7 +361,6 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if appr == nil {
 		appr = d.defaultApprover()
 	}
-	d.adminApprove = approverMethod(appr) != "hello"
 	d.queue = approval.NewQueue(appr, d.cfg.Approval.Timeout.Duration, d.clk)
 
 	// 5. Limits.
@@ -413,7 +428,8 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	}
 
 	d.adminSrv = &http.Server{
-		Handler:           d.adminHandler(),
+		Handler:           d.guard(d.adminHandler()),
+		ConnContext:       d.connContext,
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          log.New(io.Discard, "", 0),
 		BaseContext:       func(net.Listener) context.Context { return d.ctx },
@@ -525,6 +541,14 @@ func (d *Daemon) Close() error {
 	unlocked := d.st.state != StateLocked
 	d.mu.Unlock()
 	if unlocked {
+		// Requests still in flight after the grace period are charged at
+		// their reserved amount while the MAC key is set (fail closed), so
+		// the spend survives the restart.
+		if n, err := d.ledger.ExpireInFlight(-1); err != nil {
+			errs = append(errs, fmt.Errorf("settle in-flight: %w", err))
+		} else if n > 0 {
+			d.log.Warn("in-flight requests charged at their reserved amount on shutdown", "count", n)
+		}
 		if err := d.ledger.Flush(); err != nil {
 			errs = append(errs, err)
 		}
@@ -578,6 +602,8 @@ func (d *Daemon) defaultApprover() approval.Approver {
 		return approval.ConsoleApprover(in, out)
 	case "hello":
 		return approval.HelloApprover(&helloConfirmer{available: d.helloAvailable})
+	case "passphrase":
+		return approval.PassphraseApprover()
 	default:
 		return approval.DenyApprover{}
 	}

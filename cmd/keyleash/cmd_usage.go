@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -123,19 +122,24 @@ func containsString(list []string, s string) bool {
 
 var cmdApprovals = &command{
 	name:    "approvals",
-	args:    "[list|approve <id> [--grant <amount> --for <duration>]|deny <id>] [--json]",
+	args:    "[list|approve <id> [--grant <amount> --for <duration>] [--stdin]|deny <id>] [--json]",
 	summary: "list, approve or deny pending step-up requests",
 	help: `
-Step-up requests (unknown model, over-limit with on_exceed = "approve",
-unattended grants, resume) wait up to approval.timeout for a decision.
+Step-up requests (new keys, passes beyond the run defaults, unknown or
+unbounded-cost requests, over-limit requests with on_exceed = "approve",
+unattended grants, resume, ...) wait up to approval.timeout for a decision.
 
   keyleash approvals                     list pending requests
-  keyleash approvals approve <id> [--grant 10 --for 1h]
+  keyleash approvals approve <id> [--grant 10 --for 1h] [--stdin]
   keyleash approvals deny <id>
 
-When approval.method is "hello", requests can only be approved with the
-Windows Hello prompt; this command can still deny them. --grant attaches an
-allowance so that one approval covers follow-up requests.`,
+Approving proves you are present: it asks for your vault passphrase or
+recovery code at a hidden prompt (or reads it from stdin with --stdin), and
+the daemon checks it against the vault. Wrong secrets are audited and rate
+limited. Denying needs nothing. Windows Hello and console prompts approve
+on their own. An over-limit approval admits exactly the request shown;
+--grant attaches an allowance (at most the cap shown by 'approvals --json',
+by default 5x the exceeded limit for 24h) for later requests of that pass.`,
 	run: runApprovals,
 }
 
@@ -146,6 +150,7 @@ func runApprovals(ctx context.Context, a *app, args []string) error {
 	}
 	fs := newFlagSet("approvals")
 	asJSON := fs.Bool("json", false, "print JSON")
+	fromStdin := fs.Bool("stdin", false, "approve: read the passphrase or recovery code from stdin")
 	var grant moneyFlag
 	var grantFor durationFlag
 	fs.Var(&grant, "grant", "allowance attached to the approval")
@@ -193,24 +198,58 @@ func runApprovals(ctx context.Context, a *app, args []string) error {
 		if len(pos) != 1 {
 			return usagef("approvals", "%s takes exactly one approval id", sub)
 		}
-		req := client.DecideRequest{Approved: sub == "approve"}
 		if grant.set != grantFor.set {
 			return usagef("approvals", "--grant and --for go together")
 		}
-		if grant.set {
-			if sub == "deny" {
-				return usagef("approvals", "--grant only applies to approve")
-			}
-			req.Grant = &client.ApprovalGrant{Amount: grant.v, For: grantFor.v}
+		if grant.set && sub == "deny" {
+			return usagef("approvals", "--grant only applies to approve")
 		}
-		if err := c.Decide(cctx, pos[0], req); err != nil {
-			if client.IsCode(err, client.CodeForbidden) {
-				return errors.New("approval.method is hello: approve at the Windows Hello prompt (this command can only deny)")
+		if sub == "deny" {
+			if err := c.Decide(cctx, pos[0], client.DecideRequest{Approved: false}); err != nil {
+				if client.IsCode(err, client.CodeNotFound) {
+					return errNoSuchApproval
+				}
+				return err
+			}
+			fmt.Fprintf(a.stdout, "Denied %s.\n", pos[0])
+			return nil
+		}
+		// Approving is proof of presence: show exactly what is approved,
+		// then ask for the vault passphrase or recovery code.
+		list, err := c.Approvals(cctx)
+		if err != nil {
+			return err
+		}
+		var target *client.Approval
+		for i := range list {
+			if list[i].ID == pos[0] {
+				target = &list[i]
+			}
+		}
+		if target == nil {
+			return errNoSuchApproval
+		}
+		fmt.Fprintf(a.stderr, "Approve %s (%s): %s\n", target.ID, target.Kind, oneLine(target.Prompt))
+		if target.Requester > 0 {
+			fmt.Fprintf(a.stderr, "  requested by %s (pid %d)\n", dash(target.RequesterImage), target.Requester)
+		}
+		var g *client.ApprovalGrant
+		if grant.set {
+			if target.GrantMax <= 0 {
+				return usagef("approvals", "only an over-limit request can carry a grant")
+			}
+			if grant.v > target.GrantMax || grantFor.v > target.GrantMaxFor {
+				return usagef("approvals", "grant too large: at most %s for %s", target.GrantMax, target.GrantMaxFor)
+			}
+			g = &client.ApprovalGrant{Amount: grant.v, For: grantFor.v}
+			fmt.Fprintf(a.stderr, "  with a grant: this pass may exceed %s %s by up to %s for %s\n", target.Scope, target.Window, grant.v, grantFor.v)
+		}
+		if err := a.approveWithSecret(ctx, c, target.ID, g, *fromStdin); err != nil {
+			if client.IsCode(err, client.CodeNotFound) {
+				return errNoSuchApproval
 			}
 			return err
 		}
-		verb := map[bool]string{true: "Approved", false: "Denied"}[req.Approved]
-		fmt.Fprintf(a.stdout, "%s %s.\n", verb, pos[0])
 		return nil
 	}
 	return usagef("approvals", "unknown subcommand %q (want list, approve or deny)", sanitizeArg(sub))

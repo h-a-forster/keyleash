@@ -643,7 +643,7 @@ func TestInitFromStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Profile != "strict" || cfg.Approval.Method != "console" {
+	if cfg.Profile != "strict" || cfg.Approval.Method != "passphrase" {
 		t.Errorf("config: profile %s, approval %s", cfg.Profile, cfg.Approval.Method)
 	}
 
@@ -658,7 +658,7 @@ func TestSetApprovalMethod(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	orig := "profile = \"recommended\"\n# [approval]\n# method = \"hello\"\n"
-	for _, m := range []string{"console", "deny"} {
+	for _, m := range []string{"passphrase", "console", "deny"} {
 		if err := os.WriteFile(path, []byte(orig), 0o600); err != nil {
 			t.Fatal(err)
 		}

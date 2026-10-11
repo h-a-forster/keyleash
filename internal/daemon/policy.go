@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/h-a-forster/keyleash/internal/approval"
 	"github.com/h-a-forster/keyleash/internal/budget"
@@ -77,10 +76,13 @@ func (a authenticator) Authenticate(_ context.Context, prov, token string, ci pr
 			return deny(denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, ""))
 		}
 	}
-	if state == StateAway && p.Kind == pass.KindRun && !d.cfg.Limits.Away.AllowNewRunPasses && !p.Created.Before(awaySince) {
-		return deny(denial(http.StatusForbidden, proxy.ReasonAwayLimit, "keyleash is in away mode: run passes created while away are refused"))
+	if state == StateAway && p.Created.After(awaySince) && !(p.Kind == pass.KindRun && d.cfg.Limits.Away.AllowNewRunPasses) {
+		return deny(denial(http.StatusForbidden, proxy.ReasonAwayLimit, "keyleash is in away mode: passes created while away are refused"))
 	}
-	entry, ok := d.entryFor(prov)
+	entry, ok, pinnedGone := d.entryFor(p, prov)
+	if pinnedGone {
+		return deny(denial(http.StatusForbidden, ReasonNoKey, "the "+prov+" key this keyleash pass was issued with has been removed; create a new pass"))
+	}
 	if !ok {
 		return deny(denial(http.StatusForbidden, ReasonNoKey, "keyleash has no key for "+prov+" — run `keyleash add "+prov+"`"))
 	}
@@ -98,19 +100,41 @@ func (d *Daemon) syncTrips() {
 	}
 }
 
-// entryFor returns the newest api_key entry for the provider.
-func (d *Daemon) entryFor(prov string) (string, bool) {
+// entryFor picks the vault entry a pass uses for prov (spec §6): the entry
+// fixed in the pass at issue time; else the provider's active key (set only
+// by the step-up protected `keys use`); else the provider's oldest api_key,
+// so adding a key never redirects existing traffic. pinnedGone reports that
+// the pass's fixed entry no longer exists (the request is refused rather
+// than redirected).
+func (d *Daemon) entryFor(p pass.Pass, prov string) (id string, ok, pinnedGone bool) {
+	ents := d.vault.Entries()
+	valid := func(id string) bool {
+		for _, e := range ents {
+			if e.ID == id && e.Provider == prov && e.Kind == vault.KindAPIKey && !isInternalEntry(e) {
+				return true
+			}
+		}
+		return false
+	}
+	if id, pinned := p.Entries[prov]; pinned {
+		if valid(id) {
+			return id, true, false
+		}
+		return "", false, true
+	}
+	if id := d.activeKey(prov); id != "" && valid(id) {
+		return id, true, false
+	}
 	var best vault.EntryInfo
-	found := false
-	for _, e := range d.vault.Entries() {
-		if e.Provider != prov || e.Kind != vault.KindAPIKey || isRootEntry(e) {
+	for _, e := range ents {
+		if e.Provider != prov || e.Kind != vault.KindAPIKey || isInternalEntry(e) {
 			continue
 		}
-		if !found || !e.Created.Before(best.Created) {
-			best, found = e, true
+		if !ok || e.Created.Before(best.Created) {
+			best, ok = e, true
 		}
 	}
-	return best.ID, found
+	return best.ID, ok, false
 }
 
 func clientName(ci proxy.ClientInfo) string {
@@ -147,29 +171,60 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 	if !a.Endpoint.Metered {
 		return &ticket{d: d, a: a}, nil
 	}
-	// 3. Estimate.
+	// 3. Estimate. A priced request reserves its estimate. An unpriced model
+	// reserves its worst case at the provider's most expensive rates; a
+	// request whose cost cannot be bounded at all reserves the per-request
+	// limit and always needs approval (spec §7.5).
 	amount, priced := d.meter.Estimate(a.Provider.Name, a.Info)
+	unpriced, unbounded := false, false
 	if !priced || amount < 0 {
+		modelPriced := false
+		if d.meter != nil && d.meter.Pricing != nil {
+			_, modelPriced = d.meter.Pricing.Lookup(a.Provider.Name, model)
+		}
+		unpriced = !modelPriced
+		bounded := false
+		if unpriced {
+			amount, bounded = d.meter.WorstCaseEstimate(a.Provider.Name, a.Info)
+		}
+		unbounded = !bounded
 		d.mu.Lock()
-		d.st.modelsSeen[a.Provider.Name+"/"+model] = true
+		if unpriced {
+			d.st.modelsSeen[a.Provider.Name+"/"+model] = true
+		}
 		awayNow := d.st.state == StateAway
-		amount = d.fallbackAmountLocked(a.Provider.Name, p.ID)
+		reqLimit := d.requestLimitLocked(a.Provider.Name, model, p.ID)
 		d.mu.Unlock()
-		if awayNow {
+		if unpriced && awayNow {
 			return deny(denial(http.StatusForbidden, proxy.ReasonModelDenied, "keyleash is in away mode: unpriced models are refused"))
 		}
-		switch d.cfg.Models.Unknown {
-		case "deny":
+		if unpriced && d.cfg.Models.Unknown == "deny" {
 			return deny(denial(http.StatusForbidden, proxy.ReasonModelDenied, "keyleash has no price for this model and the policy denies unknown models"))
-		case "approve":
+		}
+		if unbounded {
+			if awayNow {
+				return deny(denial(http.StatusForbidden, proxy.ReasonBudgetExceeded, "keyleash is in away mode: requests whose cost cannot be bounded are refused"))
+			}
+			if reqLimit <= 0 {
+				return deny(denial(http.StatusForbidden, proxy.ReasonBudgetExceeded, "keyleash cannot bound the cost of this request and no per-request limit is configured to cap it"))
+			}
+			amount = reqLimit
+		}
+		if unbounded || d.cfg.Models.Unknown == "approve" {
+			bucket := powerOfTwoAtLeast(amount)
+			why := fmt.Sprintf("%s model %q has no price; each request is reserved and charged at the provider's most expensive rates, up to %s", a.Provider.Name, model, bucket)
+			if unbounded {
+				why = fmt.Sprintf("the cost of this %s request to %q cannot be bounded; it reserves the per-request limit %s and is charged at the metered cost", a.Provider.Name, model, amount)
+				bucket = amount
+			}
 			dec, err := d.queue.Request(ctx, approval.Request{
-				Kind: "unknown_model", Title: "Allow an unpriced model",
-				Detail: fmt.Sprintf("%s model %q has no price; it will be charged %s per request", a.Provider.Name, model, amount),
-				PassID: p.ID, Model: model, Amount: amount,
-				CoalesceKey: "unknown_model:" + p.ID + ":" + a.Provider.Name + "/" + model,
+				Kind: "unknown_model", Title: "Allow a request keyleash cannot price",
+				Detail: why + " (pass " + p.ID + ", client " + clientName(a.Client) + ")",
+				PassID: p.ID, Model: model, Amount: bucket,
+				CoalesceKey: fmt.Sprintf("unknown_model:%s:%s/%s:%d:%t", p.ID, a.Provider.Name, model, int64(bucket), unbounded),
 			})
 			d.auditEvent("approval", map[string]any{"kind": "unknown_model", "approved": err == nil && dec.Approved,
-				"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount)})
+				"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "unbounded": unbounded})
 			if dn := approvalDenial(ctx, dec, err); dn != nil {
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
@@ -177,14 +232,29 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 				return deny(dn)
 			}
 		}
-		priced = false
 	}
 
-	// 4–5. Reserve against every applicable scope.
-	for attempt := 0; ; attempt++ {
-		res, err := d.reserve(a, p, amount)
+	// 4–5. Reserve against every applicable scope. An approved over-limit
+	// request is admitted by skipping exactly the limit(s) the owner saw, for
+	// this one reservation; a grant attached to the approval becomes a pass
+	// grant for later requests of this pass only (spec §9).
+	var skip []budget.LimitKey
+	var grants []pendingPassGrant
+	for approvals := 0; ; {
+		res, err := d.reserve(a, p, amount, skip)
 		if err == nil {
-			return &ticket{d: d, a: a, res: res, unpriced: !priced}, nil
+			for _, g := range grants {
+				d.addPassGrant(g)
+			}
+			if len(skip) > 0 {
+				ks := make([]string, len(skip))
+				for i, k := range skip {
+					ks[i] = k.Scope + "/" + string(k.Window)
+				}
+				d.auditEvent("limit_override", map[string]any{"request_id": a.RequestID, "pass": p.ID,
+					"limits": ks, "amount_micros": int64(amount)})
+			}
+			return &ticket{d: d, a: a, res: res, unpriced: unpriced, unbounded: unbounded}, nil
 		}
 		var ex *budget.ExceededError
 		var dn *proxy.Denial
@@ -192,24 +262,34 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 		case errors.As(err, &dn):
 			return deny(dn)
 		case errors.As(err, &ex):
-			if ex.Scope == budget.ScopeAway || strings.HasPrefix(ex.Scope, budget.ScopeGrantPrefix) {
+			if ex.Scope == budget.ScopeAway || strings.HasPrefix(ex.Scope, budget.ScopeGrantPrefix+"g_") {
 				return deny(denial(http.StatusForbidden, proxy.ReasonAwayLimit, exceededMessage(ex)))
 			}
-			if d.cfg.Limits.OnExceed == "approve" && attempt == 0 {
+			if strings.HasPrefix(ex.Scope, budget.ScopeGrantPrefix) {
+				return deny(denial(http.StatusForbidden, proxy.ReasonBudgetExceeded, "the allowance approved for this keyleash pass is used up: "+exceededMessage(ex)))
+			}
+			if d.cfg.Limits.OnExceed == "approve" && approvals < maxOverLimitApprovals {
+				approvals++
 				dec, aerr := d.queue.Request(ctx, approval.Request{
-					Kind: "over_limit", Title: "Exceed a keyleash spend limit",
-					Detail: exceededMessage(ex), PassID: p.ID, Model: model, Amount: amount,
-					CoalesceKey: "over_limit:" + p.ID + ":" + ex.Scope + ":" + string(ex.Window),
+					Kind: "over_limit", Title: "Exceed a keyleash spend limit for one request",
+					Detail: fmt.Sprintf("admits this one request only (limit not raised): %s %s limit %s; client %s",
+						ex.Scope, ex.Window, ex.Limit, clientName(a.Client)),
+					PassID: p.ID, Model: model, Amount: amount,
+					Scope: ex.Scope, Window: string(ex.Window), Limit: ex.Limit,
 				})
 				d.auditEvent("approval", map[string]any{"kind": "over_limit", "approved": aerr == nil && dec.Approved,
-					"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "scope": ex.Scope})
+					"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "scope": ex.Scope,
+					"window": string(ex.Window), "id": dec.ID})
 				if adn := approvalDenial(ctx, dec, aerr); adn != nil {
 					if ctx.Err() != nil {
 						return nil, ctx.Err()
 					}
 					return deny(adn)
 				}
-				d.addOverlay(ex, amount, dec.Grant)
+				skip = append(skip, budget.LimitKey{Scope: ex.Scope, Window: ex.Window})
+				if g := dec.Grant; g != nil && g.Amount > 0 && g.For > 0 {
+					grants = append(grants, pendingPassGrant{approval: dec.ID, pass: p.ID, ex: *ex, grant: *g})
+				}
 				continue
 			}
 			return deny(denial(http.StatusForbidden, proxy.ReasonBudgetExceeded, exceededMessage(ex)))
@@ -223,6 +303,20 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 			return deny(denial(http.StatusServiceUnavailable, proxy.ReasonInternal, "keyleash cannot record spend right now"))
 		}
 	}
+}
+
+// maxOverLimitApprovals bounds the approvals one request may ask for (one
+// per distinct exceeded limit).
+const maxOverLimitApprovals = 3
+
+// powerOfTwoAtLeast rounds v up to a power of two (in micro-dollars), so
+// coalesced unknown-model approvals share a stated upper bound.
+func powerOfTwoAtLeast(v money.Micros) money.Micros {
+	b := money.Micros(1)
+	for b < v && b < money.Micros(1)<<61 {
+		b <<= 1
+	}
+	return b
 }
 
 func approvalDenial(ctx context.Context, dec approval.Decision, err error) *proxy.Denial {
@@ -278,8 +372,10 @@ func (d *Daemon) modelDenied(p pass.Pass, model string) string {
 
 // reserve checks the state and reserves under the state read lock, so a
 // concurrent lock either happens before (and the request is refused) or after
-// (and the reservation is settled by the lock).
-func (d *Daemon) reserve(a proxy.Admission, p pass.Pass, amount money.Micros) (*budget.Reservation, error) {
+// (and the reservation is settled by the lock). skip lists limits the owner
+// approved exceeding for this one request; the pass's active pass grants add
+// their own skips and scopes.
+func (d *Daemon) reserve(a proxy.Admission, p pass.Pass, amount money.Micros, skip []budget.LimitKey) (*budget.Reservation, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	switch d.st.state {
@@ -288,59 +384,100 @@ func (d *Daemon) reserve(a proxy.Admission, p pass.Pass, amount money.Micros) (*
 	case StateTripped:
 		return nil, denial(http.StatusLocked, proxy.ReasonTripped, "")
 	}
+	now := d.clk.Now()
 	scopes := []string{
 		budget.ScopeProviderPrefix + a.Provider.Name,
 		budget.ScopePassPrefix + p.ID,
 		budgetSessionScope(d.st.session),
 	}
 	if d.st.state == StateAway {
-		if g := d.st.grant; g != nil && d.clk.Now().Before(g.until) && (g.pass == "" || g.pass == p.ID) {
+		if g := d.st.grant; g != nil && now.Before(g.until) && (g.pass == "" || g.pass == p.ID) {
 			scopes = append(scopes, budget.ScopeGrantPrefix+g.id)
 		} else {
 			scopes = append(scopes, budget.ScopeAway)
 		}
 	}
-	return d.ledger.Reserve(scopes, amount, budget.Meta{
+	opt := budget.ReserveOptions{Skip: append([]budget.LimitKey(nil), skip...)}
+	for _, pg := range d.st.passGrants {
+		if pg.pass == p.ID && now.Before(pg.until) {
+			opt.Skip = append(opt.Skip, budget.LimitKey{Scope: pg.scope, Window: pg.window})
+			scopes = append(scopes, budget.ScopeGrantPrefix+pg.id)
+		}
+	}
+	return d.ledger.ReserveWith(scopes, amount, budget.Meta{
 		PassID: p.ID, Provider: a.Provider.Name, Model: a.Info.Model, Session: d.st.session,
 		Client: clientName(a.Client), RequestID: a.RequestID,
-	})
+	}, opt)
 }
 
-// addOverlay raises the exceeded limit after an approval: by the grant (if
-// any) for its duration, else by the shortfall for this request only
-// (five minutes).
-func (d *Daemon) addOverlay(ex *budget.ExceededError, amount money.Micros, g *approval.Grant) {
-	now := d.clk.Now()
-	o := overlay{scope: ex.Scope, window: ex.Window}
-	if g != nil && g.Amount > 0 && g.For > 0 {
-		o.amount, o.until = g.Amount, now.Add(g.For)
-	} else {
-		short := ex.Spent + ex.Reserved + ex.Requested - ex.Limit
-		if ex.Window == budget.WindowRequest {
-			short = ex.Requested - ex.Limit
-		}
-		o.amount, o.until = max(short, amount), now.Add(5*time.Minute)
+// pendingPassGrant is a grant from an over-limit approval, applied once the
+// approved request itself has been admitted.
+type pendingPassGrant struct {
+	approval string
+	pass     string
+	ex       budget.ExceededError
+	grant    approval.Grant
+}
+
+// addPassGrant turns an approval's grant into a pass grant: the pass may
+// exceed the one limit the owner saw by up to the grant amount (capped at
+// approval.grant_max_multiple times that limit) until the grant ends
+// (capped at approval.grant_max_duration). Idempotent by approval id.
+func (d *Daemon) addPassGrant(pg pendingPassGrant) {
+	amt, dur := pg.grant.Amount, pg.grant.For
+	if c := grantCap(pg.ex.Limit, d.cfg.Approval.GrantMaxMultiple); c > 0 && amt > c {
+		amt = c
 	}
+	if mx := d.cfg.Approval.GrantMaxDuration.Duration; mx > 0 && dur > mx {
+		dur = mx
+	}
+	id := "pg_" + pg.approval
+	if pg.approval == "" {
+		id = newID("pg_")
+	}
+	g := passGrant{id: id, pass: pg.pass, scope: pg.ex.Scope, window: pg.ex.Window, amount: amt, until: d.clk.Now().Add(dur)}
 	d.mu.Lock()
-	d.st.overlays = append(d.st.overlays, o)
+	for _, x := range d.st.passGrants {
+		if x.id == g.id {
+			d.mu.Unlock()
+			return
+		}
+	}
+	d.st.passGrants = append(d.st.passGrants, g)
 	d.applyLimitsLocked()
+	d.ledger.ResetSession(budget.ScopeGrantPrefix + g.id)
 	d.mu.Unlock()
-	d.auditEvent("limit_change", map[string]any{"change": "approved_overlay", "scope": o.scope,
-		"window": string(o.window), "amount_micros": int64(o.amount), "until": o.until.UTC().Format("2006-01-02T15:04:05Z")})
+	d.auditEvent("limit_change", map[string]any{"change": "pass_grant", "grant": g.id, "pass": g.pass,
+		"scope": g.scope, "window": string(g.window), "amount_micros": int64(g.amount),
+		"until": g.until.UTC().Format("2006-01-02T15:04:05Z")})
+}
+
+// grantCap is the largest grant an over-limit approval may carry.
+func grantCap(limit money.Micros, multiple int) money.Micros {
+	if limit <= 0 || multiple <= 0 {
+		return 0
+	}
+	if limit > money.Micros(1)<<55 {
+		return limit
+	}
+	return limit * money.Micros(multiple)
 }
 
 // ---- Ticket ----------------------------------------------------------------
 
 type ticket struct {
-	d        *Daemon
-	a        proxy.Admission
-	res      *budget.Reservation // nil for unmetered endpoints
-	unpriced bool
+	d   *Daemon
+	a   proxy.Admission
+	res *budget.Reservation // nil for unmetered endpoints
+	// unpriced: the model has no price (settled at the provider's maximum
+	// rates); unbounded: the reservation was the per-request limit.
+	unpriced, unbounded bool
 }
 
 // Finish implements proxy.Ticket: release when the request never left,
-// otherwise settle at the metered cost, or at the reserved amount (marked
-// estimated) when usage or price is unknown.
+// otherwise settle at the metered cost; an unpriced model at the provider's
+// most expensive rates for the reported tokens (marked estimated); the
+// reserved amount (marked estimated) when usage is unknown.
 func (t *ticket) Finish(o proxy.Outcome) {
 	d := t.d
 	var cost money.Micros
@@ -353,8 +490,15 @@ func (t *ticket) Finish(o proxy.Outcome) {
 			if u.Model == "" {
 				u.Model = t.a.Info.Model
 			}
-			c, priced := d.meter.Cost(t.a.Provider.Name, u)
-			if o.UsageOK && priced && c >= 0 {
+			var c money.Micros
+			var ok bool
+			if t.unpriced {
+				c, ok = d.meter.WorstCaseCost(t.a.Provider.Name, u)
+				estimated = true
+			} else {
+				c, ok = d.meter.Cost(t.a.Provider.Name, u)
+			}
+			if o.UsageOK && ok && c >= 0 {
 				cost = c
 			} else {
 				cost, estimated = t.res.Amount(), true

@@ -212,7 +212,7 @@ func (a *app) doctorChecks(ctx context.Context, now time.Time) []check {
 	} else {
 		add("config", levelOK, "valid (profile %s)", cfg.Profile)
 		if cfg.Approval.Method == "hello" && !helloOK {
-			add("approvals", levelWarn, "approval.method is hello but Windows Hello is unavailable: every step-up will be denied (set approval.method = \"console\")")
+			add("approvals", levelWarn, "approval.method is hello but Windows Hello is unavailable: every step-up will be denied (set approval.method = \"passphrase\")")
 		}
 	}
 

@@ -434,3 +434,34 @@ func TestCanonicalStable(t *testing.T) {
 		t.Fatalf("unexpected canonical form %s", b1.String())
 	}
 }
+
+func TestRedact(t *testing.T) {
+	for _, s := range []string{"claude-sonnet-4-5", "agent.exe", "pass name", "", "0123456789abcdef0123456789abcdef0123456789abcdef"} {
+		if got := Redact(s); got != s || LooksSecret(s) {
+			t.Errorf("Redact(%q) = %q", s, got)
+		}
+	}
+	key := "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	r := Redact(key)
+	if !strings.HasPrefix(r, "[redacted:") || strings.Contains(r, "sk-ant") || !LooksSecret(key) {
+		t.Fatalf("Redact(key) = %q", r)
+	}
+	if Redact(key) != r || Redact(key+"x") == r {
+		t.Fatal("redaction must be deterministic and value-specific")
+	}
+	if LooksSecret(r) {
+		t.Fatal("redacted value still looks secret")
+	}
+	// The redacted value is accepted by Append.
+	l, err := Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := l.Append("request", map[string]any{"model": key}); !errors.Is(err, ErrSecret) {
+		t.Fatalf("raw: %v", err)
+	}
+	if err := l.Append("request", map[string]any{"model": r}); err != nil {
+		t.Fatalf("redacted: %v", err)
+	}
+}

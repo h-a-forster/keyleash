@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,14 @@ const (
 	anthropicResponse = `{"id":"msg_01","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Hello."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":34,"service_tier":"standard"}}`
 	anthropicRequest  = `{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
 )
+
+// setupApprover approves the setup step-ups the CLI tests rely on (creating
+// passes, adding keys) and denies everything else.
+type setupApprover struct{}
+
+func (setupApprover) Approve(ctx context.Context, req approval.Request) (bool, error) {
+	return req.Kind == "pass_create" || req.Kind == "key_add", nil
+}
 
 // fakePresence reports an owner who is always at the keyboard.
 type fakePresence struct{}
@@ -69,7 +78,7 @@ type testDaemon struct {
 // startTestDaemon initialises a vault (cheap KDF) and starts a daemon.
 // With tcpAdmin the admin API listens on a loopback TCP port (so tests do
 // not touch the per-user pipe); otherwise the default admin channel is used.
-func startTestDaemon(t *testing.T, tcpAdmin bool) *testDaemon {
+func startTestDaemon(t *testing.T, tcpAdmin bool, mutate ...func(*daemon.Options)) *testDaemon {
 	t.Helper()
 	restore := vault.SetTestKDFParams()
 	t.Cleanup(restore)
@@ -104,7 +113,7 @@ func startTestDaemon(t *testing.T, tcpAdmin bool) *testDaemon {
 		DataDir:        td.dir,
 		Config:         cfg,
 		PresenceSource: fakePresence{},
-		Approver:       approval.DenyApprover{},
+		Approver:       setupApprover{},
 		HelloAvailable: func() (bool, string) { return false, "test" },
 		Upstream:       func(*provider.Provider) *url.URL { u := *upURL; return &u },
 		Transport:      up.Client().Transport,
@@ -117,7 +126,12 @@ func startTestDaemon(t *testing.T, tcpAdmin bool) *testDaemon {
 			t.Fatal(err)
 		}
 		opts.AdminListener = adminLn
+		// The CLI runs in this process, so this process is the admin caller.
+		opts.AdminPeerPID = func(net.Conn) (int, error) { return os.Getpid(), nil }
 		td.adminAddr = adminLn.Addr().String()
+	}
+	for _, m := range mutate {
+		m(&opts)
 	}
 	d, err := daemon.Start(context.Background(), opts)
 	if err != nil {
@@ -193,4 +207,12 @@ func callProxy(t *testing.T, proxyAddr, token string) int {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return resp.StatusCode
+}
+
+// manualApprover never decides: approvals come from `keyleash approvals`.
+type manualApprover struct{}
+
+func (manualApprover) Approve(ctx context.Context, _ approval.Request) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
 }

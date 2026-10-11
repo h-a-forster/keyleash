@@ -221,12 +221,33 @@ func (q *Queue) Pending() []PendingInfo {
 	return out
 }
 
+// Get returns the pending request id while it is still pending.
+func (q *Queue) Get(id string) (PendingInfo, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	p, ok := q.byID[id]
+	if !ok {
+		return PendingInfo{}, false
+	}
+	return PendingInfo{ID: p.id, Request: p.req, Prompt: PromptText(p.req),
+		Created: p.created, Deadline: p.deadline, Waiters: p.waiters}, true
+}
+
 // Decide answers pending request id from outside the approver (e.g. the
 // admin API). It races the approver and the timeout; the loser is cancelled.
 // grant is attached only to approvals. Returns ErrNotFound if id is not
-// pending (unknown or already decided).
+// pending (unknown or already decided). The decision's Method is "external".
 func (q *Queue) Decide(id string, approved bool, grant *Grant) error {
-	d := Decision{Approved: approved, Method: "external"}
+	return q.DecideAs(id, approved, grant, "external")
+}
+
+// DecideAs is Decide with the decision's Method set to method (e.g.
+// "passphrase" when the decider proved a vault secret).
+func (q *Queue) DecideAs(id string, approved bool, grant *Grant, method string) error {
+	if method == "" {
+		method = "external"
+	}
+	d := Decision{Approved: approved, Method: method}
 	if approved && grant != nil {
 		if grant.Amount < 0 || grant.For < 0 {
 			return errors.New("approval: negative grant")

@@ -48,6 +48,9 @@ keyleash init
   passphrase is lost.
 - A commented `config.toml` with the recommended profile is written
   (`--profile strict` or `--profile relaxed` pick another starting point).
+  Step-up approvals use Windows Hello when it is available, otherwise your
+  passphrase or recovery code (`--approval` overrides: `hello`,
+  `passphrase`, `console` or `deny`).
 - keyleash then offers to start the daemon in the background and add your
   first key.
 
@@ -83,6 +86,13 @@ op read "op://Private/Anthropic/credential" | keyleash add anthropic --stdin
 
 Then remove the key from any `.env` file, shell profile or tool config it
 lived in.
+
+The very first key goes straight into the vault. Every later key needs a
+step-up approval (Windows Hello, or your passphrase or recovery code), so a
+program running as you cannot slip in a key of its own. Each pass keeps the
+key it was created with; new passes use the provider's **active** key (its
+oldest key, marked `*` in `keyleash keys`). To switch new passes to another
+key: `keyleash keys use <id>` (step-up).
 
 ### 5. Run something
 
@@ -137,6 +147,17 @@ repeatable), `--ttl` (default 12 h), `--providers`, `--models` and
 `--deny-models` (globs; `*` matches anything, including `/`),
 `--concurrency`, `--name` (shown in `usage` and the audit log).
 
+A `run` pass needs no approval while it stays within the defaults: providers
+you have keys for, lifetime up to `limits.pass.run_ttl` (12 h), every budget
+up to `limits.pass.max_run_budget` ($10; without `--budget`/`--limit` the
+pass gets $10 per session and per month), and concurrency up to
+`limits.pass.concurrency`. Anything beyond that asks for a step-up.
+
+Inside a `keyleash run` session, keyleash itself is off limits: the command
+and everything it starts may only read `keyleash status` and revoke its own
+pass. Creating passes, adding keys, approving, granting or changing anything
+is refused with `confined`, so an agent cannot raise its own budget.
+
 In bash and zsh write amounts as `5` or `'$5'`: `"$5"` is expanded by the
 shell.
 
@@ -176,7 +197,9 @@ keyleash pass revoke <id>
 ```
 
 `pass create` prints the token once on stdout. A pass is worthless off this
-machine, but treat it like a password anyway.
+machine, but treat it like a password anyway. Creating a named pass (and so
+`keyleash env`) needs a step-up approval; no pass can be created while
+keyleash is in away mode.
 
 ## Recommended defaults
 
@@ -205,6 +228,12 @@ Edit `config.toml` (`keyleash config path`), check it with
 so a typo cannot silently weaken a limit. `keyleash limits` shows the
 effective limits and how much of each is used.
 
+Because any program running as you can edit `config.toml`, a changed config
+does not take effect silently: at the next unlock keyleash is **tripped**
+(`config_changed`), `keyleash status` and `keyleash unlock` list every
+changed setting (`limits.global.day: $20 -> $500`), and `keyleash resume`
+(step-up) accepts them.
+
 ## How limits, away mode and approvals behave
 
 **Hard limits.** Before forwarding a request, keyleash reserves its
@@ -217,14 +246,21 @@ that would exceed a limit gets HTTP `403` with `x-keyleash-reason:
 budget_exceeded` (not `429`, so SDKs do not retry it), and a message naming
 the limit.
 
+**Models without a price** are reserved and charged at the provider's most
+expensive rates for the tokens used. A request whose cost cannot be bounded
+at all (for example web search with no cap on the number of searches)
+reserves the per-request limit and needs a step-up; without a per-request
+limit it is refused.
+
 **Concurrency.** Too many parallel requests get `429 concurrency`; SDKs retry
 those, which is correct.
 
 **Away mode.** After `idle_after` without physical keyboard or mouse input
 (input injected by automation tools does not count), or when the screen
 locks (with `screen_lock = "away"`), keyleash enters away mode: existing
-passes keep working under the away limits, new `run` passes are refused,
-and unknown models are denied. Coming back to the keyboard ends away mode.
+passes keep working under the away limits, no new passes can be created
+(`run` passes only with `allow_new_run_passes`), and unknown models and
+unbounded requests are denied. Coming back to the keyboard ends away mode.
 After `away_max` in away mode, on sleep, or at the end of the lease,
 keyleash locks: every request gets `423 locked` until `keyleash unlock`.
 
@@ -234,32 +270,53 @@ keyleash locks: every request gets `423 locked` until `keyleash unlock`.
 keyleash away --budget 20 --for 8h [--pass <id>]
 ```
 
-This needs a step-up approval. While the grant lasts, away mode uses the
-granted budget instead of the away limits and does not lock after
-`away_max`.
+This needs a step-up approval, whose prompt shows exactly that amount,
+duration and pass; each `keyleash away` call gets its own approval. While
+the grant lasts, away mode uses the granted budget instead of the away
+limits and does not lock after `away_max`.
 
-**Tripwire.** If spend in the tripwire window crosses the threshold, or the
-ledger or audit log fails an integrity check, keyleash is **tripped**: new
-requests get `423 tripped` and in-flight ones finish. Check `keyleash status`
-and `keyleash audit verify`, then leave it with `keyleash resume` (step-up).
+**Tripwire.** If spend in the tripwire window crosses the threshold, the
+ledger or audit log fails an integrity check after unlock (including a
+deleted ledger), the config changed, or a security record could not be
+written to the audit log, keyleash is **tripped**: new requests get `423
+tripped` and in-flight ones finish. Check `keyleash status` and `keyleash
+audit verify`, then leave it with `keyleash resume` (step-up). Resuming after
+a failed audit check moves the rejected log to `audit/rejected-<time>/` and
+starts a new chain.
 
-**Step-up approvals** are needed for unknown models (with
-`models.unknown = "approve"`), going over a limit (with
-`limits.on_exceed = "approve"`), unattended grants, leaving Tripped and
-removing keys. The request waits up to `approval.timeout` (60 s):
+**Step-up approvals prove you are there.** Every program running as you can
+reach keyleash's admin channel, including the agents it governs, so being
+able to call it proves nothing. A step-up is one of: a Windows Hello prompt,
+your vault passphrase or recovery code (checked by the vault), or an answer
+typed into the daemon's own terminal. Step-ups are needed for unknown models
+(with `models.unknown = "approve"`), requests whose cost cannot be bounded,
+going over a limit (with `limits.on_exceed = "approve"`), unattended grants,
+leaving Tripped, creating passes beyond the `run` defaults, adding keys
+(after the first), `keyleash keys use`, removing keys, rotating the recovery
+code and removing vault slots. The request waits up to `approval.timeout`
+(60 s):
 
 - `approval.method = "hello"` (default with Windows Hello): a Hello prompt
-  describes the request. `keyleash approvals deny <id>` can refuse it, but
-  approving is only possible at the prompt, so a program running as you
-  cannot approve its own request.
-- `"console"` (set by `init` when Hello is unavailable): the daemon's
-  terminal asks `Approve? [y/N]`; `keyleash approvals approve <id>` works
-  too. Any program running as your user could also call it, so prefer Hello
-  where you can.
+  describes the request.
+- `"passphrase"` (set by `init` when Hello is unavailable): the command that
+  needs the approval asks for your passphrase or recovery code at a hidden
+  prompt; from another terminal, `keyleash approvals approve <id>` does the
+  same.
+- `"console"`: the daemon's terminal asks `Approve? [y/N]`; the passphrase
+  route works too.
 - `"deny"`: every step-up is refused (servers, CI).
 
-`keyleash approvals` lists what is waiting. `approve <id> --grant 10 --for 1h`
-attaches an allowance so one approval covers follow-up requests.
+With every method except `deny`, `keyleash approvals approve <id>` approves
+with your passphrase or recovery code (`--stdin` reads it from standard
+input). Wrong secrets are recorded in the audit log and, after five, slowed
+down (30 s, doubling up to 15 min). `keyleash approvals deny <id>` needs
+nothing. Each approval belongs to the one request that asked: two commands
+never share an approval, and approving an over-limit request admits exactly
+that request without raising the limit. `approve <id> --grant 10 --for 1h`
+on an over-limit request lets that pass exceed that one limit by up to the
+grant for later requests; grants are capped at `approval.grant_max_multiple`
+(5) times the limit and `approval.grant_max_duration` (24 h), shown by
+`keyleash approvals --json`.
 
 **Panic.** `keyleash panic` locks immediately and revokes every pass. Rotate
 the keys at the provider if you think one leaked; automatic upstream
@@ -279,14 +336,14 @@ unlocked. `keyleash usage` shows spend by pass, model, provider and program.
 | `status [--json]` | state, lease, spend vs limits, active passes |
 | `unlock [--recovery] [--stdin]` / `lock` | unlock or lock the vault |
 | `add <provider> [--label] [--stdin]` | store a key (hidden prompt or stdin) |
-| `keys [--json]` / `rm-key <id>` | list (masked) or remove keys |
+| `keys [--json]` / `keys use <id>` / `rm-key <id>` | list (masked, `*` = active), choose a provider's active key, or remove keys |
 | `run [flags] -- <cmd…>` | run a command with its own pass |
 | `env [--shell] [flags]` | create a named pass and print exports |
 | `pass create\|list\|revoke` | manage named passes |
 | `limits [--json]` | effective limits and current spend |
 | `away --budget --for [--pass]` / `resume` | unattended grant / leave Tripped |
 | `usage [--by] [--since] [--json]` | spend by pass, model, provider, process |
-| `approvals [approve\|deny <id>]` | pending step-up requests |
+| `approvals [approve <id> [--grant --for] [--stdin]\|deny <id>]` | pending step-up requests; approving asks for the passphrase or recovery code |
 | `audit verify\|tail` | check or read the audit log |
 | `config show\|check\|path` | effective configuration |
 | `doctor [--json]` | environment checks |
@@ -305,17 +362,19 @@ how old the pricing table is. Start there.
 |---|---|
 | `the keyleash daemon is not running` | Start it: `keyleash daemon` (or `--background`). |
 | `keyleash is locked — run: keyleash unlock` / HTTP `423 locked` | The screen locked, the machine slept, the lease ended or you were away too long. Unlock. |
-| HTTP `423 tripped` | The tripwire or an integrity check fired. `keyleash status`, `keyleash audit verify`, then `keyleash resume`. |
+| HTTP `423 tripped` | The tripwire or an integrity check fired, or `config.toml` changed. `keyleash status`, `keyleash audit verify`, then `keyleash resume`. |
+| `refused: this command runs inside a keyleash run session` (`confined`) | Admin commands other than `status` are refused from inside `keyleash run` (and from processes keyleash cannot identify). Run them from a normal terminal. |
+| `too many wrong passphrases or recovery codes` | Approving with a secret is slowed down after five wrong tries. Wait the time shown. |
 | HTTP `401 pass_invalid` | Wrong, revoked or expired pass, or a `run` pass used from outside its process tree (e.g. a tool started separately). Use `keyleash run` for that tool or a named pass from `keyleash env`. |
 | HTTP `403 budget_exceeded` | A limit is used up. `keyleash limits` shows which; wait for the window, raise it in config, or use `on_exceed = "approve"`. |
 | HTTP `403 model_denied` / `approval_denied` / `approval_timeout` | The model is denied or unknown and the step-up was refused or not answered in time. Check `keyleash approvals` while the request waits. |
 | HTTP `429 concurrency` | Too many parallel requests for the global or pass limit; SDKs retry. |
-| `run passes ... away mode` | New `run` passes are refused while away. Touch the keyboard, or use `keyleash away --budget … --for …` first. |
+| `passes ... away mode` | New passes are refused while away. Touch the keyboard, or use `keyleash away --budget … --for …` first. |
 | `no terminal for a hidden prompt` | Standard input is not a console (for example Git Bash's mintty, or a pipe). Use `winpty keyleash …`, PowerShell/cmd, or `--stdin`. |
 | A tool still uses the real key | It reads a different variable or a config file. Remove the key from that file, and set the tool's base URL and key to the values from `keyleash env`. |
 | Requests go to a corporate proxy | `keyleash run`/`env` add loopback to `NO_PROXY`; tools that ignore `NO_PROXY` need their proxy setting changed. |
 | `proxy port … used by another program` | Free port 47114 or set `[proxy] port` and restart. |
 | `the vault file is older than the last recorded state` | A backup was restored or the file rolled back. If that was you: `keyleash unlock --accept-rollback`. |
 | `presence detection is degraded` | Low-level input hooks could not be installed; idle time falls back to `GetLastInputInfo`, which also counts injected input. |
-| `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied. Set `approval.method = "console"` in config. |
+| `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied. Set `approval.method = "passphrase"` in config. |
 | Forgot the passphrase | `keyleash unlock --recovery` with the recovery code. |

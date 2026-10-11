@@ -408,3 +408,50 @@ func TestConsoleApproverThroughQueueTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestPassphraseApproverWaitsForDecideAs: the passphrase approver never
+// decides by itself; DecideAs records who decided, Get exposes the pending
+// request (with its requester) until then.
+func TestPassphraseApproverWaitsForDecideAs(t *testing.T) {
+	ap := PassphraseApprover()
+	if methodOf(ap) != "passphrase" {
+		t.Fatalf("method = %q", methodOf(ap))
+	}
+	clk := newClock()
+	q := NewQueue(ap, time.Minute, clk)
+	res := make(chan Decision, 1)
+	go func() {
+		d, _ := q.Request(context.Background(), Request{Kind: "resume", Requester: 4242})
+		res <- d
+	}()
+	waitFor(t, func() bool { return len(q.Pending()) == 1 })
+	id := q.Pending()[0].ID
+	pi, ok := q.Get(id)
+	if !ok || pi.Request.Requester != 4242 || pi.Request.Kind != "resume" {
+		t.Fatalf("get = %+v %v", pi, ok)
+	}
+	if _, ok := q.Get("nope"); ok {
+		t.Fatal("unknown id found")
+	}
+	select {
+	case d := <-res:
+		t.Fatalf("decided without anyone deciding: %+v", d)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := q.DecideAs(id, true, nil, "passphrase"); err != nil {
+		t.Fatal(err)
+	}
+	if d := <-res; !d.Approved || d.Method != "passphrase" {
+		t.Fatalf("decision %+v", d)
+	}
+	if _, ok := q.Get(id); ok {
+		t.Fatal("decided request still pending")
+	}
+	// Timeout still applies.
+	go func() { d, _ := q.Request(context.Background(), Request{}); res <- d }()
+	waitFor(t, func() bool { return len(q.Pending()) == 1 })
+	clk.fireAll()
+	if d := <-res; d.Approved || d.Method != "timeout" {
+		t.Fatalf("timeout decision %+v", d)
+	}
+}

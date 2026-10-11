@@ -101,3 +101,54 @@ func TestEncodeRoundTrip(t *testing.T) {
 		t.Error("round trip lost values")
 	}
 }
+
+func TestDiffAndHash(t *testing.T) {
+	a, _ := Default("recommended")
+	b, _ := Default("recommended")
+	ha, _ := a.Hash()
+	hb, _ := b.Hash()
+	if ha != hb || len(ha) != 64 {
+		t.Fatal("equal configs hash differently")
+	}
+	b.Limits.Global.Day = amt("$200")
+	b.Approval.Method = "passphrase"
+	b.Models.Deny = []string{"*opus*"}
+	if hb, _ = b.Hash(); hb == ha {
+		t.Fatal("changed config hashes the same")
+	}
+	ea, _ := a.Encode()
+	eb, _ := b.Encode()
+	d, err := Diff(ea, eb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"approval.method: hello -> passphrase",
+		"limits.global.day: $20.00 -> $200.00",
+		"models.deny: (unset) -> [*opus*]",
+	}
+	if strings.Join(d, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("diff:\n%s", strings.Join(d, "\n"))
+	}
+	if d, _ := Diff(ea, ea); len(d) != 0 {
+		t.Fatalf("self diff: %v", d)
+	}
+}
+
+func TestNewApprovalAndPassOptions(t *testing.T) {
+	c, err := Parse("[approval]\nmethod = \"passphrase\"\n")
+	if err != nil || c.Approval.Method != "passphrase" || c.Approval.GrantMaxMultiple != 5 ||
+		c.Approval.GrantMaxDuration.Duration != 24*time.Hour || c.Limits.Pass.MaxRunBudget.Micros != 10_000_000 {
+		t.Fatalf("parse: %v %+v", err, c)
+	}
+	for _, bad := range []string{
+		"[approval]\ngrant_max_multiple = 0\n",
+		"[approval]\ngrant_max_duration = \"30s\"\n",
+		"[limits.pass]\nmax_run_budget = \"0\"\n",
+		"[approval]\nmethod = \"yes\"\n",
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

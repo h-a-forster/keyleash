@@ -90,15 +90,34 @@ func (p *fakePresence) set(idle time.Duration, locked bool) {
 	p.mu.Unlock()
 }
 
-// switchApprover answers with the current value of approve.
+// switchApprover answers with the current value of approve. Setup step-ups
+// (pass_create, key_add) are approved while strictSetup is false, so tests
+// that only need a pass or a key do not depend on approve; they are not
+// counted in calls.
 type switchApprover struct {
-	approve atomic.Bool
-	calls   atomic.Int32
+	approve     atomic.Bool
+	strictSetup atomic.Bool
+	calls       atomic.Int32
+	mu          sync.Mutex
+	reqs        []approval.Request
 }
 
 func (a *switchApprover) Approve(ctx context.Context, req approval.Request) (bool, error) {
+	a.mu.Lock()
+	a.reqs = append(a.reqs, req)
+	a.mu.Unlock()
+	if !a.strictSetup.Load() && (req.Kind == "pass_create" || req.Kind == "key_add") {
+		return true, nil
+	}
 	a.calls.Add(1)
 	return a.approve.Load(), nil
+}
+
+// requests returns the requests seen so far.
+func (a *switchApprover) requests() []approval.Request {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]approval.Request(nil), a.reqs...)
 }
 
 func (a *switchApprover) Method() string { return "test" }
@@ -237,6 +256,10 @@ type env struct {
 	appr     *switchApprover
 	up       *upstream
 	peerPID  atomic.Int64
+	// adminPID is the verified PID the daemon sees for admin calls (default:
+	// the parent of the test process, so a run pass bound to the test
+	// process does not confine the test's own admin calls); 0 = unknown.
+	adminPID atomic.Int64
 	approver approval.Approver // overrides appr when set
 	adminLn  net.Listener      // overrides the in-memory admin listener
 
@@ -261,6 +284,7 @@ func newEnv(t *testing.T, mutate func(*config.Config)) *env {
 	t.Helper()
 	e := &env{t: t, dir: t.TempDir(), clk: newFakeClock(), pres: &fakePresence{}, appr: &switchApprover{}}
 	e.peerPID.Store(int64(os.Getpid()))
+	e.adminPID.Store(int64(os.Getppid()))
 	e.cfg = testConfig(t)
 	if mutate != nil {
 		mutate(e.cfg)
@@ -317,6 +341,15 @@ func (e *env) start() {
 		ProxyListener:  ln,
 		AdminListener:  adminLn,
 		Logger:         slog.New(slog.NewTextHandler(syncWriter{&e.logMu, e.logs}, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		AdminPeerPID: func(c net.Conn) (int, error) {
+			switch p := int(e.adminPID.Load()); {
+			case p > 0:
+				return p, nil
+			case p == 0:
+				return connPeerPID(c) // the real lookup (pipe tests)
+			}
+			return 0, errors.New("unknown peer")
+		},
 		PeerResolver: func(local, remote netip.AddrPort) proxy.ClientInfo {
 			return proxy.ClientInfo{PID: int(e.peerPID.Load()), Image: `C:\tools\agent.exe`}
 		},
@@ -369,13 +402,42 @@ func (e *env) unlock() {
 	}
 }
 
+// withOwner runs call, approving any pass_create or key_add step-up it triggers the way
+// the owner would: with the vault passphrase over the admin API.
+func (e *env) withOwner(call func(ctx context.Context) error) error {
+	e.t.Helper()
+	ctx := e.ctx()
+	done := make(chan error, 1)
+	go func() { done <- call(ctx) }()
+	decided := map[string]bool{}
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Millisecond):
+		}
+		list, err := e.c.Approvals(ctx)
+		if err != nil {
+			continue
+		}
+		for _, ap := range list {
+			if !decided[ap.ID] && (ap.Kind == "pass_create" || ap.Kind == "key_add") {
+				decided[ap.ID] = true
+				_ = e.c.Decide(ctx, ap.ID, client.DecideRequest{Approved: true, Secret: append([]byte(nil), testPassphrase...)})
+			}
+		}
+	}
+}
+
 func (e *env) addKeys() {
 	e.t.Helper()
-	if _, err := e.c.AddKey(e.ctx(), "anthropic", "main", []byte(anthropicKey)); err != nil {
-		e.t.Fatal(err)
-	}
-	if _, err := e.c.AddKey(e.ctx(), "openai", "main", []byte(openaiKey)); err != nil {
-		e.t.Fatal(err)
+	for _, k := range [][2]string{{"anthropic", anthropicKey}, {"openai", openaiKey}} {
+		if err := e.withOwner(func(ctx context.Context) error {
+			_, err := e.c.AddKey(ctx, k[0], "main", []byte(k[1]))
+			return err
+		}); err != nil {
+			e.t.Fatal(err)
+		}
 	}
 }
 
@@ -387,7 +449,12 @@ func (e *env) newPass(req client.PassCreateRequest) string {
 	if len(req.Providers) == 0 {
 		req.Providers = []string{"*"}
 	}
-	r, err := e.c.CreatePass(e.ctx(), req)
+	var r client.PassCreateResponse
+	err := e.withOwner(func(ctx context.Context) error {
+		var err error
+		r, err = e.c.CreatePass(ctx, req)
+		return err
+	})
 	if err != nil {
 		e.t.Fatalf("create pass: %v", err)
 	}
@@ -549,3 +616,30 @@ func (helloLike) Approve(ctx context.Context, _ approval.Request) (bool, error) 
 func (helloLike) Method() string                                                { return "hello" }
 
 type netConn = net.Conn
+
+// waitPending waits for a pending approval of kind and returns its id.
+func (e *env) waitPending(kind string) string {
+	e.t.Helper()
+	for i := 0; i < 500; i++ {
+		list, _ := e.c.Approvals(e.ctx())
+		for _, ap := range list {
+			if ap.Kind == kind {
+				return ap.ID
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	e.t.Fatalf("no pending %s approval", kind)
+	return ""
+}
+
+// ownerSecret is the passphrase as a fresh slice (Decide wipes its copy).
+func ownerSecret() []byte { return append([]byte(nil), testPassphrase...) }
+
+// setAdminPID changes the PID the daemon sees for admin calls. The PID is
+// fixed per connection (as with a real pipe), so idle connections are
+// dropped first.
+func (e *env) setAdminPID(pid int) {
+	e.c.Close()
+	e.adminPID.Store(int64(pid))
+}

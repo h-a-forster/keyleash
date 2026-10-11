@@ -78,9 +78,13 @@ type Pass struct {
 	MaxConcurrency int         `json:"max_concurrency,omitempty"` // 0 = no per-pass cap beyond policy
 	Limits         []LimitSpec `json:"limits,omitempty"`
 	Bind           *Binding    `json:"bind,omitempty"`
-	Revoked        bool        `json:"revoked,omitempty"`
-	RevokedAt      time.Time   `json:"revoked_at,omitzero"`
-	LastUsed       time.Time   `json:"last_used,omitzero"`
+	// Entries maps a provider to the vault entry id this pass uses for it,
+	// fixed when the pass is issued (spec §6), so adding a key or changing
+	// a provider's active key never redirects an existing pass's traffic.
+	Entries   map[string]string `json:"entries,omitempty"`
+	Revoked   bool              `json:"revoked,omitempty"`
+	RevokedAt time.Time         `json:"revoked_at,omitzero"`
+	LastUsed  time.Time         `json:"last_used,omitzero"`
 }
 
 // AllowsModel reports whether model may be used with this pass. Deny globs
@@ -135,6 +139,12 @@ func (p Pass) clone() Pass {
 		b := *p.Bind
 		c.Bind = &b
 	}
+	if p.Entries != nil {
+		c.Entries = make(map[string]string, len(p.Entries))
+		for k, v := range p.Entries {
+			c.Entries[k] = v
+		}
+	}
 	return c
 }
 
@@ -144,6 +154,9 @@ const (
 	maxGlobLen  = 256
 	maxLimits   = 32
 	maxImageLen = 4096
+
+	maxEntryMaps  = 64
+	maxEntryIDLen = 128
 )
 
 var validWindows = map[string]bool{
@@ -209,6 +222,17 @@ func validate(p *Pass, now time.Time) error {
 		}
 		if l.Amount <= 0 {
 			return errors.New("pass: limit amount must be positive")
+		}
+	}
+	if len(p.Entries) > maxEntryMaps {
+		return errors.New("pass: too many entry mappings")
+	}
+	for prov, id := range p.Entries {
+		if _, ok := provider.Get(prov); !ok || prov != strings.ToLower(prov) {
+			return fmt.Errorf("pass: entry mapping for unknown provider %q", prov)
+		}
+		if id == "" || len(id) > maxEntryIDLen {
+			return errors.New("pass: bad entry id")
 		}
 	}
 	if p.Bind != nil {

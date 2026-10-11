@@ -79,6 +79,9 @@ func Init(dataDir string, opts InitOptions) (recoveryCode string, err error) {
 	if _, err := ensureRootEntry(v); err != nil {
 		return "", fmt.Errorf("keyleash: create integrity key: %w", err)
 	}
+	if err := ensureStateEntry(v); err != nil {
+		return "", fmt.Errorf("keyleash: create daemon state: %w", err)
+	}
 	cpath := filepath.Join(dataDir, ConfigFile)
 	if _, serr := os.Stat(cpath); errors.Is(serr, os.ErrNotExist) {
 		text, terr := configTemplate(cfg)

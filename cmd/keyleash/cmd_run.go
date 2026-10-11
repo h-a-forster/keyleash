@@ -97,7 +97,12 @@ func runRun(ctx context.Context, a *app, args []string) error {
 		return err
 	}
 	req.BindPID = os.Getpid()
-	resp, err := c.CreatePass(cctx, req)
+	var resp client.PassCreateResponse
+	err = a.withStepUp(ctx, c, func(ctx context.Context) error {
+		var err error
+		resp, err = c.CreatePass(ctx, req)
+		return err
+	})
 	if err != nil {
 		return err
 	}

@@ -22,11 +22,21 @@ import (
 // Request describes what needs approving. CoalesceKey groups identical
 // requests (e.g. pass id + reason): while one is pending, later requests with
 // the same non-empty key wait for the same decision instead of prompting
-// again.
+// again. Callers must only coalesce requests whose approval means exactly
+// the same thing for every waiter (the daemon never coalesces admin
+// step-ups, spec §9).
 type Request struct {
 	Kind, Title, Detail, PassID, Model string
 	Amount                             money.Micros
 	CoalesceKey                        string
+	// Requester is the verified PID of the admin-channel caller whose call
+	// triggered the request (0 for proxy requests or when unknown). It lets
+	// a CLI recognise the approval its own call is waiting for.
+	Requester int
+	// Scope, Window and Limit describe the exceeded limit of an over_limit
+	// request; Limit bounds the grant an approval may carry.
+	Scope, Window string
+	Limit         money.Micros
 }
 
 // Grant is an allowance attached to an approval (e.g. "+$10 for 1 h") so one
@@ -166,6 +176,20 @@ func (h helloApprover) Approve(ctx context.Context, req Request) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// PassphraseApprover never decides on its own: requests wait for an
+// external decision (the daemon's admin API, which requires re-entering a
+// vault secret, spec §9) or the timeout.
+func PassphraseApprover() Approver { return waitApprover{} }
+
+type waitApprover struct{}
+
+func (waitApprover) Method() string { return "passphrase" }
+
+func (waitApprover) Approve(ctx context.Context, _ Request) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
 }
 
 // DenyApprover denies everything (CI, servers).

@@ -232,6 +232,14 @@ func (c *Client) AddKey(ctx context.Context, provider, label string, secret []by
 	return k, err
 }
 
+// UseKey makes entry id its provider's active key: the key new passes are
+// mapped to (step-up; blocks until approved).
+func (c *Client) UseKey(ctx context.Context, id string) (KeyInfo, error) {
+	var k KeyInfo
+	err := c.do(ctx, http.MethodPost, "/v1/keys/"+url.PathEscape(id)+"/use", nil, struct{}{}, &k)
+	return k, err
+}
+
 // RemoveKey deletes a vault entry (step-up).
 func (c *Client) RemoveKey(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/keys/"+url.PathEscape(id), nil, nil, nil)
@@ -259,8 +267,13 @@ func (c *Client) Approvals(ctx context.Context) ([]Approval, error) {
 	return r, err
 }
 
-// Decide answers a pending approval.
+// Decide answers a pending approval. Approving needs req.Secret (the vault
+// passphrase or recovery code); the caller still owns and should wipe it.
 func (c *Client) Decide(ctx context.Context, id string, req DecideRequest) error {
+	if len(req.Secret) > 0 {
+		req.Secret = append([]byte(nil), req.Secret...)
+		defer secmem.Wipe(req.Secret)
+	}
 	return c.do(ctx, http.MethodPost, "/v1/approvals/"+url.PathEscape(id), nil, req, nil)
 }
 

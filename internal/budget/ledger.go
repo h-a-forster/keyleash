@@ -221,6 +221,26 @@ func (l *Ledger) newTripAgg(now time.Time) *agg {
 // is. Errors: *ExceededError (ErrExceeded), *ConcurrencyError
 // (ErrConcurrency), ErrTripped, ErrClosed, ErrPersist, ErrInvalid.
 func (l *Ledger) Reserve(scopes []string, amount money.Micros, meta Meta) (*Reservation, error) {
+	return l.ReserveWith(scopes, amount, meta, ReserveOptions{})
+}
+
+// LimitKey names one limit: a scope and a window.
+type LimitKey struct {
+	Scope  string
+	Window Window
+}
+
+// ReserveOptions adjusts a single reservation.
+type ReserveOptions struct {
+	// Skip lists limits that are not checked for this one reservation (an
+	// owner approved exactly this request over them). The reservation and
+	// its settled charge still count toward those limits for every later
+	// reservation; concurrency caps and the tripwire always apply.
+	Skip []LimitKey
+}
+
+// ReserveWith is Reserve with per-reservation options (see ReserveOptions).
+func (l *Ledger) ReserveWith(scopes []string, amount money.Micros, meta Meta, opt ReserveOptions) (*Reservation, error) {
 	if amount < 0 {
 		return nil, fmt.Errorf("%w: negative amount", ErrInvalid)
 	}
@@ -256,6 +276,9 @@ func (l *Ledger) Reserve(scopes []string, amount money.Micros, meta Meta) (*Rese
 		now := l.clock.Now()
 		for i, lim := range l.limits {
 			if !scopeMatches(lim.Scope, sc, meta.Model) {
+				continue
+			}
+			if slices.Contains(opt.Skip, LimitKey{Scope: lim.Scope, Window: lim.Window}) {
 				continue
 			}
 			if lim.Window == WindowRequest {

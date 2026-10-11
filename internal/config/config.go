@@ -101,6 +101,10 @@ type PassDefaults struct {
 	RunTTL      Duration `toml:"run_ttl"`
 	Day         *Amount  `toml:"day"`
 	Concurrency int      `toml:"concurrency"`
+	// MaxRunBudget is the largest budget a run pass bound to the calling
+	// process may get without a step-up (spec §6); it is also the default
+	// budget of run passes created without one.
+	MaxRunBudget *Amount `toml:"max_run_budget"`
 }
 
 // Config is the effective configuration.
@@ -145,8 +149,11 @@ type Config struct {
 
 	Models struct {
 		// Unknown is the policy for models without a price: "approve",
-		// "deny" or "allow" (allow still reserves AssumeMaxOutputTokens at
-		// the most expensive known rate).
+		// "deny" or "allow". Allowed or approved requests reserve their
+		// input estimate plus max output (or AssumeMaxOutputTokens) at the
+		// provider's most expensive known rates and settle reported usage at
+		// those rates (spec §7.5); requests whose input cannot be bounded
+		// always need approval and reserve the per-request limit.
 		Unknown               string   `toml:"unknown"`
 		Allow                 []string `toml:"allow"`
 		Deny                  []string `toml:"deny"`
@@ -154,9 +161,14 @@ type Config struct {
 	} `toml:"models"`
 
 	Approval struct {
-		// Method is "hello", "console" or "deny".
+		// Method is "hello", "passphrase", "console" or "deny" (spec §9).
 		Method  string   `toml:"method"`
 		Timeout Duration `toml:"timeout"`
+		// GrantMaxMultiple caps a grant attached to an over-limit approval
+		// at this many times the exceeded limit.
+		GrantMaxMultiple int `toml:"grant_max_multiple"`
+		// GrantMaxDuration caps how long such a grant lasts.
+		GrantMaxDuration Duration `toml:"grant_max_duration"`
 	} `toml:"approval"`
 
 	Pricing struct {
@@ -193,6 +205,7 @@ func Default(profile string) (*Config, error) {
 	c.Limits.Away = AwayLimits{Total: amt("$3"), Concurrency: 2}
 	c.Limits.Pass = PassDefaults{
 		TTL: Duration{24 * time.Hour}, RunTTL: Duration{12 * time.Hour}, Concurrency: 4,
+		MaxRunBudget: amt("$10"),
 	}
 	c.Limits.OnExceed = "deny"
 
@@ -204,6 +217,8 @@ func Default(profile string) (*Config, error) {
 
 	c.Approval.Method = "hello"
 	c.Approval.Timeout = Duration{60 * time.Second}
+	c.Approval.GrantMaxMultiple = 5
+	c.Approval.GrantMaxDuration = Duration{24 * time.Hour}
 
 	c.Audit.AnchorEvery = Duration{10 * time.Minute}
 
@@ -361,9 +376,18 @@ func (c *Config) Validate() error {
 		bad("models.assume_max_output_tokens must be positive")
 	}
 	switch c.Approval.Method {
-	case "hello", "console", "deny":
+	case "hello", "passphrase", "console", "deny":
 	default:
-		bad("approval.method must be \"hello\", \"console\" or \"deny\"")
+		bad("approval.method must be \"hello\", \"passphrase\", \"console\" or \"deny\"")
+	}
+	if c.Approval.GrantMaxMultiple < 1 || c.Approval.GrantMaxMultiple > 100 {
+		bad("approval.grant_max_multiple must be between 1 and 100")
+	}
+	if c.Approval.GrantMaxDuration.Duration < time.Minute || c.Approval.GrantMaxDuration.Duration > 7*24*time.Hour {
+		bad("approval.grant_max_duration must be between 1m and 168h")
+	}
+	if c.Limits.Pass.MaxRunBudget != nil && c.Limits.Pass.MaxRunBudget.Micros <= 0 {
+		bad("limits.pass.max_run_budget must be positive")
 	}
 	if c.Approval.Timeout.Duration < 5*time.Second || c.Approval.Timeout.Duration > 10*time.Minute {
 		bad("approval.timeout must be between 5s and 10m")

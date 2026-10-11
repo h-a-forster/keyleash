@@ -1,6 +1,8 @@
 package audit
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"math"
 	"strings"
@@ -116,4 +118,21 @@ func tokenLooksSecret(t string) bool {
 		}
 	}
 	return h >= minEntropyBits
+}
+
+// LooksSecret reports whether s contains anything Append would reject as a
+// credential (a provider-key or pass prefix, or a long high-entropy token).
+func LooksSecret(s string) bool { return looksSecret(s) }
+
+// Redact returns s unchanged unless it looks like a secret; then it returns
+// "[redacted:<first 12 hex of SHA-256(s)>]", which identifies repeated values
+// without revealing them. Callers use it on caller-controlled fields (client
+// image, model, pass name, labels) so a hostile value cannot make Append drop
+// a record (spec §11).
+func Redact(s string) string {
+	if !looksSecret(s) {
+		return s
+	}
+	sum := sha256.Sum256([]byte(s))
+	return "[redacted:" + hex.EncodeToString(sum[:6]) + "]"
 }

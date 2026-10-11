@@ -255,22 +255,26 @@ func TestClientAPIErrorNeverEchoesSecret(t *testing.T) {
 	}
 }
 
-func TestFallbackAmount(t *testing.T) {
+func TestRequestLimit(t *testing.T) {
 	e := newEnv(t, func(c *config.Config) {
 		c.Limits.Global.Request = &config.Amount{Micros: 3_000_000}
 		c.Limits.Provider["openai"] = config.Limits{Request: &config.Amount{Micros: 500_000}}
+		c.Limits.Model = map[string]config.Limits{"*mystery*": {Request: &config.Amount{Micros: 200_000}}}
 	})
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
-	if got := e.d.fallbackAmountLocked("anthropic", "p1"); got != 3_000_000 {
-		t.Fatalf("anthropic fallback = %s", got)
+	if got := e.d.requestLimitLocked("anthropic", "claude-x", "p1"); got != 3_000_000 {
+		t.Fatalf("anthropic request limit = %s", got)
 	}
-	if got := e.d.fallbackAmountLocked("openai", "p1"); got != 500_000 {
-		t.Fatalf("openai fallback = %s", got)
+	if got := e.d.requestLimitLocked("openai", "gpt-x", "p1"); got != 500_000 {
+		t.Fatalf("openai request limit = %s", got)
+	}
+	if got := e.d.requestLimitLocked("anthropic", "mystery-model", "p1"); got != 200_000 {
+		t.Fatalf("model request limit = %s", got)
 	}
 	e.d.cfg.Limits.Global.Request = nil
-	if got := e.d.fallbackAmountLocked("anthropic", "p1"); got != DefaultFallbackAmount {
-		t.Fatalf("default fallback = %s", got)
+	if got := e.d.requestLimitLocked("anthropic", "claude-x", "p1"); got != 0 {
+		t.Fatalf("no request limit = %s, want 0 (no default amount)", got)
 	}
 }
 

@@ -219,7 +219,10 @@ func (m *Meter) Inspect(p *provider.Provider, ep provider.Endpoint, path string,
 
 	pr, priced := m.lookup(p.Name, info.Model)
 	if !priced {
-		return info, nil // Estimate will report the model unpriced
+		// Estimate will report the model unpriced; WorstCaseEstimate bounds
+		// it at the provider's most expensive rates, so fold in everything
+		// that can be bounded and mark the rest unbounded.
+		return m.inspectUnpriced(p.Name, ep.Kind, obj, n, scan.serverSide, info)
 	}
 	if scan.serverSide {
 		if pr.MaxInputTokens <= 0 {
