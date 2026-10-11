@@ -121,6 +121,10 @@ type Config struct {
 		AwayMax    Duration `toml:"away_max"`
 		MaxLease   Duration `toml:"max_lease"`
 		Poll       Duration `toml:"poll"`
+		// CountInjectedInput treats synthetic input (SendInput, remote
+		// control tools) as presence. Off by default so a computer-use agent
+		// driving the desktop cannot keep the session "present".
+		CountInjectedInput bool `toml:"count_injected_input"`
 	} `toml:"presence"`
 
 	Limits struct {

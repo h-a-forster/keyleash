@@ -118,14 +118,29 @@ can be built and tested in isolation.
 ### 5.2 Key slots
 
 Like LUKS: the DEK is wrapped independently by each slot; any one slot unlocks.
-Each slot derives a 256-bit key-encryption key (KEK) and seals the DEK with
-XChaCha20-Poly1305, AAD = `"keyleash/v1/slot\x00" || vault_id || slot_id || slot_type`.
+Each slot yields a fresh 256-bit key-encryption key (KEK) per wrap and seals
+the DEK with XChaCha20-Poly1305, AAD = `"keyleash/v1/slot\x00" || vault_id || slot_id || slot_type`.
+
+Every slot can be **re-wrapped from public material alone**, without the
+owner's secret and without escrowing slot keys under the DEK. This makes
+re-keying possible: removing a slot or rotating the recovery code generates a
+new DEK, re-seals every entry, and re-wraps the new DEK for the remaining
+slots only. A removed slot (or an old copy of the file) never sees the new DEK.
+
+- Passphrase and recovery slots: Argon2id(secret, salt) is used as an X25519
+  private scalar; its public key is stored in the slot. Each wrap uses a fresh
+  ephemeral X25519 key (stored in the slot), and
+  KEK = HKDF-SHA256(shared secret, info = `"keyleash/v1/slot-kek\x00" || epk || pub`).
+  An offline guess still costs one full Argon2id evaluation.
+- Hello slots store the RSA public key and the padding used; each wrap draws a
+  random KEK and encrypts it to the public key.
+- DPAPI slots draw a random KEK per wrap and protect it with DPAPI.
 
 | Slot | KEK source | Notes |
 |---|---|---|
-| `hello` | Windows Hello / TPM: RSA key in the Microsoft Passport KSP; DEK wrapped with RSA-OAEP-SHA256 (PKCS#1 v1.5 fallback only if OAEP is unsupported by the KSP) | Each unlock prompts for PIN/biometric. Default on Windows when available |
-| `passphrase` | Argon2id(passphrase, salt) — defaults m=256 MiB, t=3, p=4, tuned at creation to ≥ 0.5 s | Portable; default where Hello is unavailable |
-| `recovery` | Argon2id over a random 128-bit recovery code shown once (grouped base32, with checksum) | Created at init; offline backup |
+| `hello` | Windows Hello / TPM: RSA key in the Microsoft Passport KSP; KEK encrypted with RSA-OAEP-SHA256 (PKCS#1 v1.5 fallback only if the KSP rejects OAEP, detected by a test unwrap at slot creation) | Each unlock prompts for PIN/biometric. Default on Windows when available |
+| `passphrase` | Argon2id(passphrase, salt) → X25519 key; defaults m=256 MiB, t=3, p=4, tuned at creation to ≥ 0.5 s | Portable; default where Hello is unavailable |
+| `recovery` | Argon2id over a random 128-bit recovery code shown once (Crockford base32, 8 groups of 4 incl. a checksum group) → X25519 key | Created at init; offline backup |
 | `dpapi` | Windows DPAPI (user scope, entropy = vault_id, UI forbidden) | Opt-in "unlock at logon". Any same-user process can unwrap it, so it is labelled *convenience* and off by default |
 | `fido2` | FIDO2 `hmac-secret` from a security key | Later phase |
 
@@ -155,8 +170,17 @@ reveals nothing useful without the vault.
   for crash recovery only.
 - Data directory permissions: owner-only (Windows DACL: current user + SYSTEM;
   Unix 0700/0600).
-- Anti-rollback (optional): the latest `seq` is also stored in a DPAPI-protected
-  sidecar; a lower `seq` on disk triggers a warning.
+- Anti-rollback: the latest `seq` is also stored in a sidecar (`vault.json.seq`;
+  DPAPI-protected on Windows, HMAC'd under a DEK-derived key elsewhere). At
+  unlock, after the DEK is recovered, a lower `seq` on disk (or a sidecar from
+  another vault) fails with `ErrRollback` and the vault stays locked until the
+  owner explicitly accepts the older state. Because the sidecar lives next to
+  the vault, this detects accidents and naive restores, not an attacker who
+  can replace both files.
+- After a re-key, `vault.prev` is replaced with a copy of the new state so the
+  old DEK does not linger next to the vault. Backups taken before a slot
+  removal still open with that slot and reveal the entries as they were then;
+  rotate provider keys if a slot was compromised.
 
 Default data directory: `%LOCALAPPDATA%\keyleash` on Windows,
 `~/Library/Application Support/keyleash` on macOS, `$XDG_CONFIG_HOME/keyleash`
@@ -208,7 +232,9 @@ All amounts are integer **micro-USD** (`int64`). No floats in accounting.
 ### 7.2 Scopes and windows
 
 Limits can be attached to scopes: `global`, `provider:<name>`, `pass:<id>`,
-`session:<unlock-id>`, `model:<glob>`.
+`session:<unlock-id>`, `model:<glob>`, `away`, `grant:<id>`. `global` always
+applies. Model globs are case-insensitive and `*` matches any characters
+including `/` (OpenRouter ids look like `anthropic/claude-opus-4`).
 
 Windows per limit: `request`, `minute`, `hour` (rolling), `day`, `month`
 (calendar, local time zone), `session` (resets on unlock).
@@ -249,6 +275,15 @@ worst case until they settle.
 - Model allow/deny globs at global, provider and pass level. Default deny
   list is empty; default policy for *unknown* models (not in the pricing table)
   is `approve` (step-up), never "free".
+- A request is also treated as **unpriced** when its worst case cannot be
+  bounded: server-side context (`previous_response_id`, file ids, cached
+  content) on a model without a known context window, or declared tools with
+  per-call fees and no call cap (e.g. web search without `max_uses` /
+  `max_tool_calls`, code execution, image generation). If a response shows a
+  fee-bearing tool that cannot be priced, the reservation is charged in full.
+- When the request does not pin a service tier, the estimate assumes the
+  model's most expensive tier, because accounts can default to a premium tier
+  the request does not show.
 - Only listed endpoints are forwarded per provider (messages, chat completions,
   responses, embeddings, model listing, token counting, …). Anything else is
   denied unless explicitly allowed in config.
@@ -263,8 +298,13 @@ worst case until they settle.
 
 ### 7.7 Persistence
 
-- Settled charges are appended to `ledger/YYYY-MM.jsonl` (fsync'd in batches
-  ≤ 1 s). On start the ledger replays the current month to rebuild windows.
+- Settled charges are appended to `ledger/ledger-YYYY-MM.jsonl` (fsync'd in
+  batches ≤ 1 s). On start the ledger replays the current month (plus the last
+  24 h of the previous one) to rebuild windows.
+- Records are hash-chained across months and, once unlocked, carry an HMAC
+  under a vault-derived key. After unlock the daemon verifies the chain and
+  MACs against its last stored checkpoint; any break, MAC failure or missing
+  month trips the daemon, so deleting the ledger cannot silently reset spend.
 - Reservations live in memory only; a crash drops in-flight requests anyway.
 
 ## 8. Presence and state machine
@@ -293,8 +333,15 @@ worst case until they settle.
   presence loop (portable) and OS power notifications where available.
 - **Tripped**: see §7.4.
 
-Windows signals: `GetLastInputInfo` (idle), `OpenInputDesktop` /
-`WTSQuerySessionInformation` (locked session), clock-gap (sleep).
+Windows signals: idle is time since the last **physical** keyboard/mouse
+event, observed with low-level hooks that ignore injected input
+(`LLKHF_INJECTED`/`LLMHF_INJECTED`), so a computer-use agent driving the
+desktop cannot keep the session "present". Remote-control tools that inject
+input (Parsec, Sunshine, some VNC) therefore look idle unless
+`presence.count_injected_input = true`. If hooks cannot be installed the
+daemon falls back to `GetLastInputInfo` and reports presence as degraded.
+Screen lock: `WTSQuerySessionInformation` lock state, falling back to
+`OpenInputDesktop`. Sleep: wall-clock gap between polls.
 
 ## 9. Step-up approval
 
