@@ -909,8 +909,11 @@ func (u *usageParser) Final() (Usage, bool) {
 	hasExtras := !isStandardTier(u.d.tier) || u.d.regional || u.d.hasFees()
 	pr, ok := u.m.lookup(u.prov, out.Model)
 	if !ok {
-		if u.grounded() {
-			return Usage{}, false // grounding fees cannot be priced
+		if u.grounded() || u.d.hasFees() {
+			// A model without a price has no fee table to price provider
+			// tool calls (web search, file search, grounding) with: charge
+			// the reservation instead of settling the fees at $0.
+			return Usage{}, false
 		}
 		if hasExtras && out.Model == "" {
 			// The price-changing detail cannot be applied without a model;

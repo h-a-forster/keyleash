@@ -49,7 +49,33 @@ This document is normative for the engine. UI is out of scope here.
 | T9 | Prompt injection asks the agent to reveal its key | "print your ANTHROPIC_API_KEY" | Agent only ever has a pass |
 | T10 | Agent drives the admin channel | An agent running as the owner calls the admin pipe to approve its own requests, mint passes, add its own key or raise limits | Admin access is never proof of presence: every step-up needs Windows Hello, the vault secret or the daemon's console (§9); processes inside a run pass are confined (§12) |
 
-Residual risk is stated plainly in the README.
+Residual risk is stated plainly in the README. Specifically:
+
+- **Passphrase approvals can be delayed.** Wrong approval secrets are
+  rate-limited per caller and globally (2 s doubling, capped at 1 min). A
+  same-user process that keeps submitting wrong guesses can keep the global
+  window closed and delay passphrase approvals by up to a minute at a time.
+  Every guess is audited; Windows Hello approvals, `lock` and `panic` are
+  unaffected.
+
+- **Data-dir snapshot restore erases spend.** The vault's anti-rollback
+  sidecar sits next to the vault. Restoring a consistent snapshot of the
+  *whole* data directory (vault, sidecar, ledger, audit, passes.json) to an
+  earlier point is indistinguishable from the owner restoring a backup: the
+  ledger, the pass store and the daemon state all match one another, so spend
+  recorded since the snapshot is forgotten and passes revoked since then come
+  back. Any process running as the owner can do this while the daemon is
+  stopped. Keeping a copy of the anti-rollback record outside the data
+  directory (e.g. a TPM NV counter) is a later phase.
+- **Confinement is OS-dependent** (§12): on Windows a run pass's process tree
+  is held in a job object it cannot leave; elsewhere it rests on the
+  parent-process chain, which a process can escape by daemonising.
+- **Revocations made while locked** are kept outside the authenticated pass
+  store (§6) until the next unlock; deleting them before that un-revokes
+  those passes (a pass still cannot be used while locked).
+- A run pass's agent runs as the owner's OS user. It cannot use the admin
+  channel to weaken anything, but it can read the owner's files; real
+  isolation (`keyleash run --isolate`) is a later phase (§15).
 
 ## 4. Architecture
 
@@ -222,6 +248,37 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
 - Kinds: `named` (created by the owner, e.g. for an editor), `run` (ephemeral,
   created by `keyleash run`, process-bound, revoked on exit), `admin` (none —
   the admin channel uses OS-level access control, not passes).
+- **Run pass jobs (Windows).** When a `run` pass is issued, the daemon places
+  the bound process in a new unnamed job object that it alone holds, without
+  breakaway rights; every process started from it later is a member and
+  cannot leave, even when an intermediate parent exits. The proxy accepts a
+  run pass from a member of its job (or, by the parent walk, from the bound
+  process's tree). If the process cannot be placed in a job the pass is not
+  issued. Jobs are kept while any member lives, even after the pass ends
+  (members stay confined, §12), and with `[run] kill_on_daemon_exit = true`
+  (default) members are terminated when the daemon exits. Run passes left by
+  an earlier daemon are revoked at start (their jobs died with it). Other
+  systems have no equivalent: there, binding uses the parent chain only.
+- **Lists.** `providers`, `models`, `deny_models` and `limits` hold at most 32
+  entries each; duplicate providers (case-insensitive) or model patterns,
+  unknown providers and `*` combined with other providers are refused.
+- **Authenticated store.** `passes.json` (format version 2) holds a `body`
+  (a counter and the pass records) and an HMAC-SHA256 of the body under a
+  key derived from the vault's integrity root (`keyleash/v1/passes-mac`).
+  Every change made while unlocked is an authenticated write that increments
+  the counter, and the daemon records the counter and a SHA-256 per pass in
+  the daemon-state vault entry (§7.7). At unlock the body is verified: a bad
+  MAC, a counter that is neither the recorded one nor one ahead of it (a
+  crash between the two writes), or passes that differ from the record trip
+  the daemon (`pass_store`); `keyleash status` lists the added, removed and
+  changed pass ids, and the store is not re-keyed until `keyleash resume`
+  (step-up), which revokes every added and changed pass and records a new
+  baseline. Revocations made while locked are kept in an unauthenticated list
+  (`revoked_while_locked`) and folded into the body at the next unlock.
+  `last_used` is not authenticated.
+- **Issue order.** A pass is stored, its process confined (run passes), and
+  its `pass_issue` audit record written before the token is returned; if the
+  confinement or the audit write fails, the pass is removed again.
 - Passes only work while the daemon is Unlocked or Away (§8).
 - **Key mapping.** When a pass is issued, each provider it allows that has a
   key is mapped to a vault entry (`entries`): the provider's *active* key,
@@ -352,8 +409,10 @@ worst case until they settle.
   After unlock the ledger is verified against it: a missing or shorter ledger,
   or records without a checkpoint, trip the daemon (`integrity`). The same
   entry holds the accepted config (§14) and each provider's active key (§6).
-  `state.json` holds only non-security bookkeeping (models seen without a
-  price); deleting it changes nothing.
+  The entry also holds the approval method of the accepted config (§9, §14),
+  the pass store baseline (§6) and whether the vault ever held an `api_key`
+  (§9). `state.json` holds only non-security bookkeeping (models seen without
+  a price); deleting it changes nothing.
 - Reservations live in memory only. On shutdown, requests still in flight
   after the grace period are charged at their reserved amount before the
   ledger and checkpoint are written, so their spend survives the restart.
@@ -421,13 +480,30 @@ Triggered by: unlock (Hello slot implies it), exceeding a limit with
 `on_exceed = "approve"`, unknown models (`models.unknown = "approve"`),
 unbounded requests (§7.5), leaving Tripped (including accepting a changed
 config), unattended grants, creating a pass beyond the run-pass defaults
-(§6), adding a provider key (except the very first `api_key` in the vault),
-changing a provider's active key, removing a key, reveal/export, slot
-changes, rotating the recovery code, raising limits.
+(§6), adding a provider key (except the first `api_key` the vault ever
+holds: once one was added, removing every key does not reopen the
+exemption), changing a provider's active key, removing a key,
+reveal/export, slot changes, rotating the recovery code, raising limits.
 
 ```
-Approver.Approve(ctx, Request{Kind, Title, Detail, Amount, PassID, Model, Requester, Scope, Window, Limit}) → (Decision, error)
+Approver.Approve(ctx, Request{Kind, Title, Detail, Note, Amount, PassID, Model, Requester, RequesterName, Scope, Window, Limit}) → (Decision, error)
 ```
+
+- **Prompt text.** Every approver shows the same compact text (at most 200
+  characters, what the Windows Hello dialog shows): title, the requesting
+  process's image name and PID, the risk text (`Detail`: what is spent,
+  where, for how long, bound to what), amount, model, pass, then an optional
+  `Note` in the room left. A step-up whose risk text would not fit is refused
+  (`400`) instead of being shown truncated. A resume after a config change
+  shows "N config keys changed" naming the highest-risk keys first
+  (`approval.*`, `limits.*`, `models.*`, `pricing*`, `presence.*`).
+- **Resumes from owner trips** (`integrity`, `audit_integrity`, `pass_store`,
+  `config_changed`) are approved with the approval method of the last
+  *accepted* config, recorded in the vault (§7.7), never with the method a
+  changed config.toml names and never with the console; when that method is
+  `console` or `deny`, or Windows Hello is unavailable, the resume waits for
+  the vault passphrase or recovery code over the admin API. While a changed
+  config is unaccepted, every approval uses the accepted method.
 
 - `approval.method = "hello"`: signs a fresh nonce with a Passport KSP key
   whose UI policy forces a Windows Hello prompt; the prompt text describes
@@ -441,9 +517,16 @@ Approver.Approve(ctx, Request{Kind, Title, Detail, Amount, PassID, Model, Reques
   passphrase route works too.
 - `"deny"`: always no (CI, servers); nothing can be approved.
 - Approving over the admin API with a secret works with every method except
-  `deny`. Wrong secrets are audited (`approval_secret`) and rate limited:
-  after 5 failures each attempt waits 30 s, doubling up to 15 min (`429
-  rate_limited`). The secret is wiped after use. Denying needs no secret.
+  `deny`. The vault verifies the secret without changing its state and
+  without holding the lock that `lock`/`panic` need. At most one secret is
+  verified at a time; a concurrent attempt gets `429 rate_limited` at once.
+  Wrong secrets are audited (`approval_secret`) and rate limited per caller
+  (PID and executable): after 5 failures each attempt waits 30 s, doubling up
+  to 15 min; and across all callers: after 10 failures each attempt waits 2 s,
+  doubling up to 1 min (`429 rate_limited`), so starting new processes does
+  not reset the limit. A correct secret clears both. Windows Hello approvals
+  are not rate limited. The secret is wiped after use. Denying needs no
+  secret.
 - Requests wait up to `approval.timeout` (default 60 s) holding the HTTP
   request open. **Admin step-ups never coalesce**: only the caller whose
   request triggered the prompt proceeds, and the approval records that
@@ -559,13 +642,26 @@ table, so the audit log answers "which program spent this".
   runs as the owner's OS user — as every agent does.
 - **Caller identity.** The daemon records the client PID of every admin
   connection from the OS (Windows `GetNamedPipeClientProcessId`, Linux
-  `SO_PEERCRED`, macOS `LOCAL_PEERPID`).
-- **Confinement.** A caller that is the bound process of an active `run`
-  pass, or one of its descendants, is *confined*: it may only read
-  `GET /v1/status` and revoke its own pass; everything else gets `403
-  confined`. A caller whose PID cannot be determined may read, but every
-  mutating call gets `403 confined`. An error while checking a binding counts
-  as confined (fail closed).
+  `SO_PEERCRED`, macOS `LOCAL_PEERPID`, FreeBSD 13+ `LOCAL_PEERCRED`
+  `cr_pid`). OpenBSD and NetBSD are not supported: every caller there is
+  unidentified.
+- **Confinement.** A caller is *confined* when it is a member of any run
+  pass job the daemon holds (Windows, §6: this includes descendants whose
+  parent exited and processes that outlived their pass), or the bound process
+  of an active `run` pass or one of its descendants by the parent-process
+  walk. A confined caller may only read `GET /v1/status`, lock, panic and
+  revoke its own pass; everything else gets `403 confined`. A caller whose
+  PID cannot be determined may read, lock and panic, but every other mutating
+  call gets `403 confined`. An error while checking counts as confined (fail
+  closed). `POST /v1/lock` and `POST /v1/panic` are allowed from any caller:
+  they only add protection.
+- **What is enforced where.** On Windows confinement is enforced by job
+  objects and holds against a process that daemonises or whose parent exits.
+  On Linux, macOS and the BSDs it relies on the parent chain: process groups
+  and sessions can be left by any process, so a process that detaches from
+  its run pass's tree (double fork, `setsid`) is no longer recognised as
+  confined. Such a process still cannot approve anything (§9); it can only
+  make the calls any unconfined process of the owner's user can make.
 
 ## 13. CLI (v1)
 
@@ -656,7 +752,20 @@ daemon-state vault entry, §7.7). On the first unlock the current config is
 recorded. If it changed, the daemon audits `config_change` with the list of
 changed keys (`key: old -> new`), enters Tripped (`config_changed`), and
 `keyleash status` / `keyleash unlock` show the changes until `keyleash
-resume` (step-up) accepts them.
+resume` (step-up) accepts them. With `pricing.override` set, the accepted
+config also covers the override file: its resolved path and the SHA-256 of
+the bytes the daemon read at start (shown as
+`pricing_override_file.path` / `.sha256`), so editing the override file
+trips `config_changed` like editing config.toml. The resume is approved with
+the accepted config's approval method (§9).
+
+```toml
+[limits.away]
+max_grant = "$50"            # largest unattended grant (`keyleash away`); strict $20, relaxed $200
+
+[run]
+kill_on_daemon_exit = true   # Windows: end a run pass's processes when the daemon exits
+```
 
 ## 15. Later phases (designed for, not in v0.1)
 
@@ -671,3 +780,8 @@ resume` (step-up) accepts them.
 - Tray UI and toasts; macOS (Keychain + Touch ID) and Linux (Secret Service)
   slots.
 - Daemon autostart helpers.
+- `keyleash run --isolate`: run the agent under a restricted token, in an
+  AppContainer, or as a separate local user, so it cannot read the owner's
+  files or other processes (today a run pass's agent runs as the owner).
+- An anti-rollback record outside the data directory (TPM NV counter) so
+  restoring a whole data-dir snapshot is detected (§3).

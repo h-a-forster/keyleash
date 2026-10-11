@@ -88,8 +88,9 @@ Then remove the key from any `.env` file, shell profile or tool config it
 lived in.
 
 The very first key goes straight into the vault. Every later key needs a
-step-up approval (Windows Hello, or your passphrase or recovery code), so a
-program running as you cannot slip in a key of its own. Each pass keeps the
+step-up approval (also after you removed every key: the exemption is used
+once per vault) (Windows Hello, or your passphrase or recovery code), so a program
+running as you cannot slip in a key of its own. Each pass keeps the
 key it was created with; new passes use the provider's **active** key (its
 oldest key, marked `*` in `keyleash keys`). To switch new passes to another
 key: `keyleash keys use <id>` (step-up).
@@ -154,9 +155,25 @@ pass gets $10 per session and per month), and concurrency up to
 `limits.pass.concurrency`. Anything beyond that asks for a step-up.
 
 Inside a `keyleash run` session, keyleash itself is off limits: the command
-and everything it starts may only read `keyleash status` and revoke its own
-pass. Creating passes, adding keys, approving, granting or changing anything
-is refused with `confined`, so an agent cannot raise its own budget.
+and everything it starts may only read `keyleash status`, lock, panic and
+revoke its own pass. Creating passes, adding keys, approving, granting or
+changing anything is refused with `confined`, so an agent cannot raise its
+own budget.
+
+What "everything it starts" means depends on the system. On Windows,
+keyleash puts the command into a job object that only the daemon holds and
+that its processes cannot leave: a process the agent starts stays confined
+(and can use the run pass) even if its parent exits or it detaches, and it
+stays confined after the run ends until it exits. When the daemon exits,
+the run's processes are ended too (`[run] kill_on_daemon_exit = true`; set
+it to `false` to let them keep running without keyleash). Restarting the
+daemon ends earlier `keyleash run` passes. On Linux and macOS keyleash can
+only follow the parent-process chain, which a process can leave by
+detaching (double fork, `setsid`); such a process is no longer recognised
+as part of the run. It still cannot approve anything.
+
+The agent still runs as you and can read your files; a `--isolate` mode
+that runs it under a restricted account is planned, not available.
 
 In bash and zsh write amounts as `5` or `'$5'`: `"$5"` is expanded by the
 shell.
@@ -214,6 +231,7 @@ Limits apply in every scope listed at once; the tightest one wins.
 | Parallel requests (global / per pass) | 8 / 4 | 4 / 2 | 16 / 8 |
 | Away: total budget / parallel requests | $3 / 2 | $1 / 1 | $20 / 4 |
 | New `run` passes while away | refused | refused | allowed |
+| Largest unattended grant (`keyleash away`) | $50 | $20 | $200 |
 | Idle before away | 10 min | 5 min | 30 min |
 | Screen lock | away | lock | away |
 | Away before locking | 2 h | 30 min | 8 h |
@@ -271,18 +289,26 @@ keyleash away --budget 20 --for 8h [--pass <id>]
 ```
 
 This needs a step-up approval, whose prompt shows exactly that amount,
-duration and pass; each `keyleash away` call gets its own approval. While
+duration and pass; each `keyleash away` call gets its own approval. A grant
+is at most `limits.away.max_grant` ($50; strict $20, relaxed $200). While
 the grant lasts, away mode uses the granted budget instead of the away
 limits and does not lock after `away_max`.
 
 **Tripwire.** If spend in the tripwire window crosses the threshold, the
 ledger or audit log fails an integrity check after unlock (including a
-deleted ledger), the config changed, or a security record could not be
-written to the audit log, keyleash is **tripped**: new requests get `423
-tripped` and in-flight ones finish. Check `keyleash status` and `keyleash
-audit verify`, then leave it with `keyleash resume` (step-up). Resuming after
-a failed audit check moves the rejected log to `audit/rejected-<time>/` and
-starts a new chain.
+deleted ledger), `passes.json` was edited, the config (or the pricing
+override file it names) changed, or a security record could not be written
+to the audit log, keyleash is **tripped**: new requests get `423 tripped`
+and in-flight ones finish. Check `keyleash status` and `keyleash audit
+verify`, then leave it with `keyleash resume` (step-up). Resuming after a
+failed audit check moves the rejected log to `audit/rejected-<time>/` and
+starts a new chain. Resuming after `passes.json` changed (`keyleash status`
+lists the added, removed and changed passes) revokes every added or changed
+pass. After a config change, an integrity failure or an edited
+`passes.json`, the resume is approved with the approval method of the
+config you last accepted, never with the one the changed file names: if
+that is `console` or `deny`, or Windows Hello is unavailable, `keyleash
+resume` asks for your passphrase or recovery code.
 
 **Step-up approvals prove you are there.** Every program running as you can
 reach keyleash's admin channel, including the agents it governs, so being
@@ -298,6 +324,12 @@ code and removing vault slots. The request waits up to `approval.timeout`
 
 - `approval.method = "hello"` (default with Windows Hello): a Hello prompt
   describes the request.
+
+Every prompt names the program and PID that asked, then what is at stake
+(amount, providers, limits, lifetime, binding); a request whose description
+would not fit the prompt is refused rather than shown cut off. A config
+change shows how many keys changed, naming approval, limit, model, pricing
+and presence keys first; `keyleash status` lists them all.
 - `"passphrase"` (set by `init` when Hello is unavailable): the command that
   needs the approval asks for your passphrase or recovery code at a hidden
   prompt; from another terminal, `keyleash approvals approve <id>` does the
@@ -308,8 +340,10 @@ code and removing vault slots. The request waits up to `approval.timeout`
 
 With every method except `deny`, `keyleash approvals approve <id>` approves
 with your passphrase or recovery code (`--stdin` reads it from standard
-input). Wrong secrets are recorded in the audit log and, after five, slowed
-down (30 s, doubling up to 15 min). `keyleash approvals deny <id>` needs
+input). Wrong secrets are recorded in the audit log and slowed down: after
+five from one program, that program waits 30 s, doubling up to 15 min; after
+ten from all programs together, every attempt waits 2 s, doubling up to
+1 min. Only one secret is checked at a time. `keyleash approvals deny <id>` needs
 nothing. Each approval belongs to the one request that asked: two commands
 never share an approval, and approving an over-limit request admits exactly
 that request without raising the limit. `approve <id> --grant 10 --for 1h`
@@ -318,7 +352,8 @@ grant for later requests; grants are capped at `approval.grant_max_multiple`
 (5) times the limit and `approval.grant_max_duration` (24 h), shown by
 `keyleash approvals --json`.
 
-**Panic.** `keyleash panic` locks immediately and revokes every pass. Rotate
+**Panic.** `keyleash panic` locks immediately and revokes every pass. Any
+program may lock or panic, including one inside `keyleash run`. Rotate
 the keys at the provider if you think one leaked; automatic upstream
 revocation is not implemented yet.
 
@@ -374,7 +409,9 @@ how old the pricing table is. Start there.
 | A tool still uses the real key | It reads a different variable or a config file. Remove the key from that file, and set the tool's base URL and key to the values from `keyleash env`. |
 | Requests go to a corporate proxy | `keyleash run`/`env` add loopback to `NO_PROXY`; tools that ignore `NO_PROXY` need their proxy setting changed. |
 | `proxy port … used by another program` | Free port 47114 or set `[proxy] port` and restart. |
-| `the vault file is older than the last recorded state` | A backup was restored or the file rolled back. If that was you: `keyleash unlock --accept-rollback`. |
+| `the vault file is older than the last recorded state` | A backup was restored or the file rolled back; the message shows the file's write number and the recorded one. If that was you: `keyleash unlock --accept-rollback` (passphrase, recovery code or Hello; it applies to that unlock only, is recorded in the audit log, and the regression is shown again). Review `keyleash keys` and vault slots afterwards. |
+| `pass_store` trip / `pass store change: …` | `passes.json` no longer matches what keyleash recorded in the vault (edited, replaced or rolled back). `keyleash resume` revokes the added and changed passes; create new ones. |
+| Restoring a backup of the whole data directory | Restoring vault, ledger, audit log and passes.json together to an earlier point cannot be told apart from a deliberate restore: spend recorded since the backup is forgotten and passes revoked since then come back. Keep backups where agents cannot write, and revoke passes after a restore (`keyleash panic`, then unlock). |
 | `presence detection is degraded` | Low-level input hooks could not be installed; idle time falls back to `GetLastInputInfo`, which also counts injected input. |
 | `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied. Set `approval.method = "passphrase"` in config. |
 | Forgot the passphrase | `keyleash unlock --recovery` with the recovery code. |

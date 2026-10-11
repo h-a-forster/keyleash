@@ -34,11 +34,15 @@ type PendingInfo struct {
 	Created  time.Time
 	Deadline time.Time
 	Waiters  int
+	// Method names the approver deciding this request ("hello",
+	// "passphrase", ...).
+	Method string
 }
 
 type pending struct {
 	id       string
 	req      Request
+	a        Approver
 	created  time.Time
 	deadline time.Time
 	waiters  int
@@ -78,6 +82,24 @@ func NewQueue(a Approver, timeout time.Duration, clk Clock) *Queue {
 	return &Queue{a: a, timeout: timeout, clk: clk, byID: map[string]*pending{}, byKey: map[string]*pending{}}
 }
 
+// SetApprover replaces the approver used for requests made after the call
+// (requests already pending keep theirs). A nil a denies everything.
+func (q *Queue) SetApprover(a Approver) {
+	if a == nil {
+		a = DenyApprover{}
+	}
+	q.mu.Lock()
+	q.a = a
+	q.mu.Unlock()
+}
+
+// Method names the queue's current approver.
+func (q *Queue) Method() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return methodOf(q.a)
+}
+
 // Request asks for approval and blocks until a decision, the timeout or ctx
 // cancellation.
 //
@@ -90,10 +112,22 @@ func NewQueue(a Approver, timeout time.Duration, clk Clock) *Queue {
 // Requests with the same non-empty CoalesceKey join the pending one and all
 // receive the same decision. Every non-nil error comes with Approved=false.
 func (q *Queue) Request(ctx context.Context, req Request) (Decision, error) {
+	return q.RequestWith(ctx, nil, req)
+}
+
+// RequestWith is Request with a specific approver for this one request (nil
+// means the queue's approver). Such a request never coalesces with others.
+func (q *Queue) RequestWith(ctx context.Context, a Approver, req Request) (Decision, error) {
 	if err := ctx.Err(); err != nil {
 		return Decision{Method: "cancelled"}, err
 	}
+	if a != nil {
+		req.CoalesceKey = ""
+	}
 	q.mu.Lock()
+	if a == nil {
+		a = q.a
+	}
 	if req.CoalesceKey != "" {
 		if p, ok := q.byKey[req.CoalesceKey]; ok {
 			p.waiters++
@@ -109,7 +143,7 @@ func (q *Queue) Request(ctx context.Context, req Request) (Decision, error) {
 	actx, cancel := context.WithCancel(context.Background())
 	now := q.clk.Now()
 	p := &pending{
-		id: id, req: req, created: now, deadline: now.Add(q.timeout),
+		id: id, req: req, a: a, created: now, deadline: now.Add(q.timeout),
 		waiters: 1, done: make(chan struct{}), cancel: cancel,
 	}
 	q.byID[id] = p
@@ -162,13 +196,13 @@ func (p *pending) result() (Decision, error) {
 }
 
 func (q *Queue) runApprover(ctx context.Context, p *pending) {
-	method := methodOf(q.a)
+	method := methodOf(p.a)
 	defer func() {
 		if r := recover(); r != nil {
 			q.resolve(p, Decision{Method: method}, fmt.Errorf("%w: panic", ErrApprover))
 		}
 	}()
-	ok, err := q.a.Approve(ctx, p.req)
+	ok, err := p.a.Approve(ctx, p.req)
 	if ctx.Err() != nil {
 		return // someone else already decided
 	}
@@ -208,7 +242,7 @@ func (q *Queue) Pending() []PendingInfo {
 	for _, p := range q.byID {
 		out = append(out, PendingInfo{
 			ID: p.id, Request: p.req, Prompt: PromptText(p.req),
-			Created: p.created, Deadline: p.deadline, Waiters: p.waiters,
+			Created: p.created, Deadline: p.deadline, Waiters: p.waiters, Method: methodOf(p.a),
 		})
 	}
 	q.mu.Unlock()
@@ -230,7 +264,7 @@ func (q *Queue) Get(id string) (PendingInfo, bool) {
 		return PendingInfo{}, false
 	}
 	return PendingInfo{ID: p.id, Request: p.req, Prompt: PromptText(p.req),
-		Created: p.created, Deadline: p.deadline, Waiters: p.waiters}, true
+		Created: p.created, Deadline: p.deadline, Waiters: p.waiters, Method: methodOf(p.a)}, true
 }
 
 // Decide answers pending request id from outside the approver (e.g. the

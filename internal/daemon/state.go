@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
+	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/presence"
 	"github.com/h-a-forster/keyleash/internal/secmem"
 	"github.com/h-a-forster/keyleash/internal/vault"
@@ -42,7 +44,20 @@ const (
 	TripAuditIntegrity = "audit_integrity"
 	// TripConfig: config.toml changed since the last accepted config.
 	TripConfig = "config_changed"
+	// TripPassStore: passes.json does not match the baseline in the vault
+	// (forged, edited or rolled back) or could not be checked.
+	TripPassStore = "pass_store"
 )
+
+// ownerTrip reports trip reasons whose resume must be approved with the
+// approval method of the last accepted config (spec §14).
+func ownerTrip(reason string) bool {
+	switch reason {
+	case TripIntegrity, TripAuditIntegrity, TripPassStore, TripConfig:
+		return true
+	}
+	return false
+}
 
 // stateData is everything guarded by Daemon.mu. Lock order: Daemon.mu
 // before Daemon.auditMu; unlockMu before both.
@@ -70,6 +85,16 @@ type stateData struct {
 	// auditBad is set when audit.Verify failed after unlock; resume
 	// archives the rejected log and starts a new chain.
 	auditBad bool
+	// passDiff is set while passes.json does not match the vault's
+	// baseline; resume revokes the added and changed passes and
+	// re-baselines. The store's MAC key is not set meanwhile.
+	passDiff *pass.Diff
+	// acceptedMethod is approval.method of the last accepted config.
+	acceptedMethod string
+	// rollbackFileSeq/RecordedSeq describe the last rollback detected or
+	// accepted at unlock; rollbackAccepted marks an accepted one.
+	rollbackFileSeq, rollbackRecordedSeq uint64
+	rollbackAccepted                     bool
 
 	keys *integrityKeys
 	// integrityOK is false after a failed ledger/state verification until
@@ -142,11 +167,23 @@ func statusErr(status int, code, format string, a ...any) error {
 
 // unlock verifies a slot and performs the Locked → Unlocked transition.
 // secret is not retained (the caller wipes it).
-func (d *Daemon) unlock(ctx context.Context, method string, secret []byte) error {
+//
+// With acceptRollback (an explicit owner request, `keyleash unlock
+// --accept-rollback`), a vault file older than the anti-rollback record is
+// accepted by this one unlock (not with DPAPI, which proves no presence);
+// the sequence regression is reported and audited.
+func (d *Daemon) unlock(ctx context.Context, method string, secret []byte, acceptRollback bool) error {
 	d.unlockMu.Lock()
 	defer d.unlockMu.Unlock()
 	if d.State() != StateLocked {
 		return statusErr(409, client.CodeConflict, "already unlocked")
+	}
+	if acceptRollback {
+		if method == client.MethodDPAPI {
+			return statusErr(400, client.CodeBadRequest, "a rollback can only be accepted with the passphrase, recovery code or Windows Hello")
+		}
+		d.vault.SetAcceptRollback(true)
+		defer d.vault.SetAcceptRollback(false)
 	}
 	var err error
 	switch method {
@@ -179,9 +216,17 @@ func (d *Daemon) unlock(ctx context.Context, method string, secret []byte) error
 		case errors.Is(err, vault.ErrWrongSecret), errors.Is(err, vault.ErrBadRecoveryCode):
 			return statusErr(401, client.CodeWrongSecret, "wrong secret")
 		case errors.Is(err, vault.ErrRollback):
+			var re *vault.RollbackError
 			d.mu.Lock()
 			d.st.rollback = true
+			d.st.rollbackAccepted = false
+			if errors.As(err, &re) {
+				d.st.rollbackFileSeq, d.st.rollbackRecordedSeq = re.FileSeq, re.RecordedSeq
+			}
 			d.mu.Unlock()
+			if re != nil {
+				return statusErr(409, client.CodeRollback, "%v: the vault file is at write %d but write %d was recorded; if you restored an older vault on purpose, run `keyleash unlock --accept-rollback`", vault.ErrRollback, re.FileSeq, re.RecordedSeq)
+			}
 			return statusErr(409, client.CodeRollback, "%v; if you restored an older vault on purpose, run `keyleash unlock --accept-rollback`", vault.ErrRollback)
 		case errors.Is(err, vault.ErrTampered):
 			return statusErr(409, client.CodeConflict, "vault integrity check failed")
@@ -192,6 +237,13 @@ func (d *Daemon) unlock(ctx context.Context, method string, secret []byte) error
 		}
 		d.log.Warn("unlock failed", "method", method, "err", err)
 		return statusErr(401, client.CodeWrongSecret, "unlock failed")
+	}
+	if acc := d.vault.AcceptedRollback(); acceptRollback && acc != nil {
+		d.mu.Lock()
+		d.st.rollbackFileSeq, d.st.rollbackRecordedSeq, d.st.rollbackAccepted = acc.FileSeq, acc.RecordedSeq, true
+		d.mu.Unlock()
+		d.log.Warn("accepted a rolled-back vault file", "file_seq", acc.FileSeq, "recorded_seq", acc.RecordedSeq)
+		d.auditEvent("accept_rollback", map[string]any{"method": method, "file_seq": acc.FileSeq, "recorded_seq": acc.RecordedSeq})
 	}
 	return d.afterUnlock(method)
 }
@@ -288,11 +340,59 @@ func (d *Daemon) afterUnlock(method string) error {
 		}
 	})
 
-	// The effective config against the last accepted one (spec §14).
+	// passes.json against the baseline in the vault (spec §6). The MAC key
+	// stays unset while they disagree, so nothing re-baselines the
+	// tampered content before the owner resumes.
+	d.passes.SetMACKey(nil)
+	var passDiff *pass.Diff
+	if vserr != nil {
+		passDiff = d.unverifiedPassDiff()
+	} else {
+		d.passes.SetMACKey(keys.passes.Bytes())
+		diff, perr := d.passes.VerifyAgainst(vs.PassStore)
+		switch {
+		case perr != nil:
+			d.passes.SetMACKey(nil)
+			passDiff = d.unverifiedPassDiff()
+		case !diff.OK:
+			d.passes.SetMACKey(nil)
+			passDiff = &diff
+		default:
+			// Record the baseline (and fold in revocations made while
+			// locked) with an authenticated write.
+			if err := d.passes.Commit(); err != nil {
+				d.log.Error("re-baselining passes.json failed", "err", err)
+			}
+		}
+	}
+
+	// The approval method of the last accepted config: resumes from
+	// owner trips are approved with it (spec §14).
+	accMethod := ""
+	if vserr == nil {
+		accMethod = vs.ApprovalMethod
+		if accMethod == "" && vs.ConfigTOML != "" {
+			accMethod = config.ApprovalMethodOf(vs.ConfigTOML)
+		}
+		if accMethod == "" && vs.ConfigHash == "" {
+			accMethod = d.cfg.Approval.Method // first acceptance below
+		}
+	}
+
+	// A vault from before keys_ever_added: derive it from the entries.
+	if vserr == nil && !vs.KeysEverAdded && d.vaultHasAPIKey() {
+		if err := d.updateVaultState(func(s *vaultState) { s.KeysEverAdded = true }); err != nil {
+			d.log.Error("recording keys_ever_added failed", "err", err)
+		}
+	}
+
+	// The effective config against the last accepted one (spec §14),
+	// including the pricing override file's path and content hash.
 	var changes []string
 	var pending *pendingConfig
-	curTOML, cerr := d.cfg.Encode()
-	curHash, herr := d.cfg.Hash()
+	curTOML, cerr := d.acceptedConfigText()
+	curHash := hashText(curTOML)
+	var herr error
 	if cerr != nil || herr != nil {
 		problems = append(problems, "cannot encode the effective config")
 	} else if vs.ConfigHash != "" && vs.ConfigHash != curHash {
@@ -317,6 +417,11 @@ func (d *Daemon) afterUnlock(method string) error {
 	}
 	d.st.auditBad = auditProblem != ""
 	d.st.configChanges, d.st.configPending = changes, pending
+	d.st.passDiff = passDiff
+	d.st.acceptedMethod = accMethod
+	if !d.st.rollbackAccepted {
+		d.st.rollbackFileSeq, d.st.rollbackRecordedSeq = 0, 0
+	}
 	for _, m := range st.ModelsSeen {
 		d.st.modelsSeen[m] = true
 	}
@@ -331,6 +436,8 @@ func (d *Daemon) afterUnlock(method string) error {
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripIntegrity, "ledger or state verification failed"
 	case d.st.auditBad:
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripAuditIntegrity, "audit log verification failed"
+	case passDiff != nil:
+		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripPassStore, "passes.json does not match the record in the vault"
 	case pending != nil:
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripConfig, "config.toml changed since it was last accepted"
 	case d.ledger.Tripped():
@@ -347,11 +454,28 @@ func (d *Daemon) afterUnlock(method string) error {
 	state := d.st.state
 	d.mu.Unlock()
 
+	// While a changed config is unaccepted, approvals use the accepted
+	// config's method, never the one the changed file names.
+	if pending != nil {
+		d.queue.SetApprover(d.approverFor(accMethod, false))
+	} else {
+		d.queue.SetApprover(d.configured)
+	}
+
 	d.auditEvent("unlock", map[string]any{
 		"ok": true, "method": method, "session": sid, "state": string(state),
 		"recovered_from_prev": d.vault.RecoveredFromPrev(), "integrity_ok": len(problems) == 0,
-		"audit_ok": auditProblem == "", "config_changed": pending != nil,
+		"audit_ok": auditProblem == "", "config_changed": pending != nil, "pass_store_ok": passDiff == nil,
 	})
+	if passDiff != nil {
+		ch := passStoreChanges(passDiff)
+		d.log.Error("passes.json does not match the vault; daemon tripped until `keyleash resume`", "changes", ch)
+		d.auditEvent("pass_store", map[string]any{"changes": ch, "mac_ok": passDiff.MACOK,
+			"counter": passDiff.Counter, "baseline": passDiff.Baseline})
+		if len(problems) == 0 && auditProblem == "" {
+			d.auditEvent("trip", map[string]any{"reason": TripPassStore})
+		}
+	}
 	if len(problems) > 0 {
 		if len(problems) > 8 {
 			problems = problems[:8]
@@ -366,14 +490,22 @@ func (d *Daemon) afterUnlock(method string) error {
 	if pending != nil {
 		d.log.Warn("config.toml changed since it was last accepted; daemon tripped until `keyleash resume`", "changes", changes)
 		d.auditEvent("config_change", map[string]any{"changes": changes, "accepted": false})
-		if len(problems) == 0 && auditProblem == "" {
+		if len(problems) == 0 && auditProblem == "" && passDiff == nil {
 			d.auditEvent("trip", map[string]any{"reason": TripConfig})
 		}
 	}
 	// First unlock (or a migrated vault): record the config as accepted.
 	if cerr == nil && herr == nil && vserr == nil && (vs.ConfigHash == "" || !vsExists) {
-		if err := d.updateVaultState(func(s *vaultState) { s.ConfigHash, s.ConfigTOML = curHash, curTOML }); err != nil {
+		m := d.cfg.Approval.Method
+		if err := d.updateVaultState(func(s *vaultState) {
+			s.ConfigHash, s.ConfigTOML, s.ApprovalMethod = curHash, curTOML, m
+		}); err != nil {
 			d.log.Error("recording the config in the vault failed", "err", err)
+		}
+	} else if cerr == nil && vserr == nil && vs.ApprovalMethod == "" && accMethod != "" {
+		// Migration: record the accepted config's method.
+		if err := d.updateVaultState(func(s *vaultState) { s.ApprovalMethod = accMethod }); err != nil {
+			d.log.Error("recording the approval method in the vault failed", "err", err)
 		}
 	}
 	d.anchor()
@@ -424,6 +556,7 @@ func (d *Daemon) lockHeld(reason string) {
 	d.st.grant = nil
 	d.st.passGrants = nil
 	d.st.configChanges, d.st.configPending, d.st.auditBad = nil, nil, false
+	d.st.passDiff = nil
 	d.applyLimitsLocked()
 	d.mu.Unlock()
 
@@ -440,6 +573,7 @@ func (d *Daemon) lockHeld(reason string) {
 
 	d.withAudit(func(l *audit.Log) { l.ClearAnchorKey() })
 	d.ledger.SetMACKey(nil)
+	d.passes.SetMACKey(nil)
 	d.vault.Lock()
 	d.mu.Lock()
 	d.st.keys.destroy()
@@ -482,17 +616,25 @@ func (d *Daemon) trip(reason, detail string) {
 // becomes the accepted config).
 func (d *Daemon) resume(ctx context.Context) error {
 	d.mu.RLock()
-	state, reason, detail := d.st.state, d.st.tripReason, d.st.tripDetail
+	state, reason := d.st.state, d.st.tripReason
 	changes := append([]string(nil), d.st.configChanges...)
+	passDiff, accMethod := d.st.passDiff, d.st.acceptedMethod
+	owner := ownerTrip(reason) || passDiff != nil || d.st.configPending != nil || !d.st.integrityOK || d.st.auditBad
 	d.mu.RUnlock()
 	if state != StateTripped {
 		return statusErr(409, client.CodeConflict, "not tripped")
 	}
-	det := "Tripped: " + reason + " (" + detail + ")"
-	if len(changes) > 0 {
-		det += "; accept config changes: " + strings.Join(changes, "; ")
+	det, note := resumeSummary(reason, changes, passDiff)
+	req := approval.Request{Kind: "resume", Title: "Resume keyleash", Detail: det, Note: note}
+	var dec approval.Decision
+	var err error
+	if owner {
+		// Approved with the accepted config's method (never the console,
+		// and never a method a changed config.toml names).
+		dec, err = d.stepUpWith(ctx, d.approverFor(accMethod, true), req)
+	} else {
+		dec, err = d.stepUp(ctx, req)
 	}
-	dec, err := d.stepUp(ctx, approval.Request{Kind: "resume", Title: "Resume keyleash", Detail: det})
 	if err != nil {
 		return err
 	}
@@ -512,11 +654,23 @@ func (d *Daemon) resume(ctx context.Context) error {
 			return statusErr(503, client.CodeInternal, "the rejected audit log could not be archived; check the data directory and retry")
 		}
 	}
+	var passRevoked []string
+	if passDiff != nil {
+		var perr error
+		if passRevoked, perr = d.rebaselinePasses(passDiff); perr != nil {
+			d.log.Error("re-baselining passes.json failed", "err", perr)
+			return statusErr(503, client.CodeInternal, "passes.json could not be re-baselined; check the data directory and retry")
+		}
+	}
 	if pending != nil {
-		if err := d.updateVaultState(func(s *vaultState) { s.ConfigHash, s.ConfigTOML = pending.hash, pending.toml }); err != nil {
+		m := d.cfg.Approval.Method
+		if err := d.updateVaultState(func(s *vaultState) {
+			s.ConfigHash, s.ConfigTOML, s.ApprovalMethod = pending.hash, pending.toml, m
+		}); err != nil {
 			d.log.Error("recording the accepted config failed", "err", err)
 			return statusErr(503, client.CodeInternal, "the accepted config could not be recorded in the vault")
 		}
+		d.queue.SetApprover(d.configured)
 	}
 	d.ledger.ResetTrip()
 	now := d.clk.Now()
@@ -532,6 +686,10 @@ func (d *Daemon) resume(ctx context.Context) error {
 	}
 	d.st.auditBad = false
 	d.st.configChanges, d.st.configPending = nil, nil
+	d.st.passDiff = nil
+	if pending != nil {
+		d.st.acceptedMethod = d.cfg.Approval.Method
+	}
 	d.st.state, d.st.tripReason, d.st.tripDetail = StateUnlocked, "", ""
 	if d.st.idle || d.st.screenLocked {
 		d.enterAwayLocked(now, "idle")
@@ -544,6 +702,10 @@ func (d *Daemon) resume(ctx context.Context) error {
 	if pending != nil {
 		f["config_accepted"] = changes
 		d.auditEvent("config_change", map[string]any{"changes": changes, "accepted": true})
+	}
+	if passDiff != nil {
+		f["pass_store_accepted"] = passStoreChanges(passDiff)
+		f["passes_revoked"] = passRevoked
 	}
 	d.auditEvent("resume", f)
 	d.saveState()
@@ -601,13 +763,30 @@ func (d *Daemon) archiveAudit() (string, error) {
 // whose request triggered the prompt proceeds. The verified caller PID is
 // attached so the CLI can recognise its own request.
 func (d *Daemon) stepUp(ctx context.Context, req approval.Request) (approval.Decision, error) {
+	return d.stepUpWith(ctx, nil, req)
+}
+
+// stepUpWith is stepUp with a specific approver (nil: the queue's). The
+// prompt names the requesting process; a request whose risk text would not
+// fit the prompt is refused rather than truncated (spec §9).
+func (d *Daemon) stepUpWith(ctx context.Context, a approval.Approver, req approval.Request) (approval.Decision, error) {
 	req.CoalesceKey = ""
 	req.Requester = callerFrom(ctx).pid
-	dec, err := d.queue.Request(ctx, req)
+	req.RequesterName = "unknown process"
+	if req.Requester > 0 {
+		req.RequesterName = "pid " + strconv.Itoa(req.Requester)
+		if p, err := d.lookupProcess(req.Requester); err == nil && p.Image != "" {
+			req.RequesterName = filepath.Base(p.Image)
+		}
+	}
+	if err := approval.Fits(req); err != nil {
+		return approval.Decision{}, statusErr(400, client.CodeBadRequest, "the approval prompt would be too long to show in full; request less at once")
+	}
+	dec, err := d.queue.RequestWith(ctx, a, req)
 	d.auditEvent("approval", map[string]any{
 		"kind": req.Kind, "approved": dec.Approved && err == nil, "method": dec.Method,
 		"pass": req.PassID, "model": req.Model, "amount_micros": int64(req.Amount),
-		"requester_pid": req.Requester, "detail": req.Detail,
+		"requester_pid": req.Requester, "requester": req.RequesterName, "detail": req.Detail,
 	})
 	switch {
 	case errors.Is(err, approval.ErrTimeout):
@@ -835,26 +1014,37 @@ func sanitizeAudit(v any) any {
 // serving (Tripped) until the log can be reopened. Never call trip
 // synchronously from here: callers may hold d.mu.
 func (d *Daemon) auditEvent(typ string, fields map[string]any) {
+	_ = d.auditEventErr(typ, fields)
+}
+
+// auditEventErr is auditEvent that also reports whether the record was
+// written, for operations that must not take effect unaudited.
+func (d *Daemon) auditEventErr(typ string, fields map[string]any) error {
 	if fields != nil {
 		fields = sanitizeAudit(fields).(map[string]any)
 	}
 	d.auditMu.Lock()
+	broken := d.auditBroken
 	err := d.audit.Append(typ, fields)
 	d.auditMu.Unlock()
+	if err == nil && broken {
+		err = errors.New("audit log marked broken")
+	}
 	if err == nil {
-		return
+		return nil
 	}
 	if errors.Is(err, audit.ErrClosed) {
-		return // shutting down
+		return err // shutting down
 	}
 	if errors.Is(err, audit.ErrSecret) || errors.Is(err, audit.ErrTooLarge) {
 		d.log.Error("audit record rejected", "type", typ, "err", err)
 		if securityAuditTypes[typ] {
 			go d.trip(TripAudit, "a security audit record ("+typ+") was rejected")
 		}
-		return
+		return err
 	}
 	d.markAuditBroken(err)
+	return err
 }
 
 func (d *Daemon) markAuditBroken(err error) {
@@ -977,4 +1167,5 @@ func (k *integrityKeys) destroy() {
 	k.anchor.Destroy()
 	k.ledger.Destroy()
 	k.state.Destroy()
+	k.passes.Destroy()
 }

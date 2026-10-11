@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/budget"
+	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/secmem"
 	"github.com/h-a-forster/keyleash/internal/vault"
 )
@@ -40,6 +41,16 @@ type vaultState struct {
 	// ActiveKeys maps a provider to its active api_key entry (changed only
 	// by the step-up protected `keys use`).
 	ActiveKeys map[string]string `json:"active_keys,omitempty"`
+	// ApprovalMethod is approval.method of the accepted config. Resuming
+	// after a config change or an integrity failure is approved with it
+	// (never with a method the changed config names, spec §14).
+	ApprovalMethod string `json:"approval_method,omitempty"`
+	// PassStore is the baseline of passes.json: the counter of its last
+	// authenticated write and a digest per pass (spec §6).
+	PassStore *pass.Baseline `json:"pass_store,omitempty"`
+	// KeysEverAdded is set once the vault has held an api_key: only before
+	// that may a key be added without a step-up (spec §9).
+	KeysEverAdded bool `json:"keys_ever_added,omitempty"`
 }
 
 func (s *vaultState) clone() *vaultState {
@@ -47,6 +58,13 @@ func (s *vaultState) clone() *vaultState {
 	if s.Checkpoint != nil {
 		cp := *s.Checkpoint
 		c.Checkpoint = &cp
+	}
+	if s.PassStore != nil {
+		ps := pass.Baseline{Counter: s.PassStore.Counter, Digests: make(map[string]string, len(s.PassStore.Digests))}
+		for k, v := range s.PassStore.Digests {
+			ps.Digests[k] = v
+		}
+		c.PassStore = &ps
 	}
 	c.ActiveKeys = make(map[string]string, len(s.ActiveKeys))
 	for k, v := range s.ActiveKeys {
@@ -138,6 +156,27 @@ func (d *Daemon) updateVaultState(fn func(*vaultState)) error {
 	}
 	d.vs = next
 	return nil
+}
+
+// vaultStateSnapshot returns a copy of the cached state (nil before the
+// first unlock).
+func (d *Daemon) vaultStateSnapshot() *vaultState {
+	d.vsMu.Lock()
+	defer d.vsMu.Unlock()
+	if d.vs == nil {
+		return nil
+	}
+	return d.vs.clone()
+}
+
+// onPassCommit records the pass store's new baseline in the vault after an
+// authenticated write of passes.json (called with the store's lock held).
+func (d *Daemon) onPassCommit(b pass.Baseline) {
+	if err := d.updateVaultState(func(s *vaultState) { s.PassStore = &b }); err != nil {
+		// The file is one write ahead of the vault; the next unlock accepts
+		// exactly that (pass.Diff), anything else trips.
+		d.log.Error("recording the pass store baseline in the vault failed", "err", err)
+	}
 }
 
 // activeKey returns the provider's active entry from the cached state.

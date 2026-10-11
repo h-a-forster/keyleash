@@ -175,14 +175,19 @@ func DefaultPricing() *Pricing {
 // embedded entries of the same provider and model id; a model mapped to null
 // removes it. Fees present in the override replace embedded fees.
 func LoadPricing(overridePath string) (*Pricing, error) {
-	base, err := parsePricing(embeddedPricing, true)
-	if err != nil {
-		return nil, fmt.Errorf("meter: embedded pricing: %w", err)
-	}
 	if overridePath == "" {
-		return base, nil
+		return LoadPricingData(nil, "")
 	}
-	f, err := os.Open(overridePath)
+	data, err := ReadPricingOverride(overridePath)
+	if err != nil {
+		return nil, err
+	}
+	return LoadPricingData(data, overridePath)
+}
+
+// ReadPricingOverride reads an override file (bounded in size).
+func ReadPricingOverride(path string) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("meter: open pricing override: %w", err)
 	}
@@ -194,12 +199,27 @@ func LoadPricing(overridePath string) (*Pricing, error) {
 	if len(data) > maxPricingFileSize {
 		return nil, fmt.Errorf("meter: pricing override larger than %d bytes", maxPricingFileSize)
 	}
+	return data, nil
+}
+
+// LoadPricingData is LoadPricing with the override file's content already
+// read (nil for none); name labels errors. The daemon reads the file once,
+// so the bytes it prices with are the bytes it hashes into the accepted
+// config (spec §14).
+func LoadPricingData(data []byte, name string) (*Pricing, error) {
+	base, err := parsePricing(embeddedPricing, true)
+	if err != nil {
+		return nil, fmt.Errorf("meter: embedded pricing: %w", err)
+	}
+	if data == nil {
+		return base, nil
+	}
 	over, err := decodePricingFile(data)
 	if err != nil {
-		return nil, fmt.Errorf("meter: pricing override %s: %w", overridePath, err)
+		return nil, fmt.Errorf("meter: pricing override %s: %w", name, err)
 	}
 	if err := base.merge(over); err != nil {
-		return nil, fmt.Errorf("meter: pricing override %s: %w", overridePath, err)
+		return nil, fmt.Errorf("meter: pricing override %s: %w", name, err)
 	}
 	return base, nil
 }

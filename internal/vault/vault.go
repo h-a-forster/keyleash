@@ -16,6 +16,7 @@ package vault
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,9 +151,24 @@ type Vault struct {
 	dek      *secmem.Buffer // nil while locked
 	fromPrev bool           // f was loaded from the .prev copy
 
-	acceptRollback bool   // AcceptRollback armed for the next strong unlock
-	seqFloor       uint64 // the next commit's seq must exceed this
+	acceptRollback bool           // AcceptRollback armed for the next strong unlock
+	accepted       *RollbackError // the rollback the last unlock accepted, if any
+	seqFloor       uint64         // the next commit's seq must exceed this
 }
+
+// RollbackError is the ErrRollback an unlock returns: the vault file's seq
+// is below the seq the anti-rollback sidecar recorded. errors.Is(err,
+// ErrRollback) matches it.
+type RollbackError struct {
+	FileSeq, RecordedSeq uint64
+}
+
+func (e *RollbackError) Error() string {
+	return fmt.Sprintf("%v (file seq %d, recorded seq %d)", ErrRollback, e.FileSeq, e.RecordedSeq)
+}
+
+// Is makes errors.Is(err, ErrRollback) true.
+func (e *RollbackError) Is(target error) bool { return target == ErrRollback }
 
 func nowString() string { return time.Now().UTC().Truncate(time.Second).Format(time.RFC3339) }
 
@@ -451,10 +467,11 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 		v.mu.Unlock()
 		old.Destroy()
 		dek.Destroy()
-		return fmt.Errorf("%w (file seq %d, recorded seq %d)", ErrRollback, f.Seq, sc.seq)
+		return &RollbackError{FileSeq: f.Seq, RecordedSeq: sc.seq}
 	}
 	v.dek = dek
 	if sc.rollback {
+		v.accepted = &RollbackError{FileSeq: f.Seq, RecordedSeq: sc.seq}
 		// Owner override: make the accepted state the newest one. This also
 		// rewrites the main file and the sidecar.
 		v.seqFloor = max(v.seqFloor, sc.seq)
@@ -482,10 +499,107 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 // unlock whether or not a rollback is present. Callers must only arm it on
 // an explicit user request; afterwards the user should review Slots, since a
 // rolled-back file can contain slots that had been removed.
-func (v *Vault) AcceptRollback() {
+func (v *Vault) AcceptRollback() { v.SetAcceptRollback(true) }
+
+// SetAcceptRollback arms (on) or disarms the one-shot rollback override, so
+// a caller can scope it to exactly one unlock attempt.
+func (v *Vault) SetAcceptRollback(on bool) {
 	v.mu.Lock()
-	v.acceptRollback = true
+	v.acceptRollback = on
+	if on {
+		v.accepted = nil
+	}
 	v.mu.Unlock()
+}
+
+// AcceptedRollback reports the rollback the most recent successful unlock
+// accepted under the override (nil when it accepted none).
+func (v *Vault) AcceptedRollback() *RollbackError {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.accepted == nil {
+		return nil
+	}
+	r := *v.accepted
+	return &r
+}
+
+// VerifyPassphrase checks p against the passphrase slots of the unlocked
+// vault without changing its state: it derives the slot key (the slow KDF
+// runs without holding any lock that Lock needs) and then confirms that the
+// slot yields the DEK currently loaded. It returns ErrLocked when the vault
+// is (or became) locked, ErrWrongSecret for a wrong passphrase and
+// ErrChanged when the vault was re-keyed meanwhile.
+func (v *Vault) VerifyPassphrase(p []byte) error {
+	if len(p) == 0 {
+		return ErrWrongSecret
+	}
+	return v.verify(SlotPassphrase, func(s *slotV1) (*secmem.Buffer, error) {
+		return passphraseKEK(p, s)
+	})
+}
+
+// VerifyRecovery is VerifyPassphrase for the recovery code. A malformed
+// code returns ErrBadRecoveryCode without any KDF work.
+func (v *Vault) VerifyRecovery(code string) error {
+	secret, err := parseRecoveryCode(code)
+	if err != nil {
+		return err
+	}
+	defer secret.Destroy()
+	return v.verify(SlotRecovery, func(s *slotV1) (*secmem.Buffer, error) {
+		return passphraseKEK(secret.Bytes(), s)
+	})
+}
+
+func (v *Vault) verify(slotType string, kek func(s *slotV1) (*secmem.Buffer, error)) error {
+	v.mu.RLock()
+	f, unlocked := v.f, v.dek != nil
+	v.mu.RUnlock()
+	if !unlocked {
+		return ErrLocked
+	}
+	var found *secmem.Buffer
+	for i := range f.Slots {
+		s := &f.Slots[i]
+		if s.Type != slotType {
+			continue
+		}
+		k, err := kek(s)
+		if err != nil {
+			return err
+		}
+		if k.Len() != 32 {
+			k.Destroy()
+			continue
+		}
+		d, err := openToBuffer(k.Bytes(), s.Nonce, s.Wrapped, slotAAD(f.VaultID, s.ID, s.Type))
+		k.Destroy()
+		if err != nil {
+			if errors.Is(err, errAuth) {
+				continue
+			}
+			return err
+		}
+		found = d
+		break
+	}
+	if found == nil {
+		return ErrWrongSecret
+	}
+	defer found.Destroy()
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.dek == nil {
+		return ErrLocked
+	}
+	if subtle.ConstantTimeCompare(found.Bytes(), v.dek.Bytes()) != 1 {
+		if v.f != f {
+			return ErrChanged
+		}
+		return ErrWrongSecret
+	}
+	return nil
 }
 
 // UnlockPassphrase unlocks with a passphrase slot. p is not retained.

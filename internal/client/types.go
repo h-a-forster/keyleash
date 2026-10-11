@@ -87,6 +87,10 @@ type Status struct {
 	// config ("key: old -> new"); non-empty while Tripped with reason
 	// "config_changed" until `keyleash resume` accepts them.
 	ConfigChanges []string `json:"config_changes,omitempty"`
+	// PassStoreChanges describes how passes.json differs from the state
+	// recorded in the vault ("added: id", "removed: id", "changed: id");
+	// non-empty while Tripped with reason "pass_store".
+	PassStoreChanges []string `json:"pass_store_changes,omitempty"`
 }
 
 // VaultInfo is vault metadata for status. It never contains secrets.
@@ -97,7 +101,13 @@ type VaultInfo struct {
 	RecoveredFromPrev bool   `json:"recovered_from_prev,omitempty"`
 	PrevNotScrubbed   bool   `json:"prev_not_scrubbed,omitempty"`
 	RollbackDetected  bool   `json:"rollback_detected,omitempty"`
-	Slots             []Slot `json:"slots"`
+	// RollbackFileSeq and RollbackRecordedSeq describe the detected (or,
+	// after `unlock --accept-rollback`, the accepted) rollback: the vault
+	// file's seq and the newer seq the anti-rollback record holds.
+	RollbackFileSeq     uint64 `json:"rollback_file_seq,omitempty"`
+	RollbackRecordedSeq uint64 `json:"rollback_recorded_seq,omitempty"`
+	RollbackAccepted    bool   `json:"rollback_accepted,omitempty"`
+	Slots               []Slot `json:"slots"`
 }
 
 // Slot is public key-slot metadata.
@@ -135,6 +145,11 @@ type InFlight struct {
 type UnlockRequest struct {
 	Method string `json:"method"`
 	Secret []byte `json:"secret,omitempty"`
+	// AcceptRollback accepts a vault file older than the last recorded
+	// state for this one unlock (after restoring a backup on purpose). It
+	// needs a passphrase, recovery code or Windows Hello unlock (not DPAPI)
+	// and is audited with the seq regression.
+	AcceptRollback bool `json:"accept_rollback,omitempty"`
 }
 
 // PanicRequest is the body of POST /v1/panic.
@@ -276,6 +291,10 @@ type Approval struct {
 	Created  time.Time    `json:"created"`
 	Deadline time.Time    `json:"deadline"`
 	Waiters  int          `json:"waiters"`
+	// Method is the approval method deciding this request ("hello",
+	// "passphrase", "console", "deny"). A resume after a config change uses
+	// the previously accepted method, which may differ from the config's.
+	Method string `json:"method,omitempty"`
 	// Requester is the verified PID of the admin caller that triggered the
 	// request (0: a proxied request or unknown); RequesterImage its image.
 	Requester      int    `json:"requester_pid,omitempty"`

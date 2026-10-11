@@ -93,6 +93,8 @@ type AwayLimits struct {
 	Concurrency int     `toml:"concurrency"`
 	// AllowNewRunPasses permits `keyleash run` while away.
 	AllowNewRunPasses bool `toml:"allow_new_run_passes"`
+	// MaxGrant caps the budget of one unattended grant (`keyleash away`).
+	MaxGrant *Amount `toml:"max_grant"`
 }
 
 // PassDefaults apply to passes created without explicit settings.
@@ -178,6 +180,13 @@ type Config struct {
 	Audit struct {
 		AnchorEvery Duration `toml:"anchor_every"`
 	} `toml:"audit"`
+
+	Run struct {
+		// KillOnDaemonExit ends every process of a `keyleash run` session
+		// when the daemon exits (Windows job objects), so a daemon restart
+		// cannot leave confined agents running unconfined.
+		KillOnDaemonExit bool `toml:"kill_on_daemon_exit"`
+	} `toml:"run"`
 }
 
 // Profiles are named starting points; a config file overrides on top.
@@ -202,7 +211,7 @@ func Default(profile string) (*Config, error) {
 	}
 	c.Limits.Provider = map[string]Limits{}
 	c.Limits.Model = map[string]Limits{}
-	c.Limits.Away = AwayLimits{Total: amt("$3"), Concurrency: 2}
+	c.Limits.Away = AwayLimits{Total: amt("$3"), Concurrency: 2, MaxGrant: amt("$50")}
 	c.Limits.Pass = PassDefaults{
 		TTL: Duration{24 * time.Hour}, RunTTL: Duration{12 * time.Hour}, Concurrency: 4,
 		MaxRunBudget: amt("$10"),
@@ -221,6 +230,7 @@ func Default(profile string) (*Config, error) {
 	c.Approval.GrantMaxDuration = Duration{24 * time.Hour}
 
 	c.Audit.AnchorEvery = Duration{10 * time.Minute}
+	c.Run.KillOnDaemonExit = true
 
 	switch profile {
 	case "", "recommended":
@@ -234,7 +244,7 @@ func Default(profile string) (*Config, error) {
 			Request: amt("$1"), Session: amt("$5"), Day: amt("$10"), Month: amt("$100"),
 			Concurrency: 4,
 		}
-		c.Limits.Away = AwayLimits{Total: amt("$1"), Concurrency: 1}
+		c.Limits.Away = AwayLimits{Total: amt("$1"), Concurrency: 1, MaxGrant: amt("$20")}
 		c.Limits.Pass.TTL = Duration{8 * time.Hour}
 		c.Limits.Pass.Concurrency = 2
 		c.Limits.OnExceed = "approve"
@@ -248,7 +258,7 @@ func Default(profile string) (*Config, error) {
 			Request: amt("$10"), Session: amt("$50"), Day: amt("$100"), Month: amt("$1000"),
 			Concurrency: 16,
 		}
-		c.Limits.Away = AwayLimits{Total: amt("$20"), Concurrency: 4, AllowNewRunPasses: true}
+		c.Limits.Away = AwayLimits{Total: amt("$20"), Concurrency: 4, AllowNewRunPasses: true, MaxGrant: amt("$200")}
 		c.Limits.Pass.TTL = Duration{7 * 24 * time.Hour}
 		c.Limits.Pass.Concurrency = 8
 		c.Tripwire.Threshold = amt("$25")
@@ -352,6 +362,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.Away.Concurrency < 0 {
 		bad("limits.away.concurrency cannot be negative")
+	}
+	if c.Limits.Away.MaxGrant == nil || c.Limits.Away.MaxGrant.Micros <= 0 {
+		bad("limits.away.max_grant must be positive")
 	}
 	if c.Limits.Pass.TTL.Duration <= 0 || c.Limits.Pass.RunTTL.Duration <= 0 {
 		bad("limits.pass.ttl and run_ttl must be positive")

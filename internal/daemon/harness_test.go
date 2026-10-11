@@ -261,7 +261,15 @@ type env struct {
 	// process does not confine the test's own admin calls); 0 = unknown.
 	adminPID atomic.Int64
 	approver approval.Approver // overrides appr when set
-	adminLn  net.Listener      // overrides the in-memory admin listener
+	// noApprover starts the daemon without Options.Approver, so the
+	// configured approval methods are used (console reads consoleIn).
+	noApprover bool
+	consoleIn  io.Reader
+	consoleOut io.Writer
+	// jobs stands in for the Windows job objects (the in-process daemon
+	// binds run passes to the test process itself).
+	jobs    *fakeJobs
+	adminLn net.Listener // overrides the in-memory admin listener
 
 	d     *Daemon
 	c     *client.Client
@@ -282,7 +290,7 @@ func testConfig(t *testing.T) *config.Config {
 
 func newEnv(t *testing.T, mutate func(*config.Config)) *env {
 	t.Helper()
-	e := &env{t: t, dir: t.TempDir(), clk: newFakeClock(), pres: &fakePresence{}, appr: &switchApprover{}}
+	e := &env{t: t, dir: t.TempDir(), clk: newFakeClock(), pres: &fakePresence{}, appr: &switchApprover{}, jobs: newFakeJobs()}
 	e.peerPID.Store(int64(os.Getpid()))
 	e.adminPID.Store(int64(os.Getppid()))
 	e.cfg = testConfig(t)
@@ -329,12 +337,22 @@ func (e *env) start() {
 	if e.approver != nil {
 		appr = e.approver
 	}
+	if e.noApprover {
+		appr = nil
+	}
+	var jobs JobManager
+	if e.jobs != nil {
+		jobs = e.jobs
+	}
 	opts := Options{
 		DataDir:        e.dir,
 		Config:         e.cfg,
 		Clock:          e.clk,
 		PresenceSource: e.pres,
 		Approver:       appr,
+		Jobs:           jobs,
+		ConsoleIn:      e.consoleIn,
+		ConsoleOut:     e.consoleOut,
 		HelloAvailable: func() (bool, string) { return false, "test" },
 		Upstream:       func(*provider.Provider) *url.URL { u := *upURL; return &u },
 		Transport:      e.up.srv.Client().Transport,
@@ -642,4 +660,100 @@ func ownerSecret() []byte { return append([]byte(nil), testPassphrase...) }
 func (e *env) setAdminPID(pid int) {
 	e.c.Close()
 	e.adminPID.Store(int64(pid))
+}
+
+// fakeJobs is a JobManager for the in-process tests: a job's members are
+// its bound process plus pids added with add (processes that outlive their
+// pass); a released job is dropped once none of the added pids is alive.
+type fakeJobs struct {
+	mu       sync.Mutex
+	members  map[string]map[int]bool
+	extra    map[string]map[int]bool
+	dead     map[int]bool
+	fail     error
+	confined []string
+	closed   bool
+}
+
+func newFakeJobs() *fakeJobs {
+	return &fakeJobs{members: map[string]map[int]bool{}, extra: map[string]map[int]bool{}, dead: map[int]bool{}}
+}
+
+func (j *fakeJobs) Confine(id string, pid int, _ int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.fail != nil {
+		return j.fail
+	}
+	j.members[id] = map[int]bool{pid: true}
+	j.extra[id] = map[int]bool{}
+	j.confined = append(j.confined, id)
+	return nil
+}
+
+// add makes pid a member of job id (a descendant the job caught).
+func (j *fakeJobs) add(id string, pid int) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.members[id][pid] = true
+	j.extra[id][pid] = true
+}
+
+func (j *fakeJobs) kill(pid int) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.dead[pid] = true
+}
+
+func (j *fakeJobs) Member(id string, pid int) (bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	m, ok := j.members[id]
+	if !ok {
+		return false, errors.New("no job")
+	}
+	return m[pid] && !j.dead[pid], nil
+}
+
+func (j *fakeJobs) MemberOfAny(pid int) (bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, m := range j.members {
+		if m[pid] && !j.dead[pid] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (j *fakeJobs) Sweep(active func(string) bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for id := range j.members {
+		if active(id) {
+			continue
+		}
+		alive := false
+		for pid := range j.extra[id] {
+			alive = alive || !j.dead[pid]
+		}
+		if !alive {
+			delete(j.members, id)
+			delete(j.extra, id)
+		}
+	}
+}
+
+func (j *fakeJobs) Close() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.closed = true
+	j.members = map[string]map[int]bool{}
+	j.extra = map[string]map[int]bool{}
+}
+
+func (j *fakeJobs) held() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return len(j.members)
 }

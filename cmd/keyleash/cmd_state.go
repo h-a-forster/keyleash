@@ -107,6 +107,12 @@ func printStatus(w io.Writer, st client.Status, passes []client.PassInfo, passes
 			fmt.Fprintf(w, "              %s\n", ch)
 		}
 	}
+	if len(st.PassStoreChanges) > 0 {
+		fmt.Fprintln(w, "pass store: differs from the vault record (`keyleash resume` revokes added/changed passes):")
+		for _, ch := range st.PassStoreChanges {
+			fmt.Fprintf(w, "              %s\n", ch)
+		}
+	}
 	if passesOK {
 		fmt.Fprintf(w, "passes:     %d active\n", len(passes))
 	}
@@ -229,14 +235,8 @@ func runUnlock(ctx context.Context, a *app, args []string) error {
 	if m == "auto" {
 		m = chooseUnlockMethod(st.Vault.Slots, *fromStdin)
 	}
-	if *acceptRollback {
-		actx, cancel := withTimeout(ctx)
-		err := c.AcceptRollback(actx)
-		cancel()
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(a.stderr, "Rollback override armed for this unlock.")
+	if *acceptRollback && m == client.MethodDPAPI {
+		return usagef("unlock", "--accept-rollback needs the passphrase, recovery code or Windows Hello")
 	}
 	var secret []byte
 	defer func() { secmem.Wipe(secret) }()
@@ -254,11 +254,17 @@ func runUnlock(ctx context.Context, a *app, args []string) error {
 	}
 	// No timeout: Argon2 and Windows Hello prompts take their time; Ctrl-C
 	// cancels.
-	st, err = c.Unlock(ctx, m, secret)
+	st, err = c.UnlockWith(ctx, client.UnlockRequest{Method: m, AcceptRollback: *acceptRollback}, secret)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(a.stdout, "Unlocked (lease until %s).\n", fmtTime(st.LeaseUntil, time.Now()))
+	if st.Vault.RollbackAccepted {
+		fmt.Fprintf(a.stderr, "Accepted a rolled-back vault file: it was at write %d, but write %d had been recorded. Review `keyleash status` and `keyleash keys`.\n",
+			st.Vault.RollbackFileSeq, st.Vault.RollbackRecordedSeq)
+	} else if *acceptRollback {
+		fmt.Fprintln(a.stderr, "No rollback was present; nothing was accepted.")
+	}
 	if st.State == client.StateAway {
 		fmt.Fprintln(a.stderr, "note: no recent keyboard or mouse input, so keyleash is in away mode (away limits apply until you are active).")
 	}
@@ -267,6 +273,9 @@ func runUnlock(ctx context.Context, a *app, args []string) error {
 	}
 	for _, ch := range st.ConfigChanges {
 		fmt.Fprintf(a.stderr, "config change: %s\n", ch)
+	}
+	for _, ch := range st.PassStoreChanges {
+		fmt.Fprintf(a.stderr, "pass store change: %s\n", ch)
 	}
 	if st.State == client.StateTripped {
 		fmt.Fprintf(a.stderr, "warning: keyleash is tripped (%s); check `keyleash status`, then run: keyleash resume\n", st.TripReason)

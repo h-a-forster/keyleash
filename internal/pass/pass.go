@@ -149,8 +149,11 @@ func (p Pass) clone() Pass {
 }
 
 const (
-	maxNameLen  = 128
-	maxGlobs    = 64
+	maxNameLen = 128
+	// MaxListLen caps the providers and each model pattern list of a pass,
+	// so a pass always fits an approval prompt and an audit record.
+	MaxListLen  = 32
+	maxGlobs    = MaxListLen
 	maxGlobLen  = 256
 	maxLimits   = 32
 	maxImageLen = 4096
@@ -187,21 +190,36 @@ func validate(p *Pass, now time.Time) error {
 	if len(p.Providers) == 0 {
 		return errors.New("pass: at least one provider (or \"*\") is required")
 	}
+	if len(p.Providers) > MaxListLen {
+		return errors.New("pass: too many providers")
+	}
+	seen := map[string]bool{}
 	for i, q := range p.Providers {
-		if q == AllProviders {
-			continue
+		if q != AllProviders {
+			q = strings.ToLower(q)
+			if _, ok := provider.Get(q); !ok {
+				return fmt.Errorf("pass: unknown provider %q", q)
+			}
 		}
-		q = strings.ToLower(q)
-		if _, ok := provider.Get(q); !ok {
-			return fmt.Errorf("pass: unknown provider %q", q)
+		if seen[q] {
+			return fmt.Errorf("pass: duplicate provider %q", q)
 		}
+		seen[q] = true
 		p.Providers[i] = q
+	}
+	if seen[AllProviders] && len(p.Providers) > 1 {
+		return errors.New("pass: \"*\" cannot be combined with other providers")
 	}
 	for _, list := range [][]string{p.ModelAllow, p.ModelDeny} {
 		if len(list) > maxGlobs {
 			return errors.New("pass: too many model patterns")
 		}
+		dup := map[string]bool{}
 		for _, g := range list {
+			if dup[strings.ToLower(g)] {
+				return fmt.Errorf("pass: duplicate model pattern %q", g)
+			}
+			dup[strings.ToLower(g)] = true
 			if len(g) > maxGlobLen {
 				return errors.New("pass: overlong model pattern")
 			}

@@ -33,7 +33,7 @@ func (a *app) withStepUp(ctx context.Context, c *client.Client, call func(ctx co
 	tick := time.NewTicker(stepUpPoll)
 	defer tick.Stop()
 	seen := map[string]bool{}
-	method := ""
+	cached := ""
 	self := os.Getpid()
 	for {
 		select {
@@ -56,10 +56,16 @@ func (a *app) withStepUp(ctx context.Context, c *client.Client, call func(ctx co
 				continue
 			}
 			seen[ap.ID] = true
-			if method == "" {
+			method := cached
+			if ap.Method != "" {
+				// The approver holding this request (a resume after a
+				// config change may use another method than the config).
+				method = ap.Method
+			} else if method == "" {
 				sctx, scancel := withTimeout(ctx)
 				if st, serr := c.Status(sctx); serr == nil {
 					method = st.ApprovalMethod
+					cached = method
 				}
 				scancel()
 			}

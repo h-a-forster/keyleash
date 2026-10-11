@@ -159,8 +159,14 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 // Unlock unlocks the vault. secret (passphrase or recovery code) may be nil
 // for hello and dpapi; the caller still owns and should wipe it.
 func (c *Client) Unlock(ctx context.Context, method string, secret []byte) (Status, error) {
+	return c.UnlockWith(ctx, UnlockRequest{Method: method}, secret)
+}
+
+// UnlockWith is Unlock with every UnlockRequest option (e.g.
+// AcceptRollback); req.Secret is ignored in favour of secret.
+func (c *Client) UnlockWith(ctx context.Context, req UnlockRequest, secret []byte) (Status, error) {
 	var s Status
-	req := UnlockRequest{Method: method}
+	req.Secret = nil
 	if len(secret) > 0 {
 		req.Secret = append([]byte(nil), secret...)
 		defer secmem.Wipe(req.Secret)
@@ -302,13 +308,6 @@ func (c *Client) Config(ctx context.Context) (string, error) {
 	}
 	err := c.do(ctx, http.MethodGet, "/v1/config", nil, nil, &r)
 	return r.TOML, err
-}
-
-// AcceptRollback arms the vault's one-shot rollback override: the next
-// strong unlock accepts an on-disk vault older than the recorded state.
-// Only call it on an explicit user request.
-func (c *Client) AcceptRollback(ctx context.Context) error {
-	return c.do(ctx, http.MethodPost, "/v1/vault/accept-rollback", nil, struct{}{}, nil)
 }
 
 // RotateRecovery replaces the recovery code (step-up, re-keys the vault).

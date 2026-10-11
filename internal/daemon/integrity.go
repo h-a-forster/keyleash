@@ -22,7 +22,7 @@ import (
 )
 
 // The daemon's long-lived MAC keys (audit anchors, ledger record MACs,
-// state.json MAC) are derived with HKDF-SHA256 from a random 256-bit
+// state.json MAC, passes.json MAC) are derived with HKDF-SHA256 from a random 256-bit
 // "integrity root" stored as a vault entry, not directly from the DEK:
 //
 //   - audit.Verify and budget.VerifyIntegrity check every record with ONE key,
@@ -44,11 +44,12 @@ const (
 	infoAuditAnchor = vault.InfoAuditAnchor
 	infoLedgerMAC   = "keyleash/v1/ledger-mac"
 	infoStateMAC    = "keyleash/v1/state-mac"
+	infoPassesMAC   = "keyleash/v1/passes-mac"
 )
 
 // integrityKeys are the derived keys, held in secmem while unlocked.
 type integrityKeys struct {
-	anchor, ledger, state *secmem.Buffer
+	anchor, ledger, state, passes *secmem.Buffer
 }
 
 func isRootEntry(e vault.EntryInfo) bool {
@@ -97,7 +98,10 @@ func (d *Daemon) loadIntegrityKeys() (*integrityKeys, bool, error) {
 		if keys.ledger, derr = deriveBuf(root, infoLedgerMAC); derr != nil {
 			return derr
 		}
-		keys.state, derr = deriveBuf(root, infoStateMAC)
+		if keys.state, derr = deriveBuf(root, infoStateMAC); derr != nil {
+			return derr
+		}
+		keys.passes, derr = deriveBuf(root, infoPassesMAC)
 		return derr
 	})
 	if err != nil {

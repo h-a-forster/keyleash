@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/glob"
+	"github.com/h-a-forster/keyleash/internal/money"
 	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/procinfo"
 	"github.com/h-a-forster/keyleash/internal/provider"
@@ -54,7 +56,6 @@ func (d *Daemon) adminHandler() http.Handler {
 	mux.HandleFunc("GET /v1/audit/tail", d.hAuditTail)
 	mux.HandleFunc("GET /v1/audit/verify", d.hAuditVerify)
 	mux.HandleFunc("GET /v1/config", d.hConfig)
-	mux.HandleFunc("POST /v1/vault/accept-rollback", d.hAcceptRollback)
 	mux.HandleFunc("POST /v1/vault/recovery", d.hRotateRecovery)
 	mux.HandleFunc("DELETE /v1/vault/slots/{id}", d.hRemoveSlot)
 	return mux
@@ -135,8 +136,11 @@ func (d *Daemon) status() client.Status {
 		s.Grant = &client.Grant{ID: g.id, Amount: g.amount, Until: g.until, Pass: g.pass}
 	}
 	s.Vault.RollbackDetected = d.st.rollback
+	s.Vault.RollbackFileSeq, s.Vault.RollbackRecordedSeq = d.st.rollbackFileSeq, d.st.rollbackRecordedSeq
+	s.Vault.RollbackAccepted = d.st.rollbackAccepted
 	s.Vault.PrevNotScrubbed = d.st.prevNotScrubbed
 	s.ConfigChanges = append([]string(nil), d.st.configChanges...)
+	s.PassStoreChanges = passStoreChanges(d.st.passDiff)
 	d.mu.RUnlock()
 
 	for _, l := range d.ledger.Status() {
@@ -164,7 +168,7 @@ func (d *Daemon) status() client.Status {
 			Created: sl.Created, Convenience: sl.Convenience})
 	}
 	s.PendingApprovals = len(d.queue.Pending())
-	s.ApprovalMethod = d.cfg.Approval.Method
+	s.ApprovalMethod = d.queue.Method()
 	s.AuditHealthy = !d.isAuditBroken()
 	if s.Vault.RecoveredFromPrev {
 		s.Warnings = append(s.Warnings, "the vault was recovered from vault.prev after the main file was missing or corrupt")
@@ -174,6 +178,13 @@ func (d *Daemon) status() client.Status {
 	}
 	if s.Vault.RollbackDetected {
 		s.Warnings = append(s.Warnings, "the vault file is older than the last recorded state (possible rollback)")
+	}
+	if s.Vault.RollbackAccepted {
+		s.Warnings = append(s.Warnings, fmt.Sprintf("a rolled-back vault file (write %d, recorded write %d) was accepted at unlock; review slots and keys",
+			s.Vault.RollbackFileSeq, s.Vault.RollbackRecordedSeq))
+	}
+	if len(s.PassStoreChanges) > 0 {
+		s.Warnings = append(s.Warnings, "passes.json does not match the record in the vault; review the changes and run `keyleash resume` (added and changed passes are revoked)")
 	}
 	if s.PresenceDegraded {
 		s.Warnings = append(s.Warnings, "presence detection is degraded: "+s.PresenceDegradedReason)
@@ -197,7 +208,7 @@ func (d *Daemon) hUnlock(w http.ResponseWriter, r *http.Request) {
 		d.writeErr(w, err)
 		return
 	}
-	if err := d.unlock(r.Context(), req.Method, req.Secret); err != nil {
+	if err := d.unlock(r.Context(), req.Method, req.Secret, req.AcceptRollback); err != nil {
 		d.writeErr(w, err)
 		return
 	}
@@ -239,6 +250,14 @@ func (d *Daemon) hAway(w http.ResponseWriter, r *http.Request) {
 		d.writeErr(w, statusErr(400, client.CodeBadRequest, "budget must be positive and duration between 0 and 168h"))
 		return
 	}
+	if mg := d.cfg.Limits.Away.MaxGrant; mg == nil || req.Budget > mg.Micros {
+		capAmt := money.Micros(0)
+		if mg != nil {
+			capAmt = mg.Micros
+		}
+		d.writeErr(w, statusErr(400, client.CodeBadRequest, "budget exceeds limits.away.max_grant (%s)", capAmt))
+		return
+	}
 	if req.Pass != "" {
 		if p, ok := d.passes.Get(req.Pass); !ok || p.Revoked || p.Expired(d.clk.Now()) {
 			d.writeErr(w, statusErr(404, client.CodeNotFound, "no such active pass"))
@@ -255,9 +274,9 @@ func (d *Daemon) hAway(w http.ResponseWriter, r *http.Request) {
 	} else {
 		detail += " (any pass)"
 	}
-	detail += ". Approving grants exactly this; it is never combined with another request."
 	if _, err := d.stepUp(r.Context(), approval.Request{Kind: "away_grant", Title: "Unattended grant",
-		Detail: detail, PassID: req.Pass, Amount: req.Budget}); err != nil {
+		Detail: detail, Note: "approving grants exactly this; it is never combined with another request",
+		PassID: req.Pass, Amount: req.Budget}); err != nil {
 		d.writeErr(w, err)
 		return
 	}
@@ -345,8 +364,9 @@ func (d *Daemon) hPassCreate(w http.ResponseWriter, r *http.Request) {
 	// A run pass bound to the calling process within the configured
 	// defaults needs no step-up (spec §6); anything else does.
 	if why := d.passNeedsStepUp(&p, req, caller.pid); why != "" {
-		if _, err := d.stepUp(r.Context(), approval.Request{Kind: "pass_create", Title: "Create a keyleash pass (" + why + ")",
-			Detail: describePass(p, d.clk.Now())}); err != nil {
+		risk, extra := describePass(p, d.clk.Now())
+		if _, err := d.stepUp(r.Context(), approval.Request{Kind: "pass_create", Title: "Create a pass: " + why,
+			Detail: risk, Note: extra}); err != nil {
 			d.writeErr(w, err)
 			return
 		}
@@ -379,10 +399,30 @@ func (d *Daemon) hPassCreate(w http.ResponseWriter, r *http.Request) {
 		d.writeErr(w, err)
 		return
 	}
-	d.applyLimits()
-	d.auditEvent("pass_issue", map[string]any{"pass": issued.ID, "name": issued.Name, "kind": issued.Kind,
+	// Issue → confine → audit → activate: the pass is returned (and its
+	// limits applied) only once its process tree is confined and the audit
+	// record is written; otherwise the issue is rolled back.
+	rollback := func(why string, status int, code, msg string) {
+		if rerr := d.passes.Remove(issued.ID); rerr != nil {
+			d.log.Error("rolling back an issued pass failed", "pass", issued.ID, "err", rerr)
+		}
+		d.log.Error("pass issue rolled back", "pass", issued.ID, "why", why)
+		d.writeErr(w, statusErr(status, code, "%s", msg))
+	}
+	if issued.Kind == pass.KindRun && d.jobs != nil {
+		if err := d.jobs.Confine(issued.ID, issued.Bind.PID, issued.Bind.StartTime); err != nil {
+			d.log.Warn("confining a run pass failed", "pass", issued.ID, "err", err)
+			rollback("confine", 409, client.CodeConflict, "the process could not be confined (spec §12); no pass was issued")
+			return
+		}
+	}
+	if err := d.auditEventErr("pass_issue", map[string]any{"pass": issued.ID, "name": issued.Name, "kind": issued.Kind,
 		"providers": issued.Providers, "bound": issued.Bind != nil, "expires": issued.Expires.UTC().Format(time.RFC3339),
-		"requester_pid": caller.pid, "entries": issued.Entries})
+		"requester_pid": caller.pid, "entries": issued.Entries}); err != nil {
+		rollback("audit", 503, client.CodeInternal, "the audit record could not be written; no pass was issued")
+		return
+	}
+	d.applyLimits()
 	writeJSON(w, 200, client.PassCreateResponse{Pass: passInfo(issued, d.clk.Now()), Token: token})
 }
 
@@ -423,7 +463,17 @@ func (d *Daemon) passFromRequest(req client.PassCreateRequest) (pass.Pass, error
 	if len(req.Providers) == 0 {
 		return bad("at least one provider is required (or \"*\")")
 	}
+	if len(req.Providers) > pass.MaxListLen || len(req.Models) > pass.MaxListLen ||
+		len(req.DenyModels) > pass.MaxListLen || len(req.Limits) > pass.MaxListLen {
+		return bad("too many providers, model patterns or limits (at most " + strconv.Itoa(pass.MaxListLen) + " each)")
+	}
+	seenProv := map[string]bool{}
 	for _, name := range req.Providers {
+		key := strings.ToLower(name)
+		if seenProv[key] {
+			return bad("duplicate provider " + strconv.Quote(name))
+		}
+		seenProv[key] = true
 		if name == pass.AllProviders {
 			continue
 		}
@@ -431,9 +481,19 @@ func (d *Daemon) passFromRequest(req client.PassCreateRequest) (pass.Pass, error
 			return bad("unknown provider " + strconv.Quote(name))
 		}
 	}
-	for _, g := range append(slices.Clone(req.Models), req.DenyModels...) {
-		if !glob.Valid(g) {
-			return bad("bad model pattern " + strconv.Quote(g))
+	if seenProv[pass.AllProviders] && len(req.Providers) > 1 {
+		return bad("\"*\" cannot be combined with other providers")
+	}
+	for _, list := range [][]string{req.Models, req.DenyModels} {
+		seen := map[string]bool{}
+		for _, g := range list {
+			if !glob.Valid(g) {
+				return bad("bad model pattern " + strconv.Quote(g))
+			}
+			if seen[g] {
+				return bad("duplicate model pattern " + strconv.Quote(g))
+			}
+			seen[g] = true
 		}
 	}
 	for _, l := range req.Limits {
@@ -523,13 +583,14 @@ func (d *Daemon) passNeedsStepUp(p *pass.Pass, req client.PassCreateRequest, cal
 	return ""
 }
 
-// describePass is the approval prompt text for a pass creation, most
-// important first (prompt fields are capped at 120 characters).
-func describePass(p pass.Pass, now time.Time) string {
+// describePass is the approval prompt text for a pass creation: the risk
+// text (what the pass may spend, where, for how long, bound to what), which
+// must be shown in full, and extras (model patterns, name) that may be cut.
+func describePass(p pass.Pass, now time.Time) (risk, extra string) {
 	var b strings.Builder
-	b.WriteString(p.Kind + " pass for " + strings.Join(p.Providers, ","))
+	b.WriteString(p.Kind + " pass, " + strings.Join(p.Providers, ","))
 	if len(p.Limits) == 0 {
-		b.WriteString("; no spend limit")
+		b.WriteString("; NO spend limit")
 	} else {
 		b.WriteString(";")
 		for _, l := range p.Limits {
@@ -537,20 +598,29 @@ func describePass(p pass.Pass, now time.Time) string {
 		}
 	}
 	if p.Bind != nil {
-		b.WriteString("; bound to pid " + strconv.Itoa(p.Bind.PID) + " " + filepath.Base(p.Bind.Image))
+		b.WriteString("; bound pid " + strconv.Itoa(p.Bind.PID))
 	} else {
 		b.WriteString("; unbound")
 	}
 	b.WriteString("; ttl " + p.Expires.Sub(now).Round(time.Minute).String())
 	b.WriteString("; conc " + strconv.Itoa(p.MaxConcurrency))
+	if len(p.ModelAllow) == 0 {
+		b.WriteString("; all models")
+	} else {
+		b.WriteString("; " + strconv.Itoa(len(p.ModelAllow)) + " model patterns")
+	}
+	var x []string
+	if p.Bind != nil {
+		x = append(x, "image "+filepath.Base(p.Bind.Image))
+	}
 	if len(p.ModelAllow) > 0 {
-		b.WriteString("; models " + strings.Join(p.ModelAllow, ","))
+		x = append(x, "models "+strings.Join(p.ModelAllow, ","))
 	}
 	if len(p.ModelDeny) > 0 {
-		b.WriteString("; deny " + strings.Join(p.ModelDeny, ","))
+		x = append(x, "deny "+strings.Join(p.ModelDeny, ","))
 	}
-	b.WriteString("; name " + strconv.Quote(p.Name))
-	return b.String()
+	x = append(x, "name "+strconv.Quote(p.Name))
+	return b.String(), strings.Join(x, "; ")
 }
 
 func (d *Daemon) hPassRevoke(w http.ResponseWriter, r *http.Request) {
@@ -562,10 +632,7 @@ func (d *Daemon) hPassRevoke(w http.ResponseWriter, r *http.Request) {
 	// A confined caller may revoke only the run pass whose tree it is in.
 	if c := callerFrom(r.Context()); c.confined {
 		p, ok := d.passes.Get(req.ID)
-		own := false
-		if ok && p.Bind != nil && c.known() {
-			own, _ = d.isDescendant(c.pid, procinfo.Process{PID: p.Bind.PID, StartTime: p.Bind.StartTime})
-		}
+		own := ok && c.known() && d.inRunTree(p, c.pid)
 		if !own {
 			d.writeErr(w, statusErr(403, client.CodeConfined, "this process runs under a keyleash run pass; it may only revoke its own pass"))
 			return
@@ -599,6 +666,15 @@ func (d *Daemon) sweepRunPasses() {
 			d.log.Warn("revoking pass of exited process", "pass", p.ID, "err", err)
 		}
 		d.auditEvent("pass_revoke", map[string]any{"pass": p.ID, "reason": "process_exited"})
+	}
+	if d.jobs != nil {
+		// Jobs of ended passes are kept while any member lives (they stay
+		// confined), then released.
+		now := d.clk.Now()
+		d.jobs.Sweep(func(id string) bool {
+			p, ok := d.passes.Get(id)
+			return ok && !p.Revoked && !p.Expired(now)
+		})
 	}
 	d.applyLimits()
 }
@@ -655,16 +731,14 @@ func (d *Daemon) hKeyAdd(w http.ResponseWriter, r *http.Request) {
 		d.writeErr(w, statusErr(423, client.CodeLocked, "keyleash is locked"))
 		return
 	}
-	first := req.Kind == vault.KindAPIKey
-	for _, e := range d.vault.Entries() {
-		if e.Kind == vault.KindAPIKey && !isInternalEntry(e) {
-			first = false
-		}
-	}
+	// Only the very first api_key the vault ever holds is exempt: removing
+	// every key does not reopen the exemption (spec §9).
+	vs := d.vaultStateSnapshot()
+	first := req.Kind == vault.KindAPIKey && vs != nil && !vs.KeysEverAdded && !d.vaultHasAPIKey()
 	if !first {
 		if _, err := d.stepUp(r.Context(), approval.Request{Kind: "key_add", Title: "Add a provider key",
-			Detail: "Add a " + req.Provider + " " + req.Kind + " labelled " + strconv.Quote(req.Label) +
-				". Existing passes keep their key; if the provider already has one, new passes keep using that until `keyleash keys use`."}); err != nil {
+			Detail: "Add a " + req.Provider + " " + req.Kind + " labelled " + strconv.Quote(req.Label),
+			Note:   "existing passes keep their key; new passes use the active key until `keyleash keys use`"}); err != nil {
 			d.writeErr(w, err)
 			return
 		}
@@ -681,6 +755,11 @@ func (d *Daemon) hKeyAdd(w http.ResponseWriter, r *http.Request) {
 		}
 		d.writeErr(w, err)
 		return
+	}
+	if e.Kind == vault.KindAPIKey {
+		if err := d.updateVaultState(func(s *vaultState) { s.KeysEverAdded = true }); err != nil {
+			d.log.Error("recording keys_ever_added failed", "err", err)
+		}
 	}
 	d.auditEvent("key_add", map[string]any{"entry": e.ID, "provider": e.Provider, "kind": e.Kind,
 		"fingerprint": e.Fingerprint, "step_up": !first, "requester_pid": callerFrom(r.Context()).pid})
@@ -819,7 +898,8 @@ func (d *Daemon) hApprovals(w http.ResponseWriter, _ *http.Request) {
 func (d *Daemon) approvalInfo(p approval.PendingInfo) client.Approval {
 	a := client.Approval{ID: p.ID, Kind: p.Request.Kind, Prompt: p.Prompt, Pass: p.Request.PassID,
 		Model: p.Request.Model, Amount: p.Request.Amount, Created: p.Created, Deadline: p.Deadline, Waiters: p.Waiters,
-		Requester: p.Request.Requester, Scope: p.Request.Scope, Window: p.Request.Window, Limit: p.Request.Limit}
+		Requester: p.Request.Requester, Scope: p.Request.Scope, Window: p.Request.Window, Limit: p.Request.Limit,
+		Method: p.Method}
 	if a.Requester > 0 {
 		if proc, err := d.lookupProcess(a.Requester); err == nil {
 			a.RequesterImage = filepath.Base(proc.Image)
@@ -834,14 +914,41 @@ func (d *Daemon) approvalInfo(p approval.PendingInfo) client.Approval {
 	return a
 }
 
-// Owner-secret rate limit for approvals: after secretFreeTries wrong
-// secrets, each further attempt waits secretBackoff, doubling up to
-// secretBackoffMax.
+// Owner-secret rate limit for approvals (spec §9). Each caller (PID and
+// executable image) gets secretFreeTries wrong secrets, then waits
+// secretBackoff, doubling up to secretBackoffMax. Across all callers, after
+// secretGlobalFree wrong secrets every attempt waits secretGlobalBackoff,
+// doubling up to secretGlobalMax, so new processes cannot reset the limit.
+// At most one verification runs at a time; concurrent attempts get 429.
 const (
-	secretFreeTries  = 5
-	secretBackoff    = 30 * time.Second
-	secretBackoffMax = 15 * time.Minute
+	secretFreeTries     = 5
+	secretBackoff       = 30 * time.Second
+	secretBackoffMax    = 15 * time.Minute
+	secretGlobalFree    = 10
+	secretGlobalBackoff = 2 * time.Second
+	secretGlobalMax     = time.Minute
+	secretMaxCallers    = 1024
 )
+
+// secretFailures counts consecutive wrong secrets and the time before which
+// the next attempt is refused.
+type secretFailures struct {
+	fails int
+	until time.Time
+}
+
+// fail records a wrong secret and returns the new count.
+func (f *secretFailures) fail(now time.Time, free int, base, ceil time.Duration) int {
+	f.fails++
+	if f.fails >= free {
+		back := base
+		for i := free; i < f.fails && back < ceil; i++ {
+			back *= 2
+		}
+		f.until = now.Add(min(back, ceil))
+	}
+	return f.fails
+}
 
 // hDecide decides a pending approval. Denying needs nothing. Approving is a
 // step-up and therefore needs proof of owner presence (spec §9): the vault
@@ -869,7 +976,10 @@ func (d *Daemon) hDecide(w http.ResponseWriter, r *http.Request) {
 		d.decide(w, id, false, nil, "external")
 		return
 	}
-	if d.cfg.Approval.Method == "deny" {
+	// The approver that holds this request decides what may approve it: a
+	// resume after a config change waits for the secret even when the
+	// changed config says "deny".
+	if pend.Method == "deny" || (d.cfg.Approval.Method == "deny" && pend.Method != "passphrase") {
 		d.writeErr(w, statusErr(403, client.CodeForbidden, "approval.method is deny: nothing can be approved"))
 		return
 	}
@@ -914,68 +1024,113 @@ func (d *Daemon) decide(w http.ResponseWriter, id string, approved bool, g *appr
 	writeJSON(w, 200, struct{}{})
 }
 
+// secretCallerKey identifies the caller for the per-caller secret limit:
+// its PID and executable image ("?" when unknown).
+func (d *Daemon) secretCallerKey(ctx context.Context) string {
+	c := callerFrom(ctx)
+	img := "?"
+	if c.known() {
+		if p, err := d.lookupProcess(c.pid); err == nil && p.Image != "" {
+			img = strings.ToLower(p.Image)
+		}
+	}
+	return strconv.Itoa(c.pid) + ":" + img
+}
+
 // verifyOwnerSecret checks a passphrase or recovery code against the
-// unlocked vault (the vault re-derives the key from the secret; nothing is
-// compared in the daemon). It returns the method that matched. Wrong
-// secrets are audited and rate limited.
+// unlocked vault (the vault derives the key from the secret and compares
+// what it unwraps with its own key; nothing is compared in the daemon). It
+// returns the method that matched. Wrong secrets are audited and rate
+// limited per caller and globally; the attempt is reserved before the slow
+// key derivation, which runs without holding the unlock lock, so lock and
+// panic are never delayed by it.
 func (d *Daemon) verifyOwnerSecret(ctx context.Context, approvalID, method string, secret []byte) (string, error) {
+	switch method {
+	case "", client.MethodRecovery, client.MethodPassphrase:
+	default:
+		return "", statusErr(400, client.CodeBadRequest, "method must be passphrase or recovery")
+	}
+	key := d.secretCallerKey(ctx)
 	now := d.clk.Now()
 	d.secretMu.Lock()
-	if wait := d.secretLockUntil.Sub(now); wait > 0 {
+	cf := d.secretCallers[key]
+	var wait time.Duration
+	if cf != nil {
+		wait = cf.until.Sub(now)
+	}
+	if g := d.secretGlobal.until.Sub(now); g > wait {
+		wait = g
+	}
+	switch {
+	case wait > 0:
 		d.secretMu.Unlock()
 		return "", statusErr(429, client.CodeRateLimited, "too many wrong secrets; retry in %s", wait.Round(time.Second))
+	case d.secretInFlight:
+		d.secretMu.Unlock()
+		return "", statusErr(429, client.CodeRateLimited, "another secret is being verified; retry shortly")
 	}
+	d.secretInFlight = true
 	d.secretMu.Unlock()
+	defer func() {
+		d.secretMu.Lock()
+		d.secretInFlight = false
+		d.secretMu.Unlock()
+	}()
 	if ctx.Err() != nil {
 		return "", ctx.Err()
 	}
-
-	d.unlockMu.Lock()
-	defer d.unlockMu.Unlock()
 	if !d.vault.IsUnlocked() || d.State() == StateLocked {
 		return "", statusErr(423, client.CodeLocked, "keyleash is locked")
 	}
+
 	var err error
 	used := method
 	switch method {
 	case client.MethodRecovery:
-		err = d.vault.UnlockRecovery(string(secret))
+		err = d.vault.VerifyRecovery(string(secret))
 	case client.MethodPassphrase:
-		err = d.vault.UnlockPassphrase(secret)
-	case "":
-		used = client.MethodRecovery
-		if err = d.vault.UnlockRecovery(string(secret)); errors.Is(err, vault.ErrBadRecoveryCode) {
-			used = client.MethodPassphrase
-			err = d.vault.UnlockPassphrase(secret)
-		}
+		err = d.vault.VerifyPassphrase(secret)
 	default:
-		return "", statusErr(400, client.CodeBadRequest, "method must be passphrase or recovery")
+		used = client.MethodRecovery
+		if err = d.vault.VerifyRecovery(string(secret)); errors.Is(err, vault.ErrBadRecoveryCode) {
+			used = client.MethodPassphrase
+			err = d.vault.VerifyPassphrase(secret)
+		}
 	}
 	if err == nil {
 		d.secretMu.Lock()
-		d.secretFails = 0
+		delete(d.secretCallers, key)
+		d.secretGlobal = secretFailures{}
 		d.secretMu.Unlock()
 		d.auditEvent("approval_secret", map[string]any{"approval": approvalID, "ok": true, "method": used})
 		return used, nil
 	}
-	if !d.vault.IsUnlocked() {
-		// The re-check found a problem (e.g. a rolled-back vault file) and
-		// the vault locked itself: follow it.
-		d.lockHeld("vault_check_failed")
+	if errors.Is(err, vault.ErrLocked) {
+		return "", statusErr(423, client.CodeLocked, "keyleash is locked")
 	}
 	if errors.Is(err, vault.ErrWrongSecret) || errors.Is(err, vault.ErrBadRecoveryCode) {
+		now = d.clk.Now()
 		d.secretMu.Lock()
-		d.secretFails++
-		fails := d.secretFails
-		if fails >= secretFreeTries {
-			back := secretBackoff
-			for i := secretFreeTries; i < fails && back < secretBackoffMax; i++ {
-				back *= 2
+		cf = d.secretCallers[key]
+		if cf == nil {
+			if len(d.secretCallers) >= secretMaxCallers {
+				// Bounded: drop entries whose wait is over; if none, the
+				// global limit (already counting) still applies.
+				for k, v := range d.secretCallers {
+					if !v.until.After(now) {
+						delete(d.secretCallers, k)
+					}
+				}
 			}
-			d.secretLockUntil = now.Add(min(back, secretBackoffMax))
+			cf = &secretFailures{}
+			if len(d.secretCallers) < secretMaxCallers {
+				d.secretCallers[key] = cf
+			}
 		}
+		fails := cf.fail(now, secretFreeTries, secretBackoff, secretBackoffMax)
+		global := d.secretGlobal.fail(now, secretGlobalFree, secretGlobalBackoff, secretGlobalMax)
 		d.secretMu.Unlock()
-		d.auditEvent("approval_secret", map[string]any{"approval": approvalID, "ok": false, "method": used, "failures": fails})
+		d.auditEvent("approval_secret", map[string]any{"approval": approvalID, "ok": false, "method": used, "failures": fails, "failures_all": global})
 		return "", statusErr(401, client.CodeWrongSecret, "wrong secret")
 	}
 	d.log.Warn("verifying the owner secret failed", "err", err)
@@ -1043,16 +1198,6 @@ func (d *Daemon) hConfig(w http.ResponseWriter, _ *http.Request) {
 }
 
 // ---- vault administration --------------------------------------------------
-
-func (d *Daemon) hAcceptRollback(w http.ResponseWriter, _ *http.Request) {
-	if d.State() != StateLocked {
-		d.writeErr(w, statusErr(409, client.CodeConflict, "only meaningful while locked"))
-		return
-	}
-	d.vault.AcceptRollback()
-	d.auditEvent("slot_change", map[string]any{"op": "accept_rollback_armed"})
-	writeJSON(w, 200, struct{}{})
-}
 
 func (d *Daemon) hRotateRecovery(w http.ResponseWriter, r *http.Request) {
 	if !d.vault.IsUnlocked() {

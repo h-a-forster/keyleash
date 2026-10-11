@@ -14,7 +14,6 @@ import (
 	"github.com/h-a-forster/keyleash/internal/meter"
 	"github.com/h-a-forster/keyleash/internal/money"
 	"github.com/h-a-forster/keyleash/internal/pass"
-	"github.com/h-a-forster/keyleash/internal/procinfo"
 	"github.com/h-a-forster/keyleash/internal/provider"
 	"github.com/h-a-forster/keyleash/internal/proxy"
 	"github.com/h-a-forster/keyleash/internal/vault"
@@ -71,8 +70,9 @@ func (a authenticator) Authenticate(_ context.Context, prov, token string, ci pr
 		if ci.PID <= 0 {
 			return deny(denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, ""))
 		}
-		ok, err := d.isDescendant(ci.PID, procinfo.Process{PID: p.Bind.PID, StartTime: p.Bind.StartTime})
-		if err != nil || !ok {
+		// A member of the run pass's job (even with a broken parent
+		// chain) or, by the parent walk, the bound process's tree.
+		if !d.inRunTree(p, ci.PID) {
 			return deny(denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, ""))
 		}
 	}

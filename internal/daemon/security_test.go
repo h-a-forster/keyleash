@@ -253,9 +253,16 @@ func TestConfinedCallers(t *testing.T) {
 	if err := e.c.RevokePass(e.ctx(), own.Pass.ID); err != nil {
 		t.Fatalf("revoking its own pass: %v", err)
 	}
-	// With the run pass gone, the process is no longer confined.
+	// The pass is gone but the process is still in its job: it stays
+	// confined until it exits (finding A).
+	if _, err := e.c.Passes(e.ctx()); !isAPI(err, 403, client.CodeConfined) {
+		t.Fatalf("after revoking, still in the job: %v", err)
+	}
+	// Once its last member has exited the job is released.
+	e.jobs.kill(os.Getpid())
+	e.d.sweepRunPasses()
 	if _, err := e.c.Passes(e.ctx()); err != nil {
-		t.Fatalf("after revoking: %v", err)
+		t.Fatalf("after the job was released: %v", err)
 	}
 	// A caller whose PID cannot be verified may read but not mutate.
 	e.setAdminPID(-1)
@@ -265,7 +272,8 @@ func TestConfinedCallers(t *testing.T) {
 	if err := e.c.RevokePass(e.ctx(), other.Pass.ID); !isAPI(err, 403, client.CodeConfined) {
 		t.Fatalf("unknown caller revoke: %v", err)
 	}
-	if _, err := e.c.Lock(e.ctx()); !isAPI(err, 403, client.CodeConfined) {
+	// Locking only adds protection: any caller may (finding H).
+	if _, err := e.c.Lock(e.ctx()); err != nil {
 		t.Fatalf("unknown caller lock: %v", err)
 	}
 }

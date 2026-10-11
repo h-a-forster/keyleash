@@ -22,6 +22,20 @@ func (c *Config) Hash() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// ApprovalMethodOf returns approval.method from a config rendered by
+// Encode (possibly with extra tables appended), or "" when it has none.
+func ApprovalMethodOf(text string) string {
+	var x struct {
+		Approval struct {
+			Method string `toml:"method"`
+		} `toml:"approval"`
+	}
+	if _, err := toml.Decode(text, &x); err != nil {
+		return ""
+	}
+	return x.Approval.Method
+}
+
 // Diff compares two effective configurations rendered by Encode and returns
 // one human-readable line per changed key, sorted:
 // "limits.global.day: $20 -> $200". Keys present on one side only show

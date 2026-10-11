@@ -17,6 +17,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +45,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/procinfo"
 	"github.com/h-a-forster/keyleash/internal/provider"
 	"github.com/h-a-forster/keyleash/internal/proxy"
+	"github.com/h-a-forster/keyleash/internal/runjob"
 	"github.com/h-a-forster/keyleash/internal/secmem"
 	"github.com/h-a-forster/keyleash/internal/vault"
 	"github.com/h-a-forster/keyleash/internal/winhello"
@@ -130,6 +133,9 @@ type Options struct {
 	// Unix). An error means "unknown": the caller is then confined for
 	// mutating calls (spec §12).
 	AdminPeerPID func(net.Conn) (int, error)
+	// Jobs confines run passes' process trees (default: Windows job
+	// objects via internal/runjob; none elsewhere).
+	Jobs JobManager
 
 	// manualPresence (tests) disables the presence goroutine; tests drive
 	// the monitor with stepPresence.
@@ -168,15 +174,27 @@ type Daemon struct {
 	lookupProcess  func(int) (procinfo.Process, error)
 	helloAvailable func() (bool, string)
 	adminPeerPID   func(net.Conn) (int, error)
+	jobs           JobManager
+
+	// configured is the approver config.approval.method names (or
+	// Options.Approver); console is the shared console approver.
+	configured approval.Approver
+	consoleMu  sync.Mutex
+	console    approval.Approver
+
+	// overrideSHA is the hex SHA-256 of the pricing override file's bytes
+	// as loaded ("" without an override); overridePath its resolved path.
+	overridePath, overrideSHA string
 
 	// vsMu guards vs, the cached daemon-state vault entry (vaultstate.go).
 	vsMu sync.Mutex
 	vs   *vaultState
 
 	// secretMu guards the rate limit on secrets entered to approve.
-	secretMu        sync.Mutex
-	secretFails     int
-	secretLockUntil time.Time
+	secretMu       sync.Mutex
+	secretInFlight bool
+	secretCallers  map[string]*secretFailures
+	secretGlobal   secretFailures
 
 	// unlockMu serialises slow vault operations (unlock, re-key).
 	unlockMu sync.Mutex
@@ -276,6 +294,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if d.adminPeerPID == nil {
 		d.adminPeerPID = connPeerPID
 	}
+	d.secretCallers = map[string]*secretFailures{}
 
 	var cleanup []func()
 	defer func() {
@@ -331,6 +350,16 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if d.passes, err = pass.OpenStore(filepath.Join(d.dataDir, PassesFile), d.clk); err != nil {
 		return nil, fmt.Errorf("keyleash: open pass store: %w", err)
 	}
+	d.passes.SetCommitHook(d.onPassCommit)
+	d.jobs = opts.Jobs
+	if d.jobs == nil && runjob.Supported() {
+		if m := runjob.New(d.cfg.Run.KillOnDaemonExit); m != nil {
+			d.jobs = m
+		}
+	}
+	if d.jobs != nil {
+		cleanup = append(cleanup, d.jobs.Close)
+	}
 	if d.ledger, err = budget.Open(budget.Options{Dir: filepath.Join(d.dataDir, LedgerDir), Clock: d.clk}); err != nil {
 		return nil, fmt.Errorf("keyleash: open ledger: %w", err)
 	}
@@ -346,7 +375,17 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if override != "" && !filepath.IsAbs(override) {
 		override = filepath.Join(d.dataDir, override)
 	}
-	pricing, err := meter.LoadPricing(override)
+	// The override's bytes are read once: they are what is priced with and
+	// what the accepted config covers (spec §14).
+	var overrideData []byte
+	if override != "" {
+		if overrideData, err = meter.ReadPricingOverride(override); err != nil {
+			return nil, fmt.Errorf("keyleash: load pricing: %w", err)
+		}
+		sum := sha256.Sum256(overrideData)
+		d.overridePath, d.overrideSHA = override, hex.EncodeToString(sum[:])
+	}
+	pricing, err := meter.LoadPricingData(overrideData, override)
 	if err != nil {
 		return nil, fmt.Errorf("keyleash: load pricing: %w", err)
 	}
@@ -357,11 +396,11 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	}
 
 	// Approvals.
-	appr := opts.Approver
-	if appr == nil {
-		appr = d.defaultApprover()
+	d.configured = opts.Approver
+	if d.configured == nil {
+		d.configured = d.approverFor(d.cfg.Approval.Method, false)
 	}
-	d.queue = approval.NewQueue(appr, d.cfg.Approval.Timeout.Duration, d.clk)
+	d.queue = approval.NewQueue(d.configured, d.cfg.Approval.Timeout.Duration, d.clk)
 
 	// 5. Limits.
 	d.st = stateData{state: StateLocked, concScopes: map[string]bool{}, modelsSeen: map[string]bool{}}
@@ -441,6 +480,11 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 		"vault_id": d.vault.ID(), "recovered_from_prev": d.vault.RecoveredFromPrev(),
 		"proxy": d.proxyLn.Addr().String(), "profile": d.cfg.Profile,
 	})
+	// Run passes from an earlier daemon have no job here, so their processes
+	// cannot be confined any more: end those passes (spec §12).
+	if d.jobs != nil {
+		d.revokeOrphanedRunPasses()
+	}
 	if d.vault.RecoveredFromPrev() {
 		d.log.Warn("vault was recovered from vault.prev (main file missing or corrupt)")
 	}
@@ -539,6 +583,9 @@ func (d *Daemon) Close() error {
 	d.unlockMu.Lock()
 	d.mu.Lock()
 	unlocked := d.st.state != StateLocked
+	// Locked before settling: a request still being admitted (after the
+	// grace period) cannot reserve once in-flight reservations are expired.
+	d.st.state = StateLocked
 	d.mu.Unlock()
 	if unlocked {
 		// Requests still in flight after the grace period are charged at
@@ -563,6 +610,7 @@ func (d *Daemon) Close() error {
 	if err := d.audit.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("audit close: %w", err))
 	}
+	d.passes.SetMACKey(nil)
 	d.vault.Lock()
 	d.mu.Lock()
 	d.st.keys.destroy()
@@ -570,6 +618,9 @@ func (d *Daemon) Close() error {
 	d.st.state = StateLocked
 	d.mu.Unlock()
 	d.unlockMu.Unlock()
+	if d.jobs != nil {
+		d.jobs.Close()
+	}
 	if d.osSource != nil {
 		d.osSource.Close()
 	}
@@ -589,23 +640,68 @@ func approverMethod(a approval.Approver) string {
 	return "approver"
 }
 
-func (d *Daemon) defaultApprover() approval.Approver {
-	switch d.cfg.Approval.Method {
+// approverFor returns the approver for an approval method. Options.Approver
+// (tests) overrides every method. For a resume (forResume), the console is
+// never used, and a method that cannot prompt here (console, deny, or
+// Windows Hello while it is unavailable) waits for the vault passphrase or
+// recovery code over the admin API instead (spec §14).
+func (d *Daemon) approverFor(method string, forResume bool) approval.Approver {
+	if d.opts.Approver != nil {
+		return d.opts.Approver
+	}
+	switch method {
 	case "console":
-		in, out := d.opts.ConsoleIn, d.opts.ConsoleOut
-		if in == nil {
-			in = os.Stdin
+		if forResume {
+			return approval.PassphraseApprover()
 		}
-		if out == nil {
-			out = os.Stderr
+		d.consoleMu.Lock()
+		defer d.consoleMu.Unlock()
+		if d.console == nil {
+			in, out := d.opts.ConsoleIn, d.opts.ConsoleOut
+			if in == nil {
+				in = os.Stdin
+			}
+			if out == nil {
+				out = os.Stderr
+			}
+			d.console = approval.ConsoleApprover(in, out)
 		}
-		return approval.ConsoleApprover(in, out)
+		return d.console
 	case "hello":
+		if forResume {
+			if ok, _ := d.helloAvailable(); !ok {
+				return approval.PassphraseApprover()
+			}
+		}
 		return approval.HelloApprover(&helloConfirmer{available: d.helloAvailable})
 	case "passphrase":
 		return approval.PassphraseApprover()
 	default:
+		if forResume {
+			return approval.PassphraseApprover()
+		}
 		return approval.DenyApprover{}
+	}
+}
+
+// revokeOrphanedRunPasses ends the active run passes a previous daemon
+// issued: their job objects died with it.
+func (d *Daemon) revokeOrphanedRunPasses() {
+	now := d.clk.Now()
+	var ids []string
+	for _, p := range d.passes.List() {
+		if p.Kind == pass.KindRun && !p.Revoked && !p.Expired(now) {
+			ids = append(ids, p.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	if _, err := d.passes.RevokeIDs(ids); err != nil {
+		d.log.Warn("revoking run passes of a previous daemon (revoked in memory)", "err", err)
+	}
+	for _, id := range ids {
+		d.auditEvent("pass_revoke", map[string]any{"pass": id, "reason": "daemon_restart"})
 	}
 }
 

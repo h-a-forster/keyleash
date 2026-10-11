@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -253,6 +254,19 @@ func TestIssueValidation(t *testing.T) {
 		"zero limit":       mod(func(p *Pass) { p.Limits = []LimitSpec{{Window: "day"}} }),
 		"control in name":  mod(func(p *Pass) { p.Name = "a\x1b[2Jb" }),
 		"bad bind":         mod(func(p *Pass) { p.Bind = &Binding{PID: 0} }),
+		"dup provider":     mod(func(p *Pass) { p.Providers = []string{"anthropic", "Anthropic"} }),
+		"star and other":   mod(func(p *Pass) { p.Providers = []string{"*", "openai"} }),
+		"dup model":        mod(func(p *Pass) { p.ModelAllow = []string{"claude-*", "CLAUDE-*"} }),
+		"too many models": mod(func(p *Pass) {
+			for i := 0; i < MaxListLen+1; i++ {
+				p.ModelDeny = append(p.ModelDeny, fmt.Sprintf("m%d", i))
+			}
+		}),
+		"too many providers": mod(func(p *Pass) {
+			for i := 0; i < MaxListLen+1; i++ {
+				p.Providers = append(p.Providers, "openai")
+			}
+		}),
 	}
 	for name, p := range cases {
 		if _, _, err := s.Issue(p); err == nil {
@@ -266,7 +280,7 @@ func TestIssueValidation(t *testing.T) {
 	p := mod(func(p *Pass) {
 		p.ID = "0000000000"
 		p.Revoked = true
-		p.Providers = []string{"Anthropic", "*"}
+		p.Providers = []string{"Anthropic", "openai"}
 	})
 	_, got, err := s.Issue(p)
 	if err != nil {
@@ -337,7 +351,7 @@ func TestOpenStoreRejectsCorruption(t *testing.T) {
 	cases := map[string]string{
 		"not json":     "{",
 		"wrong format": `{"format":"x","version":1,"passes":[]}`,
-		"wrong vers":   `{"format":"keyleash-passes","version":2,"passes":[]}`,
+		"wrong vers":   `{"format":"keyleash-passes","version":3,"passes":[]}`,
 		"unknown fld":  `{"format":"keyleash-passes","version":1,"passes":[],"x":1}`,
 		"bad id":       rec("BAD", h),
 		"bad hash":     rec("0123456789", "abcd"),

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,13 +27,20 @@ import (
 // the same thing for every waiter (the daemon never coalesces admin
 // step-ups, spec §9).
 type Request struct {
-	Kind, Title, Detail, PassID, Model string
-	Amount                             money.Micros
-	CoalesceKey                        string
+	// Kind and Title name the request. Detail is the risk-relevant text
+	// (limits, amounts, bindings, ...): it is always shown in full, and a
+	// request whose prompt could not show it in full is refused (see Fits).
+	// Note is optional explanatory text that may be shortened.
+	Kind, Title, Detail, Note, PassID, Model string
+	Amount                                   money.Micros
+	CoalesceKey                              string
 	// Requester is the verified PID of the admin-channel caller whose call
 	// triggered the request (0 for proxy requests or when unknown). It lets
 	// a CLI recognise the approval its own call is waiting for.
 	Requester int
+	// RequesterName is the requesting process's image name; with Requester
+	// it is shown in the prompt ("by agent.exe pid 1234").
+	RequesterName string
 	// Scope, Window and Limit describe the exceeded limit of an over_limit
 	// request; Limit bounds the grant an approval may carry.
 	Scope, Window string
@@ -92,13 +100,26 @@ func methodOf(a Approver) string {
 
 const (
 	maxFieldRunes  = 120
-	maxPromptRunes = 300
+	maxDetailRunes = 200
+	// maxPromptRunes is the whole prompt. It must not exceed what the
+	// Windows Hello dialog shows (winhello caps its text at 200 runes).
+	maxPromptRunes = 200
 )
+
+// ErrPromptTooLong is returned by Fits when the risk-relevant part of a
+// prompt would be truncated.
+var ErrPromptTooLong = errors.New("approval: the request is too long to show in full in an approval prompt")
 
 // clean makes untrusted text safe to show in a prompt: control, format
 // (bidi overrides, zero-width) and invalid characters are dropped, runs of
 // whitespace collapse to one space, and the result is capped at max runes.
 func clean(s string, max int) string {
+	c, _ := cleanFit(s, max)
+	return c
+}
+
+// cleanFit is clean that also reports whether s fitted without truncation.
+func cleanFit(s string, max int) (string, bool) {
 	var b strings.Builder
 	space := false
 	n := 0
@@ -123,15 +144,29 @@ func clean(s string, max int) string {
 	}
 	rs := []rune(b.String())
 	if len(rs) > max {
-		return string(rs[:max-1]) + "…"
+		return string(rs[:max-1]) + "…", false
 	}
-	return string(rs)
+	return string(rs), true
 }
 
-// PromptText builds the short, sanitised prompt shown to the user for req.
-func PromptText(req Request) string {
-	parts := make([]string, 0, 5)
-	title := clean(req.Title, maxFieldRunes)
+const promptSep = " · "
+
+// buildPrompt renders req: the risk-relevant parts first (title, requester,
+// detail, amount, model, pass), then the optional note in whatever room is
+// left. fits is false when a risk-relevant part had to be shortened.
+func buildPrompt(req Request) (text string, fits bool) {
+	fits = true
+	add := func(parts []string, s string, max int) []string {
+		c, ok := cleanFit(s, max)
+		fits = fits && ok
+		if c == "" {
+			return parts
+		}
+		return append(parts, c)
+	}
+	parts := make([]string, 0, 7)
+	title, ok := cleanFit(req.Title, maxFieldRunes)
+	fits = fits && ok
 	if title == "" {
 		title = clean(req.Kind, maxFieldRunes)
 	}
@@ -139,19 +174,52 @@ func PromptText(req Request) string {
 		title = "keyleash approval"
 	}
 	parts = append(parts, title)
-	if d := clean(req.Detail, maxFieldRunes); d != "" {
-		parts = append(parts, d)
+	if req.Requester > 0 {
+		name := clean(req.RequesterName, 48)
+		if name == "" {
+			name = "process"
+		}
+		parts = append(parts, "by "+name+" pid "+strconv.Itoa(req.Requester))
 	}
+	parts = add(parts, req.Detail, maxDetailRunes)
 	if req.Amount > 0 {
 		parts = append(parts, req.Amount.String())
 	}
-	if m := clean(req.Model, 64); m != "" {
-		parts = append(parts, "model "+m)
+	if req.Model != "" {
+		parts = add(parts, "model "+req.Model, 72)
 	}
-	if p := clean(req.PassID, 32); p != "" {
-		parts = append(parts, "pass "+p)
+	if req.PassID != "" {
+		parts = add(parts, "pass "+req.PassID, 40)
 	}
-	return clean(strings.Join(parts, " · "), maxPromptRunes)
+	head := strings.Join(parts, promptSep)
+	if utf8.RuneCountInString(head) > maxPromptRunes {
+		return clean(head, maxPromptRunes), false
+	}
+	if room := maxPromptRunes - utf8.RuneCountInString(head) - utf8.RuneCountInString(promptSep); room >= 8 {
+		if note := clean(req.Note, room); note != "" {
+			head += promptSep + note
+		}
+	}
+	return head, fits
+}
+
+// PromptText builds the short, sanitised prompt shown to the user for req.
+// It never exceeds maxPromptRunes; use Fits to make sure nothing
+// risk-relevant was cut.
+func PromptText(req Request) string {
+	s, _ := buildPrompt(req)
+	return s
+}
+
+// Fits reports ErrPromptTooLong when the prompt for req could not show its
+// title, requester, detail, amount, model and pass in full. Callers refuse
+// such requests instead of asking the owner to approve text they cannot
+// see.
+func Fits(req Request) error {
+	if _, ok := buildPrompt(req); !ok {
+		return ErrPromptTooLong
+	}
+	return nil
 }
 
 // --- approvers ----------------------------------------------------------
