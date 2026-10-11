@@ -224,8 +224,8 @@ Windows per limit: `request`, `minute`, `hour` (rolling), `day`, `month`
    - plus fixed per-request fees where a provider has them.
 2. The ledger atomically **reserves** that amount against every applicable
    scope/window. If any would exceed its limit the request is rejected
-   (`429`, JSON error naming the limit) or sent to step-up approval if the
-   policy says `on_exceed = "approve"`.
+   (`403`, JSON error naming the limit; not `429`, which SDKs retry) or sent
+   to step-up approval if the policy says `on_exceed = "approve"`.
 3. After the response, the meter extracts actual usage (non-stream JSON
    `usage`, or SSE events) and the ledger **settles** the reservation to the
    actual cost.
@@ -358,7 +358,11 @@ is harmless to standard clients).
 ### 10.4 Errors
 
 Proxy-generated errors use the provider's error JSON shape where possible so
-SDKs surface a readable message, plus `x-keyleash-reason` header:
+SDKs surface a readable message. Status codes are chosen so SDK retry logic
+does the right thing: `401` invalid/expired pass, `423` locked or tripped,
+`403` limit/model/endpoint/approval denials (not retried), `429` only for
+concurrency (retrying later is correct), `502` upstream failures. Every proxy
+error carries an `x-keyleash-reason` header:
 `locked`, `away_limit`, `budget_exceeded`, `concurrency`, `tripped`,
 `model_denied`, `endpoint_denied`, `pass_invalid`, `pass_expired`,
 `approval_denied`, `approval_timeout`.
