@@ -16,6 +16,21 @@ machine, only while you are there, and only up to a spending limit you set.
 - A pass shows up on a stream or in a screenshot? It is useless to whoever
   copies it.
 
+## Quick start
+
+```sh
+go install github.com/h-a-forster/keyleash/cmd/keyleash@latest
+keyleash init                 # vault + recovery code (Windows Hello or a passphrase)
+keyleash daemon --background  # start the daemon, then:
+keyleash unlock
+keyleash add anthropic        # paste the key at the hidden prompt, never on the command line
+keyleash run --budget 5 -- claude
+```
+
+Editors and other long-lived tools use `keyleash env` instead. See
+[docs/USAGE.md](docs/USAGE.md) for agents, SDKs, editors, defaults, limits,
+approvals and troubleshooting.
+
 ## How it works
 
 keyleash is a local credential broker and spend governor for LLM API keys.
