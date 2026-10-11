@@ -1,0 +1,11 @@
+{
+  "model": "gpt-5.4-mini",
+  "messages": [
+    {"role": "developer", "content": "You are a terse assistant. Reply in plain text without markdown, and never exceed three sentences in total."},
+    {"role": "user", "content": "Explain the difference between a mutex and a read-write lock, and say when the latter is worth its overhead in a Go service handling mostly reads."}
+  ],
+  "max_completion_tokens": 1000,
+  "n": 2,
+  "temperature": 0.70000000000000001,
+  "stream": true
+}

@@ -1,0 +1,4 @@
+data: {"candidates": [{"content": {"parts": [{"text": "The speaker asks"}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 50,"candidatesTokenCount": 4,"totalTokenCount": 54,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 40},{"modality": "AUDIO","tokenCount": 10}]},"modelVersion": "gemini-2.5-flash","responseId": "abc123"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " for a refund."}],"role": "model"},"finishReason": "STOP","index": 0}],"usageMetadata": {"promptTokenCount": 50,"candidatesTokenCount": 200,"totalTokenCount": 370,"thoughtsTokenCount": 120,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 40},{"modality": "AUDIO","tokenCount": 10}]},"modelVersion": "gemini-2.5-flash","responseId": "abc123"}
+

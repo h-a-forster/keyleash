@@ -1,0 +1,9 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_67c9fdcecf488190bdd9a0409de3a1ec","object":"response","created_at":1741290958,"status":"in_progress","model":"gpt-6.1-sol","output":[],"usage":null,"service_tier":"auto"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"msg_67c9fdcf37fc8190ba82116e33fb28c5","output_index":1,"content_index":0,"delta":"Go 1.27"}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_67c9fdcecf488190bdd9a0409de3a1ec","object":"response","created_at":1741290958,"status":"completed","model":"gpt-6.1-sol","service_tier":"default","output":[{"type":"web_search_call","id":"ws_1","status":"completed"},{"type":"reasoning","id":"rs_1","summary":[]},{"type":"message","id":"msg_67c9fdcf37fc8190ba82116e33fb28c5","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Go 1.27 ...","annotations":[]}]}],"usage":{"input_tokens":300,"input_tokens_details":{"cached_tokens":100,"cache_write_tokens":150},"output_tokens":700,"output_tokens_details":{"reasoning_tokens":500},"total_tokens":1000}}}
+

@@ -1,0 +1,16 @@
+{
+  "model": "claude-opus-5-5",
+  "max_tokens": 1024,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a careful assistant that answers questions about the attached style guide. Keep answers short and cite the section you used.",
+      "cache_control": {"type": "ephemeral"}
+    }
+  ],
+  "messages": [
+    {"role": "user", "content": "Which section covers naming of exported identifiers, and what does it say about acronyms such as URL or ID?"}
+  ],
+  "thinking": {"type": "adaptive"},
+  "metadata": {"user_id": "u-1234"}
+}

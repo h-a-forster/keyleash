@@ -1,0 +1,6 @@
+{
+  "candidates": [{"content": {"parts": [{"text": "1. Create a second key.\n2. Deploy it."}], "role": "model"}, "finishReason": "STOP", "index": 0}],
+  "usageMetadata": {"promptTokenCount": 110, "candidatesTokenCount": 100, "totalTokenCount": 260, "thoughtsTokenCount": 50, "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 110}]},
+  "modelVersion": "gemini-3.1-pro-preview",
+  "responseId": "xyz"
+}

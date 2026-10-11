@@ -1,0 +1,405 @@
+{
+  "version": 1,
+  "providers": {
+    "anthropic": {
+      "fees": {
+        "web_search_request": "$0.01"
+      },
+      "fees_source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "models": {
+        "claude-fable-5-1": {
+          "input": "$10", "output": "$50", "cache_write": "$20", "cache_write_5m": "$12.50", "cache_read": "$0.25",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "cache_write is the 1h TTL rate (higher); cache_write_5m the 5m rate. inference_geo=us adds 10%."
+        },
+        "claude-fable-5": {
+          "input": "$10", "output": "$50", "cache_write": "$20", "cache_write_5m": "$12.50", "cache_read": "$1",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11"
+        },
+        "claude-opus-5-5": {
+          "input": "$4", "output": "$20", "cache_write": "$8", "cache_write_5m": "$5", "cache_read": "$0.20",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "tiers": {"fast": 200},
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "fast mode (speed=fast) is $8/$40, i.e. 2x; cache multipliers stack on top."
+        },
+        "claude-opus-5": {
+          "input": "$5", "output": "$25", "cache_write": "$10", "cache_write_5m": "$6.25", "cache_read": "$0.50",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "tiers": {"fast": 200},
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "fast mode is $10/$50, i.e. 2x."
+        },
+        "claude-opus-4-8": {
+          "input": "$5", "output": "$25", "cache_write": "$10", "cache_write_5m": "$6.25", "cache_read": "$0.50",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "tiers": {"fast": 200},
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "fast mode is $10/$50, i.e. 2x."
+        },
+        "claude-opus-4-7": {
+          "input": "$5", "output": "$25", "cache_write": "$10", "cache_write_5m": "$6.25", "cache_read": "$0.50",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11"
+        },
+        "claude-opus-4-6": {
+          "input": "$5", "output": "$25", "cache_write": "$10", "cache_write_5m": "$6.25", "cache_read": "$0.50",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11"
+        },
+        "claude-opus-4-5": {
+          "input": "$5", "output": "$25", "cache_write": "$10", "cache_write_5m": "$6.25", "cache_read": "$0.50",
+          "max_output_tokens": 64000, "max_input_tokens": 200000,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "snapshot claude-opus-4-5-20251101 resolves here."
+        },
+        "claude-sonnet-5-5": {
+          "input": "$2", "output": "$10", "cache_write": "$4", "cache_write_5m": "$2.50", "cache_read": "$0.10",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11"
+        },
+        "claude-sonnet-5": {
+          "input": "$2", "output": "$10", "cache_write": "$4", "cache_write_5m": "$2.50", "cache_read": "$0.20",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "introductory $2/$10 made standard; the scheduled rise to $3/$15 was cancelled."
+        },
+        "claude-sonnet-4-6": {
+          "input": "$3", "output": "$15", "cache_write": "$6", "cache_write_5m": "$3.75", "cache_read": "$0.30",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11"
+        },
+        "claude-sonnet-4-5": {
+          "input": "$3", "output": "$15", "cache_write": "$6", "cache_write_5m": "$3.75", "cache_read": "$0.30",
+          "max_output_tokens": 64000, "max_input_tokens": 1000000,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "snapshot claude-sonnet-4-5-20250929 resolves here."
+        },
+        "claude-haiku-5-5": {
+          "input": "$0.10", "output": "$0.50", "cache_write": "$0.20", "cache_write_5m": "$0.125", "cache_read": "$0.01",
+          "max_output_tokens": 128000, "max_input_tokens": 1000000,
+          "long_context": {
+            "threshold_tokens": 100000,
+            "input": "$0.50", "output": "$2.50", "cache_write": "$1", "cache_write_5m": "$0.625", "cache_read": "$0.05"
+          },
+          "regional_premium_pct": 10,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "prompts over 100,000 tokens (input + cache reads + cache writes) pay the higher rates."
+        },
+        "claude-haiku-4-5": {
+          "input": "$1", "output": "$5", "cache_write": "$2", "cache_write_5m": "$1.25", "cache_read": "$0.10",
+          "max_output_tokens": 64000, "max_input_tokens": 200000,
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing", "as_of": "2026-10-11",
+          "note": "snapshot claude-haiku-4-5-20251001 resolves here."
+        }
+      }
+    },
+    "openai": {
+      "fees": {
+        "web_search_call": "$0.025"
+      },
+      "fees_source_url": "https://developers.openai.com/api/docs/pricing",
+      "models": {
+        "gpt-6-astra": {
+          "input": "$10", "output": "$50", "cache_write": "$12.50", "cache_read": "$1",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$20", "output": "$75", "cache_write": "$25", "cache_read": "$2"},
+          "tiers": {"fast": 200, "ultrafast": 600, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-6.1-sol": {
+          "input": "$2", "output": "$10", "cache_write": "$2.50", "cache_read": "$0.10",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$4", "output": "$15", "cache_write": "$5", "cache_read": "$0.20"},
+          "tiers": {"fast": 200, "ultrafast": 600, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-6-sol": {
+          "input": "$2", "output": "$10", "cache_write": "$2.50", "cache_read": "$0.20",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$4", "output": "$15", "cache_write": "$5", "cache_read": "$0.40"},
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "long context per model page: 2x input and cache rates, 1.5x output."
+        },
+        "gpt-6-luna": {
+          "input": "$0.10", "output": "$0.50", "cache_write": "$0.125", "cache_read": "$0.01",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$0.20", "output": "$0.75", "cache_write": "$0.25", "cache_read": "$0.02"},
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5.6-sol": {
+          "input": "$4", "output": "$20", "cache_write": "$5", "cache_read": "$0.40",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$8", "output": "$30", "cache_write": "$10", "cache_read": "$0.80"},
+          "tiers": {"fast": 200, "flex": 50},
+          "valid_until": "2026-11-21",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "promotional pricing guaranteed only through 2026-11-21; re-verify after that date."
+        },
+        "gpt-5.6-terra": {
+          "input": "$2", "output": "$12", "cache_write": "$2.50", "cache_read": "$0.20",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$4", "output": "$18", "cache_write": "$5", "cache_read": "$0.40"},
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "long context is 2x input / 1.5x output per model page; cache rates doubled as a fail-safe."
+        },
+        "gpt-5.6-luna": {
+          "input": "$0.20", "output": "$1.20", "cache_write": "$0.25", "cache_read": "$0.02",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$0.40", "output": "$1.80", "cache_write": "$0.50", "cache_read": "$0.04"},
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "long context is 2x input / 1.5x output per model page; cache rates doubled as a fail-safe."
+        },
+        "gpt-5.5": {
+          "input": "$5", "output": "$30", "cache_read": "$0.50",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$10", "output": "$45", "cache_read": "$1"},
+          "tiers": {"fast": 250, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "fast mode is $12.50/$75 (2.5x)."
+        },
+        "gpt-5.4": {
+          "input": "$2.50", "output": "$15", "cache_read": "$0.25",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$5", "output": "$22.50", "cache_read": "$0.50"},
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "snapshot gpt-5.4-2026-03-05 resolves here."
+        },
+        "gpt-5.4-pro": {
+          "input": "$30", "output": "$180", "cache_read": "$30",
+          "max_output_tokens": 128000, "max_input_tokens": 1050000,
+          "long_context": {"threshold_tokens": 272000, "input": "$60", "output": "$270", "cache_read": "$60"},
+          "tiers": {"flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "no cached-input discount: cache_read equals input."
+        },
+        "gpt-5.4-mini": {
+          "input": "$0.75", "output": "$4.50", "cache_read": "$0.075",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5.4-nano": {
+          "input": "$0.20", "output": "$1.25", "cache_read": "$0.02",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5.3-codex": {
+          "input": "$1.75", "output": "$14", "cache_read": "$0.175",
+          "tiers": {"fast": 200},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5.2": {
+          "input": "$1.75", "output": "$14", "cache_read": "$0.175",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5.2-pro": {
+          "input": "$21", "output": "$168", "cache_read": "$21",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "no cached-input discount: cache_read equals input."
+        },
+        "gpt-5.1": {
+          "input": "$1.25", "output": "$10", "cache_read": "$0.125",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5": {
+          "input": "$1.25", "output": "$10", "cache_read": "$0.125",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"fast": 200, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5-mini": {
+          "input": "$0.25", "output": "$2", "cache_read": "$0.025",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"fast": 180, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5-nano": {
+          "input": "$0.05", "output": "$0.40", "cache_read": "$0.005",
+          "max_output_tokens": 128000, "max_input_tokens": 400000,
+          "tiers": {"flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-5-pro": {
+          "input": "$15", "output": "$120", "cache_read": "$15",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "no cached-input discount: cache_read equals input."
+        },
+        "gpt-4.1": {
+          "input": "$2", "output": "$8", "cache_read": "$0.50",
+          "max_output_tokens": 32768, "max_input_tokens": 1047576,
+          "tiers": {"fast": 175},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-4.1-mini": {
+          "input": "$0.40", "output": "$1.60", "cache_read": "$0.10",
+          "max_output_tokens": 32768, "max_input_tokens": 1047576,
+          "tiers": {"fast": 175},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-4.1-nano": {
+          "input": "$0.10", "output": "$0.40", "cache_read": "$0.025",
+          "max_output_tokens": 32768, "max_input_tokens": 1047576,
+          "tiers": {"fast": 200},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-4o": {
+          "input": "$2.50", "output": "$10", "cache_read": "$1.25",
+          "max_output_tokens": 16384, "max_input_tokens": 128000,
+          "tiers": {"fast": 170},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-4o-2024-05-13": {
+          "input": "$5", "output": "$15", "cache_read": "$5",
+          "max_input_tokens": 128000,
+          "tiers": {"fast": 175},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gpt-4o-mini": {
+          "input": "$0.15", "output": "$0.60", "cache_read": "$0.075",
+          "max_output_tokens": 16384, "max_input_tokens": 128000,
+          "tiers": {"fast": 167},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "fast is $0.25/$1 (~1.667x), stored rounded up to 167%."
+        },
+        "o3": {
+          "input": "$2", "output": "$8", "cache_read": "$0.50",
+          "max_output_tokens": 100000, "max_input_tokens": 200000,
+          "tiers": {"fast": 175, "flex": 50},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "o4-mini": {
+          "input": "$1.10", "output": "$4.40", "cache_read": "$0.275",
+          "max_output_tokens": 100000, "max_input_tokens": 200000,
+          "tiers": {"fast": 182},
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11",
+          "note": "fast is $2/$8 (~1.818x), stored rounded up to 182%."
+        },
+        "o3-pro": {
+          "input": "$20", "output": "$80", "cache_read": "$20",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "o3-mini": {
+          "input": "$1.10", "output": "$4.40", "cache_read": "$0.55",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "text-embedding-3-small": {
+          "input": "$0.02", "output": "$0", "cache_read": "$0.02",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "text-embedding-3-large": {
+          "input": "$0.13", "output": "$0", "cache_read": "$0.13",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "text-embedding-ada-002": {
+          "input": "$0.10", "output": "$0", "cache_read": "$0.10",
+          "source_url": "https://developers.openai.com/api/docs/pricing", "as_of": "2026-10-11"
+        }
+      }
+    },
+    "gemini": {
+      "models": {
+        "gemini-3.8-flash": {
+          "input": "$0.75", "output": "$3.75", "cache_read": "$0.075",
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "valid_until": "2026-12-31",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11",
+          "note": "launch price through 2026-12-31; doubles to $1.50/$7.50 on 2027-01-01. Output includes thinking."
+        },
+        "gemini-3.6-flash": {
+          "input": "$0.75", "output": "$3.75", "cache_read": "$0.075",
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "valid_until": "2026-12-31",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11",
+          "note": "price through 2026-12-31; doubles to $1.50/$7.50 on 2027-01-01."
+        },
+        "gemini-3.5-flash-lite": {
+          "input": "$0.30", "output": "$2.50", "cache_read": "$0.03",
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-3.1-flash-lite": {
+          "input": "$0.25", "output": "$1.50", "cache_read": "$0.025",
+          "modality_input": {"AUDIO": "$0.50"}, "modality_cache_read": {"AUDIO": "$0.05"},
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-3.1-pro-preview": {
+          "input": "$2", "output": "$12", "cache_read": "$0.20",
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "long_context": {"threshold_tokens": 200000, "input": "$4", "output": "$18", "cache_read": "$0.40"},
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-3.1-pro-preview-customtools": {
+          "input": "$2", "output": "$12", "cache_read": "$0.20",
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "long_context": {"threshold_tokens": 200000, "input": "$4", "output": "$18", "cache_read": "$0.40"},
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-3-flash-preview": {
+          "input": "$0.50", "output": "$3", "cache_read": "$0.05",
+          "modality_input": {"AUDIO": "$1"}, "modality_cache_read": {"AUDIO": "$0.10"},
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-2.5-pro": {
+          "input": "$1.25", "output": "$10", "cache_read": "$0.125",
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "long_context": {"threshold_tokens": 200000, "input": "$2.50", "output": "$15", "cache_read": "$0.25"},
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-2.5-flash": {
+          "input": "$0.30", "output": "$2.50", "cache_read": "$0.03",
+          "modality_input": {"AUDIO": "$1"}, "modality_cache_read": {"AUDIO": "$0.10"},
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-2.5-flash-lite": {
+          "input": "$0.10", "output": "$0.40", "cache_read": "$0.01",
+          "modality_input": {"AUDIO": "$0.30"}, "modality_cache_read": {"AUDIO": "$0.03"},
+          "max_output_tokens": 65536, "max_input_tokens": 1048576,
+          "tiers": {"priority": 180, "flex": 100},
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11"
+        },
+        "gemini-embedding-2": {
+          "input": "$0.20", "output": "$0", "cache_read": "$0.20",
+          "modality_input": {"IMAGE": "$0.45", "AUDIO": "$6.50", "VIDEO": "$12"},
+          "max_input_tokens": 8192,
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing", "as_of": "2026-10-11",
+          "note": "per-modality input rates; estimates use the highest (video)."
+        }
+      }
+    }
+  }
+}

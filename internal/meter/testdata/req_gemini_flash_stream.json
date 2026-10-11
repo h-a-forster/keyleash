@@ -1,0 +1,9 @@
+{
+  "contents": [
+    {"role": "user", "parts": [
+      {"text": "Transcribe the short clip and then say in one sentence what the speaker is asking for."},
+      {"inlineData": {"mimeType": "audio/wav", "data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA="}}
+    ]}
+  ],
+  "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.2, "thinkingConfig": {"thinkingBudget": 512}}
+}

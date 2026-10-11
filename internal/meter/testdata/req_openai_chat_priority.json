@@ -1,0 +1,1 @@
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Name three prime numbers greater than one hundred, separated by commas, with no other text at all please."}],"max_tokens":100,"service_tier":"priority"}

@@ -36,6 +36,9 @@ func Parse(s string) (Micros, error) {
 		return 0, fmt.Errorf("money: negative amount %q", s)
 	}
 	whole, frac, _ := strings.Cut(s, ".")
+	if whole == "" && frac == "" {
+		return 0, fmt.Errorf("money: bad amount %q", s)
+	}
 	if whole == "" {
 		whole = "0"
 	}

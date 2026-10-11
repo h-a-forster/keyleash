@@ -1,0 +1,5 @@
+{
+  "systemInstruction": {"parts": [{"text": "You are a precise technical writer. Answer with a numbered list and keep every item under twenty words."}]},
+  "contents": [{"role": "user", "parts": [{"text": "List the steps to rotate an API key safely in a team that shares one key across several services, minimising downtime and making sure the old key stops working afterwards. Include verification steps and a rollback plan in case a service breaks after the switch."}]}],
+  "generationConfig": {"max_output_tokens": 2048, "candidate_count": 1}
+}

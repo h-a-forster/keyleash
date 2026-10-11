@@ -1,0 +1,12 @@
+[{
+  "candidates": [{"content": {"parts": [{"text": "1. Create a second key."}], "role": "model"}, "index": 0}],
+  "usageMetadata": {"promptTokenCount": 110, "candidatesTokenCount": 6, "totalTokenCount": 116, "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 110}]},
+  "modelVersion": "gemini-3.1-pro-preview"
+}
+,
+{
+  "candidates": [{"content": {"parts": [{"text": "\n2. Deploy it [one service at a time] {carefully}."}], "role": "model"}, "finishReason": "STOP", "index": 0}],
+  "usageMetadata": {"promptTokenCount": 110, "candidatesTokenCount": 100, "totalTokenCount": 260, "thoughtsTokenCount": 50, "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 110}]},
+  "modelVersion": "gemini-3.1-pro-preview"
+}
+]

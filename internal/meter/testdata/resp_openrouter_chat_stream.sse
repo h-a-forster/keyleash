@@ -1,0 +1,8 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1","provider":"Anthropic","model":"anthropic/claude-sonnet-4.5","object":"chat.completion.chunk","created":1747000000,"choices":[{"index":0,"delta":{"role":"assistant","content":"Bonjour Hola Hallo"},"finish_reason":null}]}
+
+data: {"id":"gen-1","provider":"Anthropic","model":"anthropic/claude-sonnet-4.5","object":"chat.completion.chunk","created":1747000000,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":8,"total_tokens":32,"cost":0.0001234,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}}
+
+data: [DONE]
+

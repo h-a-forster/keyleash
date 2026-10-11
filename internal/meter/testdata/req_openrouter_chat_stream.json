@@ -1,0 +1,1 @@
+{"model":"anthropic/claude-sonnet-4.5","messages":[{"role":"user","content":"Say hello in French, Spanish and German, one word each, separated by spaces."}],"stream":true,"max_tokens":50}
