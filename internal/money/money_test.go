@@ -24,6 +24,11 @@ func TestParse(t *testing.T) {
 		{"1.2.3", 0, true},
 		{"-5c", 0, true},
 		{"99999999999999999999", 0, true},
+		{"922337203685478c", 0, true},
+		{"1.-5", 0, true},
+		{"+1", 0, true},
+		{"1.+5", 0, true},
+		{"1.", 1 * Dollar, false},
 	}
 	for _, tt := range tests {
 		got, err := Parse(tt.in)

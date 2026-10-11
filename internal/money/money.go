@@ -24,8 +24,9 @@ func Parse(s string) (Micros, error) {
 		return 0, errors.New("money: empty amount")
 	}
 	if strings.HasSuffix(s, "c") {
-		n, err := strconv.ParseInt(strings.TrimSuffix(s, "c"), 10, 64)
-		if err != nil || n < 0 {
+		digits := strings.TrimSuffix(s, "c")
+		n, err := strconv.ParseInt(digits, 10, 64)
+		if err != nil || n < 0 || !allDigits(digits) || n > (1<<62)/int64(Cent) {
 			return 0, fmt.Errorf("money: bad cents amount %q", s)
 		}
 		return Micros(n) * Cent, nil
@@ -41,6 +42,9 @@ func Parse(s string) (Micros, error) {
 	}
 	if whole == "" {
 		whole = "0"
+	}
+	if !allDigits(whole) || (frac != "" && !allDigits(frac)) {
+		return 0, fmt.Errorf("money: bad amount %q", s)
 	}
 	w, err := strconv.ParseInt(whole, 10, 64)
 	if err != nil {
@@ -89,4 +93,16 @@ func (p PerMTok) Cost(n int64) Micros {
 	}
 	num := int64(p) * n
 	return Micros((num + 999_999) / 1_000_000)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

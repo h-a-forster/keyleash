@@ -8,5 +8,4 @@ import (
 	_ "golang.org/x/crypto/argon2"
 	_ "golang.org/x/crypto/chacha20poly1305"
 	_ "golang.org/x/crypto/hkdf"
-	_ "golang.org/x/sys/windows"
 )
