@@ -2,19 +2,30 @@
 
 **A wallet for your AI API keys.**
 
-> Status: pre-alpha. The engine is under active development; nothing here is
-> ready to protect real keys yet.
+An API key for Anthropic, OpenAI, Gemini or OpenRouter is a blank cheque.
+Anyone who sees it (on a stream, in a screenshot, in a leaked `.env`) can
+spend your money with it, and so can an agent stuck in a loop while you are
+asleep. Providers only tell you afterwards, on the bill.
 
-## What it is
+keyleash puts the key in an encrypted vault on your computer and hands your
+tools a stand-in **pass** instead. A pass:
 
-keyleash keeps your real AI API keys locked on your computer. Your coding
-agents and tools get a stand-in *pass* instead, one that only works on your
-machine, only while you are there, and only up to a spending limit you set.
+- **only works on your machine**: copied anywhere else, it is useless;
+- **only works while you are there**: walk away, lock the screen or let the
+  laptop sleep, and spending is capped or stopped;
+- **only spends what you allow**: every request is checked against hard
+  limits (per request, per session, per day, per month) *before* it is sent,
+  so a runaway agent stops at the limit instead of at the bill.
 
-- Walk away, fall asleep or lock your screen, and spending is capped or stopped.
-- An agent goes haywire and spawns a swarm? It hits a hard limit and stops.
-- A pass shows up on a stream or in a screenshot? It is useless to whoever
-  copies it.
+Think of it as a hardware wallet for API keys: the key never leaves the
+vault, and anything risky (a big spend, an unknown model, a long unattended
+run) needs you to confirm with Windows Hello, like pressing the button on a
+Ledger.
+
+> **Status: pre-alpha.** The vault, proxy, budgets, presence lock and CLI
+> work and are tested end to end, but the project is new and unaudited. Try
+> it with keys you can rotate. Windows is the main platform; Linux and macOS
+> run everything except Windows Hello and process-bound passes.
 
 ## Quick start
 
@@ -27,13 +38,19 @@ keyleash add anthropic        # paste the key at the hidden prompt, never on the
 keyleash run --budget 5 -- claude
 ```
 
+`keyleash run` starts the agent with its own pass and a $5 budget, points it
+at keyleash, and revokes the pass when the agent exits. The agent never sees
+the real key. `keyleash status` shows what is being spent; `keyleash lock` or
+`keyleash panic` stops everything at once.
+
 Editors and other long-lived tools use `keyleash env` instead. See
 [docs/USAGE.md](docs/USAGE.md) for agents, SDKs, editors, defaults, limits,
 approvals and troubleshooting.
 
 ## How it works
 
-keyleash is a local credential broker and spend governor for LLM API keys.
+In technical terms, keyleash is a local credential broker and spend governor
+for LLM API keys.
 
 - **Vault.** Provider keys are stored with envelope encryption: a random
   256-bit data key seals each secret with XChaCha20-Poly1305 under
@@ -87,6 +104,7 @@ administrator- or kernel-level attacker is out of scope. See
 
 ## Docs
 
+- [Usage](docs/USAGE.md): setup, agents, editors, defaults, troubleshooting
 - [Specification](docs/SPEC.md): threat model, crypto design, behaviour
 - [Plan](docs/PLAN.md): build phases
 
