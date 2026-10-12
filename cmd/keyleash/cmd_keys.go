@@ -122,6 +122,9 @@ func checkKeyInput(providerName string, key []byte) (warning string, err error) 
 	if bytes.HasPrefix(key, []byte(pass.Prefix)) {
 		return "", errors.New("that is a keyleash pass, not a provider key")
 	}
+	if recoveryCodeRE.Match(key) {
+		return "", errors.New("that is a keyleash recovery code, not a provider key; copy the key from your provider's console")
+	}
 	for _, c := range key {
 		if c <= ' ' || c >= 0x7f {
 			return "", errors.New("the key contains spaces, control or non-ASCII characters; paste only the key")

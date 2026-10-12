@@ -442,6 +442,7 @@ func TestCheckKeyInput(t *testing.T) {
 		{"anthropic", "sk-ant-api03 with spaces", true, false},
 		{"anthropic", "sk-ant-api03-\x07bell", true, false},
 		{"anthropic", "klp_ABCDEFGHIJ_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG", true, false},
+		{"anthropic", fakeRecovery, true, false},
 	}
 	for _, tt := range tests {
 		warn, err := checkKeyInput(tt.prov, []byte(tt.key))

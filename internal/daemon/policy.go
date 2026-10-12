@@ -504,6 +504,8 @@ func (t *ticket) Finish(o proxy.Outcome) {
 			}
 			if o.UsageOK && ok && c >= 0 {
 				cost = c
+			} else if upstreamRefused(o) {
+				cost = 0 // refused upstream before any work: providers bill nothing
 			} else {
 				cost, estimated = t.res.Amount(), true
 			}
@@ -521,6 +523,17 @@ func (t *ticket) Finish(o proxy.Outcome) {
 	if err := d.passes.Touch(t.a.Principal.PassID, d.clk.Now()); err != nil {
 		d.log.Warn("pass touch", "err", err)
 	}
+}
+
+// upstreamRefused reports whether the provider itself answered with an error
+// that is never billed: any 4xx (bad key, bad request, rate limit) or 529
+// (overloaded). Other 5xx keep the reservation, since a gateway error can
+// follow work that was already done (spec §7.3).
+func upstreamRefused(o proxy.Outcome) bool {
+	if o.UpstreamErr != nil || o.UsageOK {
+		return false
+	}
+	return (o.Status >= 400 && o.Status < 500) || o.Status == 529
 }
 
 // auditRequest writes the spec §11 "request" record.

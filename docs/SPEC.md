@@ -334,7 +334,11 @@ Windows per limit: `request`, `minute`, `hour` (rolling), `day`, `month`
    actual cost.
 4. If usage cannot be determined (stream cut, unknown format), the reservation
    is settled **at the reserved amount** and marked `estimated`. Fail-safe:
-   uncertainty costs budget, never the reverse.
+   uncertainty costs budget, never the reverse. The exception is a complete
+   upstream error response that providers never bill: any `4xx` (bad key,
+   invalid request, rate limit) or `529` (overloaded) settles at $0. Other
+   `5xx` keep the reservation, since a gateway error can follow work that was
+   already done.
 5. A model without a price (§7.5) is reserved at the provider's **most
    expensive** input and output rates (largest tier and regional multipliers)
    for the same token bounds, and settled at those maximum rates for the

@@ -726,3 +726,25 @@ func TestAuditTamperAndConfigChangeTrip(t *testing.T) {
 	e.restart()
 	e.unlock() // accepted: no trip
 }
+
+// A provider that refuses the request (bad key) bills nothing, so the
+// reservation settles at $0 instead of being charged as unknown usage.
+func TestUpstreamRefusalCostsNothing(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	if err := e.withOwner(func(ctx context.Context) error {
+		_, err := e.c.AddKey(ctx, "anthropic", "wrong", []byte("sk-ant-api03-not-the-right-key-0123456789"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 401, "")
+	rec := lastRequestRecord(t, e)
+	if rec["status"] != float64(401) || rec["cost_micros"] != float64(0) || rec["estimated"] == true {
+		t.Fatalf("refused request record: %v", rec)
+	}
+	if got, _ := limitSettled(e.status(), "global", "session"); got != 0 {
+		t.Fatalf("session spend after a refused request = %s", got)
+	}
+}
