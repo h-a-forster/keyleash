@@ -117,7 +117,7 @@ For each provider the pass covers, the command gets:
 | `KEYLEASH_<PROVIDER>_BASE_URL` | same as the base URL, for tools that need it set by hand |
 | `KEYLEASH_PROXY`, `KEYLEASH_PASS_ID` | proxy root and the pass id |
 
-Variables that would bypass the pass are removed (`ANTHROPIC_AUTH_TOKEN`,
+Variables that would bypass the pass are removed (`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `OPENAI_API_BASE`, `GOOGLE_API_KEY`). If an outbound proxy (`HTTPS_PROXY`…)
 is set, loopback is added to `NO_PROXY`.
 

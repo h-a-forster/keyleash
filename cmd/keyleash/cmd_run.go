@@ -41,7 +41,7 @@ For each allowed provider the child gets its base-URL variable (e.g.
 ANTHROPIC_BASE_URL=http://127.0.0.1:47114/anthropic,
 OPENAI_BASE_URL=http://127.0.0.1:47114/openai/v1), KEYLEASH_<NAME>_BASE_URL,
 and the API-key variable set to the pass. Conflicting credentials such as
-ANTHROPIC_AUTH_TOKEN are removed. By default the pass covers the providers
+ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN are removed. By default the pass covers the providers
 you stored keys for that have a standard base-URL variable (anthropic,
 openai); name others with --providers.
 

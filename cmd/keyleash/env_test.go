@@ -39,7 +39,7 @@ func TestBuildEnvPlanPerProvider(t *testing.T) {
 				"KEYLEASH_PROXY":              "http://127.0.0.1:47114",
 				"KEYLEASH_PASS_ID":            "p1",
 			},
-			unset: []string{"ANTHROPIC_AUTH_TOKEN"},
+			unset: []string{"ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"},
 		},
 		{
 			provider: "openai",

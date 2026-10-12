@@ -17,9 +17,10 @@ import (
 // CLI bypass the pass (another credential that takes precedence, or a
 // legacy base-URL variable). They are removed from a child's environment.
 var conflictingEnv = map[string][]string{
-	// Claude Code sends ANTHROPIC_AUTH_TOKEN as a bearer token in
-	// preference to ANTHROPIC_API_KEY.
-	"anthropic": {"ANTHROPIC_AUTH_TOKEN"},
+	// Claude Code sends ANTHROPIC_AUTH_TOKEN, or a CLAUDE_CODE_OAUTH_TOKEN
+	// subscription token, as a bearer token in preference to
+	// ANTHROPIC_API_KEY.
+	"anthropic": {"ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"},
 	// openai-python < 1.0 reads its base URL from OPENAI_API_BASE.
 	"openai": {"OPENAI_API_BASE"},
 	// google-genai prefers GOOGLE_API_KEY over GEMINI_API_KEY.
