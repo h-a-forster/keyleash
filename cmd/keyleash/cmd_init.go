@@ -424,17 +424,33 @@ func (a *app) firstKey(ctx context.Context, dir, slot string, pw []byte) error {
 	if _, err := c.Unlock(ctx, method, pw); err != nil {
 		return err
 	}
-	fmt.Fprint(a.stderr, "Provider ("+strings.Join(provider.Names(), ", ")+") [anthropic]: ")
-	line, err := readLineBounded(a.stdin)
-	if err != nil {
-		return err
-	}
-	name := strings.ToLower(strings.TrimSpace(string(line)))
-	if name == "" {
-		name = "anthropic"
-	}
-	if _, ok := provider.Get(name); !ok {
-		return fmt.Errorf("unknown provider %q; add a key later with: keyleash add <provider>", sanitizeArg(name))
+	// The provider name is read in the clear, so a pasted secret (the
+	// recovery code or an API key still on the clipboard) is never echoed
+	// back; unknown input re-prompts with a hint instead of aborting.
+	var name string
+	for try := 0; ; try++ {
+		fmt.Fprint(a.stderr, "Provider ("+strings.Join(provider.Names(), ", ")+") [anthropic]: ")
+		line, err := readLineBounded(a.stdin)
+		if err != nil {
+			return err
+		}
+		raw := strings.TrimSpace(string(line))
+		secmem.Wipe(line)
+		name = strings.ToLower(raw)
+		if name == "" {
+			name = "anthropic"
+		}
+		if _, ok := provider.Get(name); ok {
+			break
+		}
+		if looksLikeSecret(raw) || len(raw) > 32 {
+			fmt.Fprintln(a.stderr, "That looks like a key or recovery code, not a provider name. It was not stored; clear your terminal scrollback.")
+		} else {
+			fmt.Fprintln(a.stderr, "Unknown provider; type one of the names above.")
+		}
+		if try == 2 {
+			return errors.New("no provider chosen; add a key later with: keyleash add <provider>")
+		}
 	}
 	if err := a.addKey(ctx, c, name, "default", false); err != nil {
 		return err
