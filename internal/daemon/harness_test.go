@@ -607,6 +607,23 @@ func (e *env) assertNoSecrets(extra ...string) {
 	}
 }
 
+// tripBySpend sends one request that settles over a tiny tripwire threshold
+// (the tripwire counts settled spend only), then waits until the next
+// request is refused as tripped.
+func (e *env) tripBySpend(tok string) {
+	e.t.Helper()
+	wantReason(e.t, e.anthropic(tok), 200, "")
+	for i := 0; i < 100; i++ {
+		r := e.anthropic(tok)
+		if r.status == 423 {
+			wantReason(e.t, r, 423, proxy.ReasonTripped)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.t.Fatal("tripwire did not fire after settled spend")
+}
+
 func wantReason(t *testing.T, r result, status int, reason string) {
 	t.Helper()
 	if r.status != status || r.reason != reason {

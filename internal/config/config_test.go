@@ -29,7 +29,7 @@ func TestMissingFileIsRecommended(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Profile != "recommended" || c.Limits.Global.Day.Micros != 20*money.Dollar {
+	if c.Profile != "recommended" || c.Limits.Global.Day.Micros != 30*money.Dollar {
 		t.Errorf("unexpected defaults: %+v", c.Limits.Global)
 	}
 }
@@ -124,7 +124,7 @@ func TestDiffAndHash(t *testing.T) {
 	}
 	want := []string{
 		"approval.method: hello -> passphrase",
-		"limits.global.day: $20.00 -> $200.00",
+		"limits.global.day: $30.00 -> $200.00",
 		"models.deny: (unset) -> [*opus*]",
 	}
 	if strings.Join(d, "\n") != strings.Join(want, "\n") {

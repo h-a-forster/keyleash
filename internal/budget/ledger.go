@@ -191,8 +191,8 @@ func (l *Ledger) SetConcurrency(scope string, n int) {
 }
 
 // SetTripwire configures the velocity tripwire: when settled spend in the
-// rolling window plus all in-flight reservations would exceed threshold, the
-// ledger trips. onTrip (may be nil) is called once per trip, outside the
+// rolling window exceeds threshold, the ledger trips. In-flight reservations
+// do not count (they are worst cases, not spend). onTrip (may be nil) is called once per trip, outside the
 // ledger's lock, with the amount that tripped it. A window or threshold of 0
 // disables the tripwire.
 func (l *Ledger) SetTripwire(window time.Duration, threshold money.Micros, onTrip func(spent money.Micros)) {
@@ -304,10 +304,10 @@ func (l *Ledger) ReserveWith(scopes []string, amount money.Micros, meta Meta, op
 			}
 		}
 		if l.trip != nil {
-			total := addSat(addSat(l.trip.settled(now, l.loc), l.reservedLocked("")), amount)
-			if total > l.tripThreshold {
-				// Fail closed: the request that would cross the threshold is
-				// refused, and the ledger trips.
+			// Settled spend only: a worst-case reservation is not spend, and
+			// counting it would trip on two ordinary concurrent requests.
+			// The window limits above already bound what is in flight.
+			if total := l.trip.settled(now, l.loc); total > l.tripThreshold {
 				l.tripped = true
 				fire, fired = l.onTrip, total
 				return ErrTripped
@@ -384,8 +384,7 @@ func (r *Reservation) Settle(actual money.Micros, estimated bool) error {
 		}
 		if l.trip != nil {
 			l.trip.addLive(c, now, l.loc)
-			total := addSat(l.trip.sum, l.reservedLocked(""))
-			if !l.tripped && total > l.tripThreshold {
+			if total := l.trip.sum; !l.tripped && total > l.tripThreshold {
 				l.tripped = true
 				fire, fired = l.onTrip, total
 			}

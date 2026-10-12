@@ -334,15 +334,19 @@ func approvalDenial(ctx context.Context, dec approval.Decision, err error) *prox
 
 func exceededMessage(ex *budget.ExceededError) string {
 	if ex.Window == budget.WindowRequest {
-		return fmt.Sprintf("keyleash spend limit: this request could cost up to %s, over the %s per-request limit of %s",
+		return fmt.Sprintf("keyleash spend limit: this request could cost up to %s (worst case: its full max_tokens of output), over the %s per-request limit of %s; raise it in config.toml or with run --budget",
 			ex.Requested, ex.Scope, ex.Limit)
 	}
 	remaining := ex.Limit - ex.Spent - ex.Reserved
 	if remaining < 0 {
 		remaining = 0
 	}
-	return fmt.Sprintf("keyleash spend limit reached: %s %s limit %s, remaining %s, this request needs up to %s",
+	msg := fmt.Sprintf("keyleash spend limit reached: %s %s limit %s, remaining %s, this request needs up to %s",
 		ex.Scope, ex.Window, ex.Limit, remaining, ex.Requested)
+	if ex.Reserved > 0 {
+		msg += fmt.Sprintf(" (%s is held by in-flight requests until they finish)", ex.Reserved)
+	}
+	return msg
 }
 
 // modelDenied applies config allow/deny globs, then the pass's model scope.

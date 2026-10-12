@@ -206,7 +206,7 @@ func Default(profile string) (*Config, error) {
 	c.Presence.Poll = Duration{5 * time.Second}
 
 	c.Limits.Global = Limits{
-		Request: amt("$2"), Session: amt("$10"), Day: amt("$20"), Month: amt("$200"),
+		Request: amt("$5"), Session: amt("$20"), Day: amt("$30"), Month: amt("$200"),
 		Concurrency: 8,
 	}
 	c.Limits.Provider = map[string]Limits{}

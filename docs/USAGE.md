@@ -224,9 +224,9 @@ Limits apply in every scope listed at once; the tightest one wins.
 
 | Setting | recommended | strict | relaxed |
 |---|---|---|---|
-| Per request | $2 | $1 | $10 |
-| Per session (resets on unlock) | $10 | $5 | $50 |
-| Per day | $20 | $10 | $100 |
+| Per request | $5 | $1 | $10 |
+| Per session (resets on unlock) | $20 | $5 | $50 |
+| Per day | $30 | $10 | $100 |
 | Per month | $200 | $100 | $1000 |
 | Parallel requests (global / per pass) | 8 / 4 | 4 / 2 | 16 / 8 |
 | Away: total budget / parallel requests | $3 / 2 | $1 / 1 | $20 / 4 |
@@ -236,7 +236,7 @@ Limits apply in every scope listed at once; the tightest one wins.
 | Screen lock | away | lock | away |
 | Away before locking | 2 h | 30 min | 8 h |
 | Unlock lease | 12 h | 8 h | 24 h |
-| Velocity tripwire | $5 in 5 min | $2 in 5 min | $25 in 5 min |
+| Velocity tripwire (settled spend) | $5 in 5 min | $2 in 5 min | $25 in 5 min |
 | Over a limit | deny | ask (step-up) | deny |
 | Unknown model | ask (step-up) | deny | ask (step-up) |
 | Named pass lifetime (run passes) | 24 h (12 h) | 8 h (12 h) | 7 d (12 h) |

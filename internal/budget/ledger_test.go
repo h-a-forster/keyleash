@@ -546,6 +546,12 @@ func TestTripwire(t *testing.T) {
 	if l.Tripped() {
 		t.Fatal("tripped at exactly the threshold")
 	}
+	// In-flight reservations are worst cases, not spend: they never trip.
+	big := reserve(t, l, nil, 5*money.Dollar, Meta{})
+	if l.Tripped() || fired.Load() != 0 {
+		t.Fatal("a reservation tripped the wire")
+	}
+	settle(t, big, 1) // $1 + 1 micro settled: over
 	if _, err := l.Reserve(nil, 1, Meta{}); !errors.Is(err, ErrTripped) {
 		t.Fatalf("want ErrTripped, got %v", err)
 	}

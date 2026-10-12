@@ -356,9 +356,13 @@ worst case until they settle.
 ### 7.4 Concurrency and velocity
 
 - Concurrency limiter per scope (default global 8, per pass 4).
-- **Velocity tripwire**: if settled+reserved spend in a rolling window exceeds a
+- **Velocity tripwire**: if settled spend in a rolling window exceeds a
   threshold (default $5 in 5 minutes), the daemon enters `Tripped`: new requests
-  are rejected and in-flight streams may finish. Leaving `Tripped` requires
+  are rejected and in-flight streams may finish. In-flight reservations do not
+  count: they are worst cases (an agent request on a frontier model can
+  reserve several dollars and settle at a few cents), and counting them would
+  trip on ordinary parallel requests. The window limits already bound what is
+  in flight. Leaving `Tripped` requires
   step-up approval.
 
 ### 7.5 Models and endpoints
@@ -711,9 +715,9 @@ away_max = "2h"
 max_lease = "12h"
 
 [limits.global]
-request = "$2"
-session = "$10"
-day = "$20"
+request = "$5"
+session = "$20"
+day = "$30"
 month = "$200"
 concurrency = 8
 

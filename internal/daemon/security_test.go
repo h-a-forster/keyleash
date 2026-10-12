@@ -468,8 +468,8 @@ func TestUnpricedWorstCase(t *testing.T) {
 	if r := e.post("anthropic", "/v1/messages", tok, ub); r.status != 200 {
 		t.Fatalf("approved unbounded request: %d %s", r.status, r.body)
 	}
-	if rec := lastRequestRecord(t, e); rec["reserved_micros"] != float64(2*money.Dollar) {
-		t.Fatalf("unbounded reservation = %v, want the $2 request limit", rec["reserved_micros"])
+	if rec := lastRequestRecord(t, e); rec["reserved_micros"] != float64(5*money.Dollar) {
+		t.Fatalf("unbounded reservation = %v, want the $5 request limit", rec["reserved_micros"])
 	}
 
 	n := newEnv(t, func(c *config.Config) { c.Limits.Global.Request = nil })

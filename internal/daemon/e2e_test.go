@@ -385,7 +385,7 @@ func TestTripwireAndResume(t *testing.T) {
 	e.unlock()
 	e.addKeys()
 	tok := e.newPass(client.PassCreateRequest{})
-	wantReason(t, e.anthropic(tok), 423, proxy.ReasonTripped)
+	e.tripBySpend(tok)
 	s := e.status()
 	if s.State != client.StateTripped || s.TripReason != TripVelocity {
 		t.Fatalf("state = %s (%s)", s.State, s.TripReason)
@@ -515,7 +515,7 @@ func TestStateFileTamperTrips(t *testing.T) {
 	e.unlock() // fatals unless Unlocked
 	e.stop()
 	// Deleting state.json and the whole ledger (to reset spend) is detected:
-	// the checkpoint lives in the vault (spec §7.7).
+	// the checkpoint lives in the vault (spec Â§7.7).
 	os.Remove(filepath.Join(e.dir, StateFile))
 	if err := os.RemoveAll(filepath.Join(e.dir, LedgerDir)); err != nil {
 		t.Fatal(err)
@@ -713,7 +713,7 @@ func TestExternalApprovalViaAdmin(t *testing.T) {
 	e.unlock()
 	e.addKeys()
 	tok := e.newPass(client.PassCreateRequest{})
-	wantReason(t, e.anthropic(tok), 423, proxy.ReasonTripped)
+	e.tripBySpend(tok)
 	done := make(chan error, 1)
 	go func() { _, err := e.c.Resume(e.ctx()); done <- err }()
 	var pending []client.Approval
@@ -724,7 +724,7 @@ func TestExternalApprovalViaAdmin(t *testing.T) {
 	if len(pending) != 1 || pending[0].Kind != "resume" {
 		t.Fatalf("pending = %+v", pending)
 	}
-	// Access to the admin channel alone never approves (spec §9).
+	// Access to the admin channel alone never approves (spec Â§9).
 	if err := e.c.Decide(e.ctx(), pending[0].ID, client.DecideRequest{Approved: true}); !isAPI(err, 403, client.CodeForbidden) {
 		t.Fatalf("approve without secret: %v", err)
 	}
@@ -750,7 +750,7 @@ func TestRecoveryCodeApprovesAndDenyNeedsNothing(t *testing.T) {
 	e.unlock()
 	e.addKeys()
 	tok := e.newPass(client.PassCreateRequest{})
-	wantReason(t, e.anthropic(tok), 423, proxy.ReasonTripped)
+	e.tripBySpend(tok)
 	first := make(chan error, 1)
 	go func() { _, err := e.c.Resume(e.ctx()); first <- err }()
 	id := e.waitPending("resume")
