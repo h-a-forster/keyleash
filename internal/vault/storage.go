@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -117,6 +118,39 @@ func writeTemp(dir string, data []byte) (name string, err error) {
 		return "", fmt.Errorf("vault: close: %w", err)
 	}
 	return name, nil
+}
+
+// scrubStalePrev replaces path's .prev with a copy of the live state f when
+// .prev parses but does not authenticate under the live dek: a copy left
+// under an older DEK by a re-key that crashed between its two renames (or
+// whose scrub failed), which the slots that re-key removed (an old recovery
+// code, a removed slot) would still open. found reports such a .prev; err
+// is errPrevNotScrubbed if it could be neither replaced nor removed. A
+// missing or unparsable .prev opens with nothing and is left alone.
+func scrubStalePrev(path string, f *fileV1, dek []byte) (found bool, err error) {
+	pf, rerr := readFile(PrevPath(path))
+	if rerr != nil {
+		return false, nil
+	}
+	if ok, verr := verifyHeaderMAC(dek, pf); verr == nil && ok {
+		return false, nil
+	}
+	data, merr := json.MarshalIndent(f, "", "  ")
+	if merr == nil {
+		var tmp string
+		if tmp, merr = writeTemp(filepath.Dir(path), append(data, '\n')); merr == nil {
+			if merr = os.Rename(tmp, PrevPath(path)); merr != nil {
+				_ = os.Remove(tmp)
+			}
+		}
+	}
+	if merr != nil {
+		if rerr := os.Remove(PrevPath(path)); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			return true, errPrevNotScrubbed
+		}
+	}
+	_ = syncDir(filepath.Dir(path))
+	return true, nil
 }
 
 // writeAtomic replaces path with data: write a temp file in the same

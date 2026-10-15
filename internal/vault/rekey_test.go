@@ -310,6 +310,32 @@ func TestRotateRecoveryCrashAndRollback(t *testing.T) {
 			if got := mustSecret(t, x, x.Entries()[0].ID); !bytes.Equal(got, testSecret) {
 				t.Fatal("secret mismatch")
 			}
+			// That unlock replaced the stale .prev (old DEK, old code) with
+			// a copy of the live state, and reports it once.
+			if found, err := x.TakeStalePrev(); !found || err != nil {
+				t.Fatalf("stale .prev not scrubbed: found=%v err=%v", found, err)
+			}
+			if found, _ := x.TakeStalePrev(); found {
+				t.Fatal("stale .prev reported twice")
+			}
+			prev := readBytes(t, PrevPath(path))
+			if bytes.Equal(prev, before.prev) {
+				t.Fatal(".prev still holds the pre-rotation state")
+			}
+			if err := openCopy(t, prev).UnlockRecovery(oldCode); !errors.Is(err, ErrWrongSecret) {
+				t.Fatalf("old code on .prev = %v", err)
+			}
+			if err := openCopy(t, prev).UnlockRecovery(newCode); err != nil {
+				t.Fatalf("new code on .prev = %v", err)
+			}
+			// A .prev under the live DEK is left alone.
+			x.Lock()
+			if err := x.UnlockRecovery(newCode); err != nil {
+				t.Fatal(err)
+			}
+			if found, _ := x.TakeStalePrev(); found {
+				t.Fatal("current .prev reported as stale")
+			}
 		})
 		t.Run("main lost after the rotation", func(t *testing.T) {
 			// .prev was replaced with the new state: falling back to it is

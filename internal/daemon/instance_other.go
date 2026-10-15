@@ -27,3 +27,24 @@ func acquireInstanceLock(path string) (io.Closer, error) {
 	}
 	return f, nil
 }
+
+// instanceLockHeld reports whether a daemon holds the instance lock at path
+// (its exclusive flock makes a shared, non-blocking one fail).
+func instanceLockHeld(path string) (bool, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return true, nil
+		}
+		return false, err
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return false, nil
+}

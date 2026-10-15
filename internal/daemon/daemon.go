@@ -199,6 +199,10 @@ type Daemon struct {
 	// unlockMu serialises slow vault operations (unlock, re-key).
 	unlockMu sync.Mutex
 
+	// testBeforeRekey, set only by tests, runs in rekey under unlockMu
+	// just before the caller-gone check.
+	testBeforeRekey func(ctx context.Context)
+
 	// auditMu guards the audit health flag.
 	auditMu     sync.Mutex
 	auditBroken bool
@@ -541,6 +545,15 @@ func (d *Daemon) fatal(err error) {
 	case d.fatalCh <- err:
 	default:
 	}
+}
+
+// Running reports whether a daemon holds the instance lock of dataDir. The
+// lock is released last in Close, after the ledger, state, audit and vault
+// are saved and closed, so false means a stopping daemon has finished.
+// (The check briefly opens the lock file; a daemon starting at that very
+// moment may fail with "already running".)
+func Running(dataDir string) (bool, error) {
+	return instanceLockHeld(filepath.Join(dataDir, InstanceLock))
 }
 
 // Done returns a channel that receives a fatal server error, if any.

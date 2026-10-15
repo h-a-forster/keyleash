@@ -113,7 +113,9 @@ does: it stops accepting proxy connections, lets in-flight requests finish
 (up to 30 s; any still running are charged at their reserved amount), saves
 the ledger checkpoint, locks the vault and exits. With [run]
 kill_on_daemon_exit (the default) processes started by 'keyleash run' end
-too. The request is recorded in the audit log.
+too. The request is recorded in the audit log. The command waits until
+the daemon has finished shutting down (it has released its instance lock,
+the last step) and reports an error if that takes longer than 45 s.
 
 No step-up is needed: stopping only takes keyleash offline. It is refused
 from inside a 'keyleash run' session (use 'keyleash lock' or 'keyleash
@@ -143,20 +145,36 @@ func runStop(ctx context.Context, a *app, args []string) error {
 		return err
 	}
 	fmt.Fprintln(a.stderr, "Stopping the keyleash daemon (in-flight requests may take up to 30 s)...")
+	// The daemon closes its admin channel early in its shutdown and
+	// releases the instance lock last, after saving the ledger and state,
+	// locking the vault and ending run sessions: wait for both.
+	dir, err := a.dataDir()
+	if err != nil {
+		return err
+	}
 	deadline := time.Now().Add(stopWait)
+	adminGone := false
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return errInterrupted
 		case <-time.After(stopPoll):
 		}
-		qctx, qcancel := context.WithTimeout(ctx, 2*time.Second)
-		_, serr := c.Status(qctx)
-		qcancel()
-		if serr != nil && errors.Is(friendly(serr), errDaemonDown) {
-			fmt.Fprintln(a.stdout, "keyleash daemon stopped.")
-			return nil
+		if !adminGone {
+			qctx, qcancel := context.WithTimeout(ctx, 2*time.Second)
+			_, serr := c.Status(qctx)
+			qcancel()
+			adminGone = serr != nil && errors.Is(friendly(serr), errDaemonDown)
 		}
+		if adminGone {
+			if running, rerr := daemon.Running(dir); rerr == nil && !running {
+				fmt.Fprintln(a.stdout, "keyleash daemon stopped.")
+				return nil
+			}
+		}
+	}
+	if adminGone {
+		return errors.New("the daemon stopped answering but has not finished shutting down (it still holds its instance lock); check its log")
 	}
 	return errors.New("the daemon accepted the stop request but is still answering; check its log or `keyleash status`")
 }

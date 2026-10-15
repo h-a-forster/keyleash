@@ -243,8 +243,11 @@ func (d *Daemon) hPanic(w http.ResponseWriter, r *http.Request) {
 // vault and ends every pass's use until the daemon runs again, so it needs
 // no step-up (spec §9 reserves those for calls that weaken protection or
 // spend more), but unlike lock and panic it is not open to every caller:
-// the guard refuses confined and unidentified callers (spec §12), so an
-// agent under a run pass cannot end its own confinement this way. The
+// the guard refuses confined and unidentified callers (spec §12). That is
+// defence in depth, not a boundary: the daemon runs as the owner's user
+// with no restrictive process DACL, so a confined process can simply kill
+// it (which also locks the vault and spends nothing); the refusal only
+// keeps such a stop from passing as an orderly, owner-requested one. The
 // request is audited with the caller; the shutdown itself (docs/DAEMON.md
 // "Shutdown") runs after the response is sent.
 func (d *Daemon) hShutdown(w http.ResponseWriter, r *http.Request) {
@@ -1224,6 +1227,12 @@ func (d *Daemon) hConfig(w http.ResponseWriter, _ *http.Request) {
 // ---- vault administration --------------------------------------------------
 
 func (d *Daemon) hRotateRecovery(w http.ResponseWriter, r *http.Request) {
+	// Reading the (empty) body to EOF also lets net/http notice a caller
+	// that disconnects, which cancels r.Context(); rekey checks it.
+	if err := readBody(r, &struct{}{}); err != nil {
+		d.writeErr(w, err)
+		return
+	}
 	if !d.vault.IsUnlocked() {
 		d.writeErr(w, statusErr(423, client.CodeLocked, "keyleash is locked"))
 		return
@@ -1234,7 +1243,7 @@ func (d *Daemon) hRotateRecovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var code string
-	err := d.rekey("rotate_recovery", func() error {
+	err := d.rekey(r.Context(), "rotate_recovery", func() error {
 		var rerr error
 		code, rerr = d.vault.RotateRecovery()
 		return rerr
@@ -1268,7 +1277,7 @@ func (d *Daemon) hRemoveSlot(w http.ResponseWriter, r *http.Request) {
 		d.writeErr(w, err)
 		return
 	}
-	err := d.rekey("remove_slot", func() error { return d.vault.RemoveSlot(id) })
+	err := d.rekey(r.Context(), "remove_slot", func() error { return d.vault.RemoveSlot(id) })
 	switch {
 	case err == nil, errors.Is(err, vault.ErrPrevNotScrubbed):
 		writeJSON(w, 200, struct{}{})

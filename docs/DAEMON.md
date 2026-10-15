@@ -59,7 +59,7 @@ transitions are audited.
 
 | Event | From | To | Side effects |
 |---|---|---|---|
-| unlock (slot verified) | Locked | Unlocked | new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit |
+| unlock (slot verified) | Locked | Unlocked | a `vault.prev` left under an older DEK by an interrupted re-key is replaced (audit `prev_scrub` {ok}, spec §5.4); new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit |
 | presence Idle ≥ idle_after | Unlocked | Away | `ResetSession("away")`; away timer starts |
 | presence ScreenLocked | Unlocked | Away or Locked | per `presence.screen_lock` |
 | presence Active | Away | Unlocked | |
@@ -236,7 +236,7 @@ There is no rollback-arming endpoint (the former `POST
 `accept_rollback` flag of the unlock request.
 | GET | /v1/audit/tail | ?n= |
 | GET | /v1/config | effective config (TOML) |
-| POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` / `slot_change` {op: rotate_recovery}, never the code |
+| POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` / `slot_change` {op: rotate_recovery}, never the code. Not committed if the caller has disconnected by the time the step-up is decided (audit `rekey` {ok: false, reason: caller_gone}); the CLI checks the audit log when it gets no answer |
 | DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key |
 
 Secrets travel only in request bodies over the ACL-protected channel and are
@@ -254,4 +254,7 @@ its reserved amount (`ExpireInFlight(-1)`, while the ledger MAC key is set),
 flush the ledger, write the checkpoint to the vault and state.json, audit
 `lock` and anchor; then `ledger.Close`, `audit.Close`,
 `passes.SetMACKey(nil)`, `vault.Lock`; close the run jobs (members end with
-kill-on-close); remove the socket; release the instance lock.
+kill-on-close); remove the socket; release the instance lock. The admin
+server is shut down before all this, so `keyleash stop` waits for the
+instance lock to be free (`daemon.Running`) before reporting the daemon
+stopped.

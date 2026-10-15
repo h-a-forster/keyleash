@@ -68,8 +68,10 @@ Residual risk is stated plainly in the README. Specifically:
   stopped. Keeping a copy of the anti-rollback record outside the data
   directory (e.g. a TPM NV counter) is a later phase.
 - **Confinement is OS-dependent** (§12): on Windows a run pass's process tree
-  is held in a job object it cannot leave; elsewhere it rests on the
-  parent-process chain, which a process can escape by daemonising.
+  is held in a job object it cannot leave. On Linux, macOS and the BSDs
+  process binding is not implemented yet, so run passes cannot be created
+  there and nothing is confined; once it is, confinement there will rest on
+  the parent-process chain, which a process can escape by daemonising.
 - **Revocations made while locked** are kept outside the authenticated pass
   store (§6) until the next unlock; deleting them before that un-revokes
   those passes (a pass still cannot be used while locked).
@@ -205,7 +207,14 @@ reveals nothing useful without the vault.
   the vault, this detects accidents and naive restores, not an attacker who
   can replace both files.
 - After a re-key, `vault.prev` is replaced with a copy of the new state so the
-  old DEK does not linger next to the vault. Backups taken before a slot
+  old DEK does not linger next to the vault. The main file is renamed first
+  and the copy right after; a crash between the two renames (or a copy that
+  could be neither renamed nor removed) leaves `vault.prev` under the old
+  DEK. Every successful unlock therefore checks `vault.prev`: if it parses
+  but its header MAC does not verify under the live DEK, it is replaced with
+  a copy of the live state (or removed), and the daemon audits `prev_scrub`
+  {ok}. Until that unlock, the slots the re-key removed (an old recovery
+  code) still open `vault.prev`. Backups taken before a slot
   removal still open with that slot and reveal the entries as they were then;
   rotate provider keys if a slot was compromised.
 
@@ -244,7 +253,8 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   - `bind`: optional process binding (PID + process start time); the pass dies
     when that process exits, and requests whose TCP peer is not that process or
     a descendant are rejected (Windows: `GetExtendedTcpTable` →
-    owning PID → parent chain)
+    owning PID → parent chain). Windows only for now: elsewhere a pass with
+    `bind` is refused (§12, "What is enforced where").
 - Kinds: `named` (created by the owner, e.g. for an editor), `run` (ephemeral,
   created by `keyleash run`, process-bound, revoked on exit), `admin` (none —
   the admin channel uses OS-level access control, not passes).
@@ -258,7 +268,8 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   (members stay confined, §12), and with `[run] kill_on_daemon_exit = true`
   (default) members are terminated when the daemon exits. Run passes left by
   an earlier daemon are revoked at start (their jobs died with it). Other
-  systems have no equivalent: there, binding uses the parent chain only.
+  systems have no equivalent: once binding is implemented there it will use
+  the parent chain only.
 - **Lists.** `providers`, `models`, `deny_models` and `limits` hold at most 32
   entries each; duplicate providers (case-insensitive) or model patterns,
   unknown providers and `*` combined with other providers are refused.
@@ -630,8 +641,9 @@ table, so the audit log answers "which program spent this".
   `approval`, `approval_secret`, `pass_issue`, `pass_revoke`, `request`
   (provider, model, pass, client process, status, tokens, cost, estimated
   flag, latency, deny reason), `limit_change`, `limit_override`, `key_add`,
-  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey`,
-  `panic`, `shutdown` (a stop request: requester PID and image),
+  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey`
+  (`ok: false, reason: caller_gone` when the requester disconnected before
+  the commit), `prev_scrub`, `panic`, `shutdown` (a stop request: requester PID and image),
   `daemon_stop`, `anchor`.
 - After every unlock the daemon verifies the chain **and** the anchors with
   the anchor key; a failure trips the daemon (`audit_integrity`) until the
@@ -667,14 +679,21 @@ table, so the audit log answers "which program spent this".
   step-up, since a stopped daemon locks the vault and spends nothing, but is
   not on that list: stopping also ends confinement (run jobs are closed) and
   the presence and audit machinery, so a confined or unidentified caller
-  gets `403 confined`. It is audited (`shutdown`).
+  gets `403 confined`. This is defence in depth, not a boundary: the daemon
+  runs as the owner's user without a restrictive process DACL, so a
+  confined process can end it directly (e.g. `TerminateProcess`, `kill`),
+  which also locks the vault and spends nothing; the refusal only keeps a
+  stop from looking like an orderly, owner-requested one. It is audited
+  (`shutdown`).
 - **What is enforced where.** On Windows confinement is enforced by job
   objects and holds against a process that daemonises or whose parent exits.
-  On Linux, macOS and the BSDs it relies on the parent chain: process groups
-  and sessions can be left by any process, so a process that detaches from
-  its run pass's tree (double fork, `setsid`) is no longer recognised as
-  confined. Such a process still cannot approve anything (§9); it can only
-  make the calls any unconfined process of the owner's user can make.
+  On Linux, macOS and the BSDs process identity (`internal/procinfo`) is not
+  implemented yet: a pass cannot be bound to a process (a request with
+  `bind_pid` is refused with `400`, never issued unbound), so `run` passes
+  cannot be created, requests are not attributed to a client process, and no
+  caller is confined. When it is implemented there, confinement will rely
+  on the parent chain, which a process can leave by detaching (double fork,
+  `setsid`).
 
 ## 13. CLI (v1)
 

@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -422,8 +427,19 @@ func TestApprovalsApproveNeedsSecret(t *testing.T) {
 	}
 }
 
+// slowJobs makes the daemon's shutdown take a while after its admin
+// channel has closed (Close ends run jobs just before releasing the
+// instance lock).
+type slowJobs struct{}
+
+func (slowJobs) Confine(string, int, int64) error { return nil }
+func (slowJobs) Member(string, int) (bool, error) { return false, nil }
+func (slowJobs) MemberOfAny(int) (bool, error)    { return false, nil }
+func (slowJobs) Sweep(func(string) bool)          {}
+func (slowJobs) Close()                           { time.Sleep(time.Second) }
+
 func TestStopCommand(t *testing.T) {
-	td := startTestDaemon(t, true)
+	td := startTestDaemon(t, true, func(o *daemon.Options) { o.Jobs = slowJobs{} })
 	// The test daemon runs via Start, not Run: close it when asked to stop,
 	// as Run does.
 	go func() {
@@ -433,6 +449,11 @@ func TestStopCommand(t *testing.T) {
 	code, out, errOut := td.run("", "stop")
 	if code != 0 || !strings.Contains(out, "daemon stopped") {
 		t.Fatalf("stop: %d %q %q", code, out, errOut)
+	}
+	// "Stopped" means the shutdown has finished: the instance lock, which
+	// Close releases last, is free.
+	if running, err := daemon.Running(td.dir); err != nil || running {
+		t.Fatalf("stop returned while the daemon still holds its instance lock (running=%v, err=%v)", running, err)
 	}
 	if code, out, _ := td.run("", "stop"); code != 0 || !strings.Contains(out, "not running") {
 		t.Fatalf("stop again: %d %q", code, out)
@@ -516,5 +537,92 @@ func TestRecoveryRotateCommand(t *testing.T) {
 	}
 	if code, _, errOut := td.run(testPassphrase+"\n", "unlock", "--stdin"); code != 0 {
 		t.Fatalf("passphrase unlock after rotation: %d %q", code, errOut)
+	}
+}
+
+// dropRotateConn loses the daemon's answer to POST /v1/vault/recovery: it
+// reads the response (so the rotation has been committed) and then fails,
+// as when the connection drops during the commit.
+type dropRotateConn struct {
+	net.Conn
+	rotate atomic.Bool
+}
+
+func (c *dropRotateConn) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("POST /v1/vault/recovery ")) {
+		c.rotate.Store(true)
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *dropRotateConn) Read(p []byte) (int, error) {
+	// The transport's read loop is already blocked here when the request
+	// is written, so decide once the answer has arrived.
+	n, err := c.Conn.Read(p)
+	if !c.rotate.Load() {
+		return n, err
+	}
+	clear(p[:n])
+	c.Conn.Close()
+	return 0, io.ErrUnexpectedEOF
+}
+
+// A rotation that is committed but whose answer is lost is reported as
+// such: the old code is dead, the new one lost, run rotate again.
+func TestRecoveryRotateLostAnswer(t *testing.T) {
+	td := startTestDaemon(t, true, func(o *daemon.Options) { o.Approver = manualApprover{} })
+	if code, _, errOut := td.run(testPassphrase+"\n", "unlock", "--stdin"); code != 0 {
+		t.Fatalf("unlock: %q", errOut)
+	}
+	c := td.client()
+	defer c.Close()
+	type res struct {
+		code        int
+		out, errOut string
+	}
+	done := make(chan res, 1)
+	go func() {
+		a, out, errb := td.app("")
+		addr := td.adminAddr
+		a.dial = func() (*client.Client, error) {
+			return client.New(func(ctx context.Context) (net.Conn, error) {
+				var d net.Dialer
+				conn, err := d.DialContext(ctx, "tcp", addr)
+				if err != nil {
+					return nil, err
+				}
+				return &dropRotateConn{Conn: conn}, nil
+			}), nil
+		}
+		code := a.main([]string{"recovery", "rotate"})
+		done <- res{code, out.String(), errb.String()}
+	}()
+	var ap client.Approval
+	for i := 0; i < 500 && ap.ID == ""; i++ {
+		if list, _ := c.Approvals(t.Context()); len(list) == 1 {
+			ap = list[0]
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if ap.ID == "" {
+		t.Fatal("no approval")
+	}
+	if code, _, errOut := td.run(td.recovery+"\n", "approvals", "approve", ap.ID, "--stdin"); code != 0 {
+		t.Fatalf("approve: %d %q", code, errOut)
+	}
+	r := <-done
+	if r.code == 0 || !strings.Contains(r.errOut, "WAS rotated") || !strings.Contains(r.errOut, "old recovery code no longer works") ||
+		!strings.Contains(r.errOut, "keyleash recovery rotate` again") {
+		t.Fatalf("lost rotation not reported: %d %q %q", r.code, r.out, r.errOut)
+	}
+	if strings.Contains(r.out, "New recovery code") {
+		t.Fatalf("code printed: %q", r.out)
+	}
+	if code, _, _ := td.run("", "lock"); code != 0 {
+		t.Fatal("lock")
+	}
+	if code, _, errOut := td.run(td.recovery+"\n", "unlock", "--method", "recovery", "--stdin"); code != exitError || !strings.Contains(errOut, "wrong passphrase") {
+		t.Fatalf("old code after a committed rotation: %d %q", code, errOut)
 	}
 }

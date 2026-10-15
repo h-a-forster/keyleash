@@ -245,6 +245,17 @@ func (d *Daemon) unlock(ctx context.Context, method string, secret []byte, accep
 		d.log.Warn("accepted a rolled-back vault file", "file_seq", acc.FileSeq, "recorded_seq", acc.RecordedSeq)
 		d.auditEvent("accept_rollback", map[string]any{"method": method, "file_seq": acc.FileSeq, "recorded_seq": acc.RecordedSeq})
 	}
+	// Every unlock checks vault.prev: one still under an older vault key (a
+	// re-key interrupted between its two renames, or a failed scrub; spec
+	// §5.4) is replaced with a copy of the live state.
+	found, serr := d.vault.TakeStalePrev()
+	d.mu.Lock()
+	d.st.prevNotScrubbed = found && serr != nil
+	d.mu.Unlock()
+	if found {
+		d.log.Warn("vault.prev held an older vault key (interrupted re-key)", "scrubbed", serr == nil)
+		d.auditEvent("prev_scrub", map[string]any{"ok": serr == nil})
+	}
 	return d.afterUnlock(method)
 }
 
@@ -1137,11 +1148,25 @@ func (d *Daemon) saveState() {
 // daemon's integrity keys come from a vault entry (see integrity.go), which
 // a re-key re-seals, so they stay valid; the change is recorded and the chain
 // anchored before and after.
-func (d *Daemon) rekey(op string, fn func() error) error {
+//
+// ctx is the admin request's: if the caller has gone (it disconnected or
+// was interrupted while the step-up was pending or just decided), nothing
+// is committed. Otherwise a rotation could commit with nobody left to
+// receive the new recovery code, leaving the vault with a code no one has.
+// The check is made under unlockMu, right before the commit; a disconnect
+// after that point is detected by the CLI from the audit log.
+func (d *Daemon) rekey(ctx context.Context, op string, fn func() error) error {
 	d.unlockMu.Lock()
 	defer d.unlockMu.Unlock()
 	if !d.vault.IsUnlocked() {
 		return statusErr(423, client.CodeLocked, "vault is locked")
+	}
+	if d.testBeforeRekey != nil {
+		d.testBeforeRekey(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		d.auditEvent("rekey", map[string]any{"op": op, "ok": false, "reason": "caller_gone"})
+		return err
 	}
 	d.anchor()
 	err := fn()

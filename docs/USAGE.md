@@ -167,10 +167,10 @@ that its processes cannot leave: a process the agent starts stays confined
 stays confined after the run ends until it exits. When the daemon exits,
 the run's processes are ended too (`[run] kill_on_daemon_exit = true`; set
 it to `false` to let them keep running without keyleash). Restarting the
-daemon ends earlier `keyleash run` passes. On Linux and macOS keyleash can
-only follow the parent-process chain, which a process can leave by
-detaching (double fork, `setsid`); such a process is no longer recognised
-as part of the run. It still cannot approve anything.
+daemon ends earlier `keyleash run` passes. On Linux, macOS and the BSDs
+keyleash cannot identify processes yet: passes there are not bound to a
+process, `keyleash run` passes cannot be created, and no caller is treated
+as confined.
 
 The agent still runs as you and can read your files; a `--isolate` mode
 that runs it under a restricted account is planned, not available.
@@ -361,17 +361,27 @@ revocation is not implemented yet.
 in its terminal: in-flight requests get up to 30 s (any still running are
 charged at their reserved amount), spend is saved, the vault locks, and
 with `[run] kill_on_daemon_exit` (default) programs started by `keyleash
-run` end. It needs no step-up (a stopped daemon spends nothing) but is
-refused from inside `keyleash run`; use lock or panic there. The request is
+run` end. The command returns once the daemon has finished shutting down
+(it releases its instance lock last). It needs no step-up (a stopped daemon
+spends nothing) but is refused from inside `keyleash run`; use lock or
+panic there. That refusal is defence in depth, not a boundary: a program
+running as your user can end the daemon process directly. The request is
 in the audit log.
 
 **Rotating the recovery code.** `keyleash recovery rotate` (unlocked,
 step-up: Hello, your passphrase or the current recovery code) prints a new
 code once, like `init`, and asks you to re-type its last group. The vault
 gets a new data key, so the old code opens neither `vault.json` nor
-`vault.prev`. Backups of the vault file made before the rotation still open
-with the old code and show the keys as they were then; rotate provider keys
-if the old code may have leaked.
+`vault.prev` (if keyleash is killed in the middle of the rotation,
+`vault.prev` can keep the old key until the next unlock, which replaces it
+and records `prev_scrub` in the audit log). Backups of the vault file made
+before the rotation still open with the old code and show the keys as they
+were then; rotate provider keys if the old code may have leaked.
+Interrupting the command while it waits for approval cancels the rotation.
+If the connection is lost while the rotation is being committed, the
+command checks the audit log and tells you whether it happened; if it did,
+the old code no longer works and the new one is lost, so run `keyleash
+recovery rotate` again.
 
 **Audit.** Every decision is in a hash-chained log. `keyleash audit tail`
 shows recent records (passes by id, keys by fingerprint, never secrets);
