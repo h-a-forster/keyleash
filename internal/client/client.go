@@ -182,6 +182,13 @@ func (c *Client) Lock(ctx context.Context) (Status, error) {
 	return s, err
 }
 
+// Shutdown asks the daemon to stop gracefully. It returns once the daemon
+// has accepted the request; the shutdown itself continues after that.
+func (c *Client) Shutdown(ctx context.Context) error {
+	var r ShutdownResponse
+	return c.do(ctx, http.MethodPost, "/v1/shutdown", nil, struct{}{}, &r)
+}
+
 // Panic locks the daemon and revokes every pass.
 func (c *Client) Panic(ctx context.Context, revokeUpstream bool) (PanicSummary, error) {
 	var s PanicSummary

@@ -41,6 +41,7 @@ func (d *Daemon) adminHandler() http.Handler {
 	mux.HandleFunc("POST /v1/unlock", d.hUnlock)
 	mux.HandleFunc("POST /v1/lock", d.hLock)
 	mux.HandleFunc("POST /v1/panic", d.hPanic)
+	mux.HandleFunc("POST /v1/shutdown", d.hShutdown)
 	mux.HandleFunc("POST /v1/away", d.hAway)
 	mux.HandleFunc("POST /v1/resume", d.hResume)
 	mux.HandleFunc("GET /v1/passes", d.hPassList)
@@ -236,6 +237,29 @@ func (d *Daemon) hPanic(w http.ResponseWriter, r *http.Request) {
 	}
 	sum.Status = d.status()
 	writeJSON(w, 200, sum)
+}
+
+// hShutdown asks the daemon to stop (keyleash stop). Stopping locks the
+// vault and ends every pass's use until the daemon runs again, so it needs
+// no step-up (spec §9 reserves those for calls that weaken protection or
+// spend more), but unlike lock and panic it is not open to every caller:
+// the guard refuses confined and unidentified callers (spec §12), so an
+// agent under a run pass cannot end its own confinement this way. The
+// request is audited with the caller; the shutdown itself (docs/DAEMON.md
+// "Shutdown") runs after the response is sent.
+func (d *Daemon) hShutdown(w http.ResponseWriter, r *http.Request) {
+	pid := callerFrom(r.Context()).pid
+	name := "pid " + strconv.Itoa(pid)
+	if p, err := d.lookupProcess(pid); err == nil && p.Image != "" {
+		name = filepath.Base(p.Image)
+	}
+	d.auditEvent("shutdown", map[string]any{"requester_pid": pid, "requester": name})
+	d.log.Info("shutdown requested over the admin channel", "requester_pid", pid)
+	writeJSON(w, http.StatusAccepted, client.ShutdownResponse{Stopping: true})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	d.requestStop()
 }
 
 // ---- away / resume ---------------------------------------------------------

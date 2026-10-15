@@ -196,7 +196,8 @@ as `Requester`. Proxy approvals (`over_limit`, `unknown_model`) carry PID 0.
   `LOCAL_PEERPID`, FreeBSD `LOCAL_PEERCRED` `cr_pid`; elsewhere unknown;
   `Options.AdminPeerPID` overrides it). The `guard` middleware then applies
   confinement (SPEC §12): `GET /v1/status`, `POST /v1/lock` and
-  `POST /v1/panic` always pass; a confined caller (a member of any held run
+  `POST /v1/panic` always pass (`POST /v1/shutdown` does not: a confined
+  or unidentified caller gets 403 `confined`); a confined caller (a member of any held run
   job, or inside an active run pass's process tree) may only `DELETE
   /v1/passes` for its own pass (`inRunTree`: job member or descendant); an
   unidentified caller may only read; everything else → 403 `confined`.
@@ -218,6 +219,7 @@ as `Requester`. Proxy approvals (`over_limit`, `unknown_model`) carry PID 0.
 | POST | /v1/unlock | {method: hello\|passphrase\|recovery\|dpapi, secret?, accept_rollback?} → status (a rollback → 409 `rollback` with the file and recorded seqs; `accept_rollback` accepts it for this unlock only, not with dpapi, audited `accept_rollback {file_seq, recorded_seq}`; status `vault.rollback_*`) |
 | POST | /v1/lock | → status (any caller) |
 | POST | /v1/panic | {revoke_upstream?} → summary (any caller) |
+| POST | /v1/shutdown | → 202 {stopping} (no step-up; not for confined or unidentified callers); audit `shutdown` {requester_pid, requester}, then the *Shutdown* sequence runs after the response |
 | POST | /v1/away | {budget ≤ `limits.away.max_grant`, for, pass?} (step-up, never coalesced) → grant |
 | POST | /v1/resume | (step-up) leave Tripped, accepting what the trip reported |
 | GET/POST/DELETE | /v1/passes | create {name, kind, providers, models, limits, ttl, bind?} (lists ≤ 32, no duplicates; step-up unless a run pass bound to the caller within the defaults; refused while Away; order: issue → job confine → audit `pass_issue` → limits, rolled back on failure) → {pass, token (once)}; list; revoke {id} (a confined caller: its own pass only) |
@@ -234,6 +236,8 @@ There is no rollback-arming endpoint (the former `POST
 `accept_rollback` flag of the unlock request.
 | GET | /v1/audit/tail | ?n= |
 | GET | /v1/config | effective config (TOML) |
+| POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` / `slot_change` {op: rotate_recovery}, never the code |
+| DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key |
 
 Secrets travel only in request bodies over the ACL-protected channel and are
 wiped after use. Responses never contain provider keys; a pass token is
@@ -241,6 +245,8 @@ returned exactly once, at creation.
 
 ## Shutdown
 
+Triggered by the context ending (Ctrl-C, SIGTERM, logoff) or by `POST
+/v1/shutdown` (`keyleash stop`); both run the same sequence (`Close`).
 Stop accepting proxy connections; wait up to `ShutdownGrace` (30 s) for
 in-flight requests; set the state to Locked (no new reservation can start);
 if it was unlocked, settle every reservation still in flight at

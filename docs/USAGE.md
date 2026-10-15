@@ -61,7 +61,7 @@ Linux. Set `KEYLEASH_HOME` to use another one.
 ### 3. Start the daemon and unlock
 
 ```sh
-keyleash daemon               # foreground; Ctrl-C stops it
+keyleash daemon               # foreground; Ctrl-C (or keyleash stop) stops it
 keyleash daemon --background  # or detached, logging to <data dir>/daemon.log
 keyleash unlock               # Windows Hello, or the passphrase at a hidden prompt
 ```
@@ -357,6 +357,22 @@ program may lock or panic, including one inside `keyleash run`. Rotate
 the keys at the provider if you think one leaked; automatic upstream
 revocation is not implemented yet.
 
+**Stopping the daemon.** `keyleash stop` shuts the daemon down like Ctrl-C
+in its terminal: in-flight requests get up to 30 s (any still running are
+charged at their reserved amount), spend is saved, the vault locks, and
+with `[run] kill_on_daemon_exit` (default) programs started by `keyleash
+run` end. It needs no step-up (a stopped daemon spends nothing) but is
+refused from inside `keyleash run`; use lock or panic there. The request is
+in the audit log.
+
+**Rotating the recovery code.** `keyleash recovery rotate` (unlocked,
+step-up: Hello, your passphrase or the current recovery code) prints a new
+code once, like `init`, and asks you to re-type its last group. The vault
+gets a new data key, so the old code opens neither `vault.json` nor
+`vault.prev`. Backups of the vault file made before the rotation still open
+with the old code and show the keys as they were then; rotate provider keys
+if the old code may have leaked.
+
 **Audit.** Every decision is in a hash-chained log. `keyleash audit tail`
 shows recent records (passes by id, keys by fingerprint, never secrets);
 `keyleash audit verify` checks the chain, and the keyed anchors while
@@ -367,7 +383,7 @@ unlocked. `keyleash usage` shows spend by pass, model, provider and program.
 | Command | What it does |
 |---|---|
 | `init` | create the vault, recovery code and config |
-| `daemon [--background]` | run the daemon |
+| `daemon [--background]` / `stop` | run the daemon / stop it gracefully (refused inside `keyleash run`) |
 | `status [--json]` | state, lease, spend vs limits, active passes |
 | `unlock [--recovery] [--stdin]` / `lock` | unlock or lock the vault |
 | `add <provider> [--label] [--stdin]` | store a key (hidden prompt or stdin) |
@@ -381,6 +397,7 @@ unlocked. `keyleash usage` shows spend by pass, model, provider and program.
 | `approvals [approve <id> [--grant --for] [--stdin]\|deny <id>]` | pending step-up requests; approving asks for the passphrase or recovery code |
 | `audit verify\|tail` | check or read the audit log |
 | `config show\|check\|path` | effective configuration |
+| `recovery rotate` | new recovery code, shown once; re-keys the vault (step-up) |
 | `doctor [--json]` | environment checks |
 | `panic [--revoke-upstream]` | lock and revoke every pass |
 | `version`, `help [command]` | |

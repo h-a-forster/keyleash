@@ -347,6 +347,12 @@ type AuditVerify struct {
 	Problem         string `json:"problem,omitempty"`
 }
 
+// ShutdownResponse is the response of POST /v1/shutdown: the daemon has
+// accepted the request and shuts down after answering.
+type ShutdownResponse struct {
+	Stopping bool `json:"stopping"`
+}
+
 // RotateRecoveryResponse is the response of POST /v1/vault/recovery. Code
 // is the new recovery code, shown once.
 type RotateRecoveryResponse struct {

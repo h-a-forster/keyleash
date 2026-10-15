@@ -630,8 +630,9 @@ table, so the audit log answers "which program spent this".
   `approval`, `approval_secret`, `pass_issue`, `pass_revoke`, `request`
   (provider, model, pass, client process, status, tokens, cost, estimated
   flag, latency, deny reason), `limit_change`, `limit_override`, `key_add`,
-  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `panic`,
-  `anchor`.
+  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey`,
+  `panic`, `shutdown` (a stop request: requester PID and image),
+  `daemon_stop`, `anchor`.
 - After every unlock the daemon verifies the chain **and** the anchors with
   the anchor key; a failure trips the daemon (`audit_integrity`) until the
   owner resumes (§8).
@@ -642,7 +643,7 @@ table, so the audit log answers "which program spent this".
 - Windows: named pipe `\\.\pipe\keyleash-<user SID>` with a DACL granting only
   the current user. Unix: socket in the data dir, mode 0600.
 - HTTP/JSON over the pipe. Endpoints (v1): `status`, `unlock`, `lock`, `away`,
-  `panic`, `passes` (list/create/revoke), `limits` (get/set), `approvals`
+  `panic`, `shutdown`, `passes` (list/create/revoke), `limits` (get/set), `approvals`
   (list/decide), `usage`, `audit/tail`, `vault/entries` (list/add/remove/rotate),
   `vault/slots` (list/add/remove).
 - Mutating calls that weaken protection or spend more require a step-up
@@ -662,7 +663,11 @@ table, so the audit log answers "which program spent this".
   PID cannot be determined may read, lock and panic, but every other mutating
   call gets `403 confined`. An error while checking counts as confined (fail
   closed). `POST /v1/lock` and `POST /v1/panic` are allowed from any caller:
-  they only add protection.
+  they only add protection. `POST /v1/shutdown` (stop the daemon) needs no
+  step-up, since a stopped daemon locks the vault and spends nothing, but is
+  not on that list: stopping also ends confinement (run jobs are closed) and
+  the presence and audit machinery, so a confined or unidentified caller
+  gets `403 confined`. It is audited (`shutdown`).
 - **What is enforced where.** On Windows confinement is enforced by job
   objects and holds against a process that daemonises or whose parent exits.
   On Linux, macOS and the BSDs it relies on the parent chain: process groups
@@ -676,6 +681,7 @@ table, so the audit log answers "which program spent this".
 ```
 keyleash init                       create vault, slots, recovery code, recommended config
 keyleash daemon                     run the daemon (foreground)
+keyleash stop                       stop the daemon gracefully (admin `shutdown`)
 keyleash status                     state, lease, spend vs limits, active passes
 keyleash unlock | lock
 keyleash add <provider> [--label]   add a key (read from hidden prompt or stdin; never argv)
@@ -694,6 +700,7 @@ keyleash scan [paths…]              find plaintext provider keys (files, env, 
 keyleash import <.env>              move keys into the vault, rewrite file to use passes (dry-run by default)
 keyleash reveal <entry>             step-up, copy to clipboard (excluded from history), auto-clear 30 s
 keyleash panic [--revoke-upstream]  lock, revoke all passes, optionally deactivate keys at provider
+keyleash recovery rotate            new recovery code (step-up, re-keys the vault, §5.2)
 keyleash audit verify|tail
 keyleash doctor                     environment checks (Hello, TPM, permissions, clock, ports)
 ```

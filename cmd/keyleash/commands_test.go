@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -418,5 +419,102 @@ func TestApprovalsApproveNeedsSecret(t *testing.T) {
 	}
 	if code, _, errOut := td.run(testPassphrase+"\n", "approvals", "approve", "nope", "--stdin"); code != exitError || !strings.Contains(errOut, "no such pending approval") {
 		t.Fatalf("unknown id: %d %q", code, errOut)
+	}
+}
+
+func TestStopCommand(t *testing.T) {
+	td := startTestDaemon(t, true)
+	// The test daemon runs via Start, not Run: close it when asked to stop,
+	// as Run does.
+	go func() {
+		<-td.d.StopRequested()
+		td.d.Close()
+	}()
+	code, out, errOut := td.run("", "stop")
+	if code != 0 || !strings.Contains(out, "daemon stopped") {
+		t.Fatalf("stop: %d %q %q", code, out, errOut)
+	}
+	if code, out, _ := td.run("", "stop"); code != 0 || !strings.Contains(out, "not running") {
+		t.Fatalf("stop again: %d %q", code, out)
+	}
+}
+
+func TestRecoveryRotateCommand(t *testing.T) {
+	td := startTestDaemon(t, true, func(o *daemon.Options) { o.Approver = manualApprover{} })
+	if code, _, errOut := td.run(testPassphrase+"\n", "unlock", "--stdin"); code != 0 {
+		t.Fatalf("unlock: %q", errOut)
+	}
+	c := td.client()
+	defer c.Close()
+	type res struct {
+		code        int
+		out, errOut string
+	}
+	done := make(chan res, 1)
+	go func() {
+		code, out, errOut := td.run("", "recovery", "rotate")
+		done <- res{code, out, errOut}
+	}()
+	var ap client.Approval
+	for i := 0; i < 500 && ap.ID == ""; i++ {
+		if list, _ := c.Approvals(t.Context()); len(list) == 1 {
+			ap = list[0]
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if ap.ID == "" || ap.Requester != os.Getpid() || ap.Kind != "admin_change" {
+		t.Fatalf("approval = %+v", ap)
+	}
+	// The current recovery code is a valid step-up secret.
+	if code, _, errOut := td.run(td.recovery+"\n", "approvals", "approve", ap.ID, "--stdin"); code != 0 {
+		t.Fatalf("approve: %d %q", code, errOut)
+	}
+	r := <-done
+	if r.code != 0 || !strings.Contains(r.out, "New recovery code") {
+		t.Fatalf("rotate: %d %q %q", r.code, r.out, r.errOut)
+	}
+	newCode := ""
+	for _, line := range strings.Split(r.out, "\n") {
+		if strings.HasPrefix(line, "    ") {
+			newCode = strings.TrimSpace(line)
+		}
+	}
+	if newCode == "" || newCode == td.recovery || !looksLikeSecret(newCode) {
+		t.Fatalf("new code not printed: %q", r.out)
+	}
+	if strings.Contains(r.out+r.errOut, td.recovery) {
+		t.Fatal("old recovery code echoed")
+	}
+	// The audit log never holds either code.
+	recs, err := c.AuditTail(t.Context(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := false
+	for _, rec := range recs {
+		b := fmt.Sprint(rec.Fields)
+		if strings.Contains(b, newCode) || strings.Contains(b, td.recovery) {
+			t.Fatalf("audit record %s holds a recovery code", rec.Type)
+		}
+		rotated = rotated || (rec.Type == "rekey" && rec.Fields["op"] == "rotate_recovery" && rec.Fields["ok"] == true)
+	}
+	if !rotated {
+		t.Fatal("no rekey audit record")
+	}
+	if code, _, errOut := td.run("", "lock"); code != 0 {
+		t.Fatalf("lock: %q", errOut)
+	}
+	if code, _, errOut := td.run(td.recovery+"\n", "unlock", "--method", "recovery", "--stdin"); code != exitError || !strings.Contains(errOut, "wrong passphrase") {
+		t.Fatalf("old code unlock: %d %q", code, errOut)
+	}
+	if code, _, errOut := td.run(newCode+"\n", "unlock", "--method", "recovery", "--stdin"); code != 0 {
+		t.Fatalf("new code unlock: %d %q", code, errOut)
+	}
+	if code, _, errOut := td.run("", "lock"); code != 0 {
+		t.Fatalf("lock: %q", errOut)
+	}
+	if code, _, errOut := td.run(testPassphrase+"\n", "unlock", "--stdin"); code != 0 {
+		t.Fatalf("passphrase unlock after rotation: %d %q", code, errOut)
 	}
 }

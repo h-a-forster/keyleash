@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -97,6 +98,71 @@ func (a *app) daemonBackground(ctx context.Context, dir string) error {
 	fmt.Fprintf(a.stdout, "keyleash daemon running in the background (log: %s). Next: keyleash unlock\n", logPath)
 	return nil
 }
+
+// stopWait bounds how long `keyleash stop` waits for the daemon to go away:
+// the daemon's shutdown grace for in-flight requests plus time to save.
+var stopWait = daemon.ShutdownGrace + 15*time.Second
+
+var cmdStop = &command{
+	name:    "stop",
+	args:    "",
+	summary: "stop the running daemon gracefully",
+	help: `
+Asks the running daemon to shut down, the same way Ctrl-C in its terminal
+does: it stops accepting proxy connections, lets in-flight requests finish
+(up to 30 s; any still running are charged at their reserved amount), saves
+the ledger checkpoint, locks the vault and exits. With [run]
+kill_on_daemon_exit (the default) processes started by 'keyleash run' end
+too. The request is recorded in the audit log.
+
+No step-up is needed: stopping only takes keyleash offline. It is refused
+from inside a 'keyleash run' session (use 'keyleash lock' or 'keyleash
+panic' there). If no daemon is running, it says so and exits successfully.`,
+	run: runStop,
+}
+
+func runStop(ctx context.Context, a *app, args []string) error {
+	if pos, err := parseFlags(newFlagSet("stop"), args, true); err != nil {
+		return err
+	} else if len(pos) > 0 {
+		return usagef("stop", "unexpected argument")
+	}
+	c, err := a.client()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	cctx, cancel := withTimeout(ctx)
+	err = c.Shutdown(cctx)
+	cancel()
+	if err != nil {
+		if errors.Is(friendly(err), errDaemonDown) {
+			fmt.Fprintln(a.stdout, "The keyleash daemon is not running.")
+			return nil
+		}
+		return err
+	}
+	fmt.Fprintln(a.stderr, "Stopping the keyleash daemon (in-flight requests may take up to 30 s)...")
+	deadline := time.Now().Add(stopWait)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return errInterrupted
+		case <-time.After(stopPoll):
+		}
+		qctx, qcancel := context.WithTimeout(ctx, 2*time.Second)
+		_, serr := c.Status(qctx)
+		qcancel()
+		if serr != nil && errors.Is(friendly(serr), errDaemonDown) {
+			fmt.Fprintln(a.stdout, "keyleash daemon stopped.")
+			return nil
+		}
+	}
+	return errors.New("the daemon accepted the stop request but is still answering; check its log or `keyleash status`")
+}
+
+// stopPoll is how often `keyleash stop` checks whether the daemon is gone.
+var stopPoll = 200 * time.Millisecond
 
 // blockingReader never yields data; Read returns io.EOF once ctx is done.
 type blockingReader struct{ ctx context.Context }
