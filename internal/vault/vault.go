@@ -411,6 +411,7 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 
 	v.mu.RLock()
 	f := v.f // immutable snapshot
+	fromPrev := v.fromPrev
 	v.mu.RUnlock()
 
 	var dek *secmem.Buffer
@@ -461,6 +462,16 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 	if err != nil {
 		dek.Destroy()
 		return err
+	}
+	if !fromPrev {
+		// A .prev of this vault with a higher seq than the main file means
+		// the main file was rolled back (e.g. an old backup restored
+		// without its sidecar). It is the same signal as a newer sidecar
+		// record, and .prev is left untouched (spec §5.4).
+		if pf, perr := readFile(PrevPath(v.path)); perr == nil && pf.VaultID == f.VaultID && pf.Seq > f.Seq {
+			sc.rollback = true
+			sc.seq = max(sc.seq, pf.Seq)
+		}
 	}
 
 	v.mu.Lock()

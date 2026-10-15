@@ -931,3 +931,45 @@ func TestUnlockScrubsStalePrev(t *testing.T) {
 		t.Fatal("status reports vault.prev not scrubbed")
 	}
 }
+
+// An old vault file restored without its anti-rollback sidecar, next to a
+// newer vault.prev, is refused as a rollback (audited, shown in status)
+// instead of unlocking and overwriting the newer vault.prev (spec §5.4).
+func TestRestoredVaultWithoutSidecarIsRollback(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	vpath := filepath.Join(e.dir, VaultFile)
+	backup, err := os.ReadFile(vpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.appr.approve.Store(true)
+	if _, err := e.c.RotateRecovery(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.stop()
+	prev, err := os.ReadFile(vault.PrevPath(vpath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vpath, backup, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(vault.SeqPath(vpath)); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	if _, err := e.c.Unlock(e.ctx(), client.MethodRecovery, []byte(e.recovery)); !isAPI(err, 409, client.CodeRollback) {
+		t.Fatalf("unlock of a restored file = %v", err)
+	}
+	if s := e.status(); !s.Vault.RollbackDetected || s.Vault.RollbackRecordedSeq <= s.Vault.RollbackFileSeq {
+		t.Fatalf("status = %+v", s.Vault)
+	}
+	if !auditHas(t, e, "unlock", func(f map[string]any) bool { return f["reason"] == "rollback" }) {
+		t.Fatal("rollback not audited")
+	}
+	if now, _ := os.ReadFile(vault.PrevPath(vpath)); !bytes.Equal(now, prev) {
+		t.Fatal("newer vault.prev overwritten")
+	}
+}

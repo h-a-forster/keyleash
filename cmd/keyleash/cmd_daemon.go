@@ -134,7 +134,19 @@ func runStop(ctx context.Context, a *app, args []string) error {
 		return err
 	}
 	defer c.Close()
+	// Wait on the instance lock of the daemon we reached, which is not
+	// necessarily the one of our KEYLEASH_HOME (the Windows admin pipe is
+	// per user, not per data directory).
+	dir, err := a.dataDir()
+	if err != nil {
+		return err
+	}
 	cctx, cancel := withTimeout(ctx)
+	if st, serr := c.Status(cctx); serr == nil && st.DataDir != "" {
+		dir = st.DataDir
+	}
+	cancel()
+	cctx, cancel = withTimeout(ctx)
 	err = c.Shutdown(cctx)
 	cancel()
 	if err != nil {
@@ -148,10 +160,6 @@ func runStop(ctx context.Context, a *app, args []string) error {
 	// The daemon closes its admin channel early in its shutdown and
 	// releases the instance lock last, after saving the ledger and state,
 	// locking the vault and ending run sessions: wait for both.
-	dir, err := a.dataDir()
-	if err != nil {
-		return err
-	}
 	deadline := time.Now().Add(stopWait)
 	adminGone := false
 	for time.Now().Before(deadline) {

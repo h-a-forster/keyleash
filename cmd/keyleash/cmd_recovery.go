@@ -117,7 +117,8 @@ var rotationSettle = 3 * time.Second
 // rotationLost turns a failed `recovery rotate` call (err) into the error
 // to report. An answer from the daemon (an API error) means nothing was
 // committed. Otherwise (interrupted, connection lost) it reads the audit
-// log after record since until it shows the outcome: a committed rotation
+// log after record since, for records of this process (requester_pid),
+// until it shows the outcome: a committed rotation
 // means the old code no longer works and the new one never reached this
 // terminal, which it says plainly; an aborted re-key or a step-up that was
 // not approved means nothing changed. If the log does not settle it within
@@ -141,7 +142,9 @@ func rotationLost(ctx context.Context, c *client.Client, err error, since uint64
 			break
 		}
 		for _, rec := range recs {
-			if rec.Seq <= since {
+			// Only this process's request: another caller's rotation
+			// says nothing about this one.
+			if rec.Seq <= since || rec.Fields["requester_pid"] != self {
 				continue
 			}
 			switch {
@@ -149,7 +152,7 @@ func rotationLost(ctx context.Context, c *client.Client, err error, since uint64
 				return fmt.Errorf("%v\nThe recovery code WAS rotated (audit record %d), but the new code never reached this terminal and cannot be recovered. Your old recovery code no longer works. %s", friendly(err), rec.Seq, again)
 			case rec.Type == "rekey" && rec.Fields["op"] == "rotate_recovery":
 				return err // aborted: nothing committed
-			case rec.Type == "approval" && rec.Fields["kind"] == "admin_change" && rec.Fields["requester_pid"] == self && rec.Fields["approved"] == false:
+			case rec.Type == "approval" && rec.Fields["kind"] == "admin_change" && rec.Fields["approved"] == false:
 				return err // never approved: nothing committed
 			}
 		}

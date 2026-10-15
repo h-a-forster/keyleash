@@ -63,9 +63,13 @@ type Status struct {
 	AwayUntil  time.Time `json:"away_until,omitzero"`
 	Grant      *Grant    `json:"grant,omitempty"`
 
-	ProxyAddr string        `json:"proxy_addr,omitempty"`
-	Limits    []LimitStatus `json:"limits"`
-	InFlight  []InFlight    `json:"in_flight"`
+	ProxyAddr string `json:"proxy_addr,omitempty"`
+	// DataDir is the daemon's data directory (absolute). On Windows the
+	// admin pipe is per user, not per data directory, so it can differ from
+	// the caller's KEYLEASH_HOME.
+	DataDir  string        `json:"data_dir,omitempty"`
+	Limits   []LimitStatus `json:"limits"`
+	InFlight []InFlight    `json:"in_flight"`
 
 	PresenceDegraded       bool   `json:"presence_degraded,omitempty"`
 	PresenceDegradedReason string `json:"presence_degraded_reason,omitempty"`

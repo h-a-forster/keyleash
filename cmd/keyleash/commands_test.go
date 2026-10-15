@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -446,7 +450,19 @@ func TestStopCommand(t *testing.T) {
 		<-td.d.StopRequested()
 		td.d.Close()
 	}()
-	code, out, errOut := td.run("", "stop")
+	// Stop from a shell whose KEYLEASH_HOME is another directory: the
+	// admin channel still reaches this daemon (on Windows the pipe is per
+	// user), so stop must wait on the daemon's own data directory.
+	a, outb, errb := td.app("")
+	otherHome := t.TempDir()
+	a.getenv = func(k string) string {
+		if k == "KEYLEASH_HOME" {
+			return otherHome
+		}
+		return ""
+	}
+	code := a.main([]string{"stop"})
+	out, errOut := outb.String(), errb.String()
 	if code != 0 || !strings.Contains(out, "daemon stopped") {
 		t.Fatalf("stop: %d %q %q", code, out, errOut)
 	}
@@ -518,10 +534,10 @@ func TestRecoveryRotateCommand(t *testing.T) {
 		if strings.Contains(b, newCode) || strings.Contains(b, td.recovery) {
 			t.Fatalf("audit record %s holds a recovery code", rec.Type)
 		}
-		rotated = rotated || (rec.Type == "rekey" && rec.Fields["op"] == "rotate_recovery" && rec.Fields["ok"] == true)
+		rotated = rotated || (rec.Type == "rekey" && rec.Fields["op"] == "rotate_recovery" && rec.Fields["ok"] == true && rec.Fields["requester_pid"] == float64(os.Getpid()))
 	}
 	if !rotated {
-		t.Fatal("no rekey audit record")
+		t.Fatal("no rekey audit record naming this process as requester")
 	}
 	if code, _, errOut := td.run("", "lock"); code != 0 {
 		t.Fatalf("lock: %q", errOut)
@@ -624,5 +640,114 @@ func TestRecoveryRotateLostAnswer(t *testing.T) {
 	}
 	if code, _, errOut := td.run(td.recovery+"\n", "unlock", "--method", "recovery", "--stdin"); code != exitError || !strings.Contains(errOut, "wrong passphrase") {
 		t.Fatalf("old code after a committed rotation: %d %q", code, errOut)
+	}
+}
+
+// rotationLost settles the outcome of a rotate call that got no answer from
+// this process's own audit records only.
+func TestRotationLostOutcomes(t *testing.T) {
+	defer func(d time.Duration) { rotationSettle = d }(rotationSettle)
+	rotationSettle = 0
+	self, other := float64(os.Getpid()), float64(os.Getpid()+1)
+	rekey := func(seq uint64, pid float64, ok bool) client.AuditRecord {
+		f := map[string]any{"op": "rotate_recovery", "ok": ok, "requester_pid": pid}
+		if !ok {
+			f["reason"] = "caller_gone"
+		}
+		return client.AuditRecord{Seq: seq, Type: "rekey", Fields: f}
+	}
+	approval := func(seq uint64, pid float64, approved bool) client.AuditRecord {
+		return client.AuditRecord{Seq: seq, Type: "approval", Fields: map[string]any{"kind": "admin_change", "approved": approved, "requester_pid": pid}}
+	}
+	const since = 10
+	tests := []struct {
+		name    string
+		recs    []client.AuditRecord
+		auditOK bool
+		want    string // "rotated", "plain" or "unknown"
+	}{
+		{"committed", []client.AuditRecord{approval(11, self, true), rekey(12, self, true)}, true, "rotated"},
+		{"aborted (caller gone)", []client.AuditRecord{approval(11, self, true), rekey(12, self, false)}, true, "plain"},
+		{"never approved", []client.AuditRecord{approval(11, self, false)}, true, "plain"},
+		{"another caller's rotation", []client.AuditRecord{approval(11, other, true), rekey(12, other, true)}, true, "unknown"},
+		{"another caller's abort", []client.AuditRecord{rekey(12, other, false), approval(13, other, false)}, true, "unknown"},
+		{"own rotation before this call", []client.AuditRecord{rekey(9, self, true), rekey(10, self, true)}, true, "unknown"},
+		{"nothing recorded", nil, true, "unknown"},
+		{"audit unreadable", nil, false, "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/audit/tail" || !tt.auditOK {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				json.NewEncoder(w).Encode(append([]client.AuditRecord{}, tt.recs...))
+			}))
+			defer srv.Close()
+			addr := srv.Listener.Addr().String()
+			c := client.New(func(ctx context.Context) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", addr)
+			})
+			defer c.Close()
+			lost := &url.Error{Op: "Post", URL: "http://keyleash/v1/vault/recovery", Err: io.ErrUnexpectedEOF}
+			got := rotationLost(t.Context(), c, lost, since, true)
+			msg := got.Error()
+			var kind string
+			switch {
+			case strings.Contains(msg, "WAS rotated"):
+				kind = "rotated"
+			case strings.Contains(msg, "Could not tell"):
+				kind = "unknown"
+			case got == error(lost):
+				kind = "plain"
+			}
+			if kind != tt.want {
+				t.Fatalf("outcome = %q (%v), want %s", kind, got, tt.want)
+			}
+		})
+	}
+	// An answer from the daemon is returned as is, without a lookup.
+	refused := &client.APIError{Status: 403, Code: client.CodeStepUpDenied}
+	if got := rotationLost(t.Context(), client.New(func(context.Context) (net.Conn, error) { return nil, errors.New("no lookup expected") }), refused, since, true); got != error(refused) {
+		t.Fatalf("API error = %v", got)
+	}
+}
+
+// Interrupting `recovery rotate` while it waits for approval reports the
+// interruption, not a lost rotation, and the old code still works.
+func TestRecoveryRotateInterruptedBeforeApproval(t *testing.T) {
+	td := startTestDaemon(t, true, func(o *daemon.Options) { o.Approver = manualApprover{} })
+	if code, _, errOut := td.run(testPassphrase+"\n", "unlock", "--stdin"); code != 0 {
+		t.Fatalf("unlock: %q", errOut)
+	}
+	c := td.client()
+	defer c.Close()
+	a, out, errb := td.app("")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRecovery(ctx, a, []string{"rotate"}) }()
+	for i := 0; i < 500; i++ {
+		if list, _ := c.Approvals(t.Context()); len(list) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	cancel() // Ctrl-C
+	err := <-done
+	if err == nil || strings.Contains(err.Error(), "WAS rotated") || strings.Contains(err.Error(), "Could not tell") {
+		t.Fatalf("interrupted rotate: %v (stdout %q, stderr %q)", err, out.String(), errb.String())
+	}
+	if d := time.Since(start); d > rotationSettle {
+		t.Fatalf("interrupted rotate took %s to settle", d)
+	}
+	if code, _, _ := td.run("", "lock"); code != 0 {
+		t.Fatal("lock")
+	}
+	if code, _, errOut := td.run(td.recovery+"\n", "unlock", "--method", "recovery", "--stdin"); code != 0 {
+		t.Fatalf("old code after an interrupted rotate: %d %q", code, errOut)
 	}
 }

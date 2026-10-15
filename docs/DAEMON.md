@@ -215,7 +215,7 @@ as `Requester`. Proxy approvals (`over_limit`, `unknown_model`) carry PID 0.
 
 | Method | Path | Body → Response |
 |---|---|---|
-| GET | /v1/status | → state, trip reason, lease, session, limits status, in-flight, degraded presence, vault info, `approval_method` (the queue's current approver), `config_changes`, `pass_store_changes` |
+| GET | /v1/status | → state, trip reason, lease, session, limits status, in-flight, degraded presence, vault info, `data_dir` (absolute), `approval_method` (the queue's current approver), `config_changes`, `pass_store_changes` |
 | POST | /v1/unlock | {method: hello\|passphrase\|recovery\|dpapi, secret?, accept_rollback?} → status (a rollback → 409 `rollback` with the file and recorded seqs; `accept_rollback` accepts it for this unlock only, not with dpapi, audited `accept_rollback {file_seq, recorded_seq}`; status `vault.rollback_*`) |
 | POST | /v1/lock | → status (any caller) |
 | POST | /v1/panic | {revoke_upstream?} → summary (any caller) |
@@ -236,7 +236,7 @@ There is no rollback-arming endpoint (the former `POST
 `accept_rollback` flag of the unlock request.
 | GET | /v1/audit/tail | ?n= |
 | GET | /v1/config | effective config (TOML) |
-| POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` / `slot_change` {op: rotate_recovery}, never the code. Not committed if the caller has disconnected by the time the step-up is decided (audit `rekey` {ok: false, reason: caller_gone}); the CLI checks the audit log when it gets no answer |
+| POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` {op: rotate_recovery, ok, requester_pid} / `slot_change` {op}, never the code. Not committed if the caller has disconnected by the time the step-up is decided (audit `rekey` {ok: false, reason: caller_gone}); the CLI checks the audit log (its own requester_pid only) when it gets no answer |
 | DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key |
 
 Secrets travel only in request bodies over the ACL-protected channel and are
@@ -257,4 +257,6 @@ flush the ledger, write the checkpoint to the vault and state.json, audit
 kill-on-close); remove the socket; release the instance lock. The admin
 server is shut down before all this, so `keyleash stop` waits for the
 instance lock to be free (`daemon.Running`) before reporting the daemon
-stopped.
+stopped. It waits on the `data_dir` the daemon reported in status, not its
+own `KEYLEASH_HOME`: on Windows the admin pipe is per user, so the two can
+differ.

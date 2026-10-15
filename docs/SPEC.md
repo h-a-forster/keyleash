@@ -199,19 +199,23 @@ reveals nothing useful without the vault.
   for crash recovery only.
 - Data directory permissions: owner-only (Windows DACL: current user + SYSTEM;
   Unix 0700/0600).
-- Anti-rollback: the latest `seq` is also stored in a sidecar (`vault.json.seq`;
+- Anti-rollback: the latest `seq` is also stored in a sidecar (`vault.seq`;
   DPAPI-protected on Windows, HMAC'd under a DEK-derived key elsewhere). At
   unlock, after the DEK is recovered, a lower `seq` on disk (or a sidecar from
   another vault) fails with `ErrRollback` and the vault stays locked until the
-  owner explicitly accepts the older state. Because the sidecar lives next to
-  the vault, this detects accidents and naive restores, not an attacker who
-  can replace both files.
+  owner explicitly accepts the older state. A `vault.prev` of the same vault
+  with a higher `seq` than `vault.json` is the same signal (an old file
+  restored without its sidecar) and fails the unlock the same way, leaving
+  `vault.prev` untouched. Because the sidecar lives next to the vault, this
+  detects accidents and naive restores, not an attacker who can replace both
+  files.
 - After a re-key, `vault.prev` is replaced with a copy of the new state so the
   old DEK does not linger next to the vault. The main file is renamed first
   and the copy right after; a crash between the two renames (or a copy that
   could be neither renamed nor removed) leaves `vault.prev` under the old
-  DEK. Every successful unlock therefore checks `vault.prev`: if it parses
-  but its header MAC does not verify under the live DEK, it is replaced with
+  DEK. Every successful unlock therefore checks `vault.prev`: if it parses,
+  has a lower `seq` than the main file and its header MAC does not verify
+  under the live DEK, it is replaced with
   a copy of the live state (or removed), and the daemon audits `prev_scrub`
   {ok}. Until that unlock, the slots the re-key removed (an old recovery
   code) still open `vault.prev`. Backups taken before a slot
@@ -642,8 +646,8 @@ table, so the audit log answers "which program spent this".
   (provider, model, pass, client process, status, tokens, cost, estimated
   flag, latency, deny reason), `limit_change`, `limit_override`, `key_add`,
   `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey`
-  (`ok: false, reason: caller_gone` when the requester disconnected before
-  the commit), `prev_scrub`, `panic`, `shutdown` (a stop request: requester PID and image),
+  (op, ok, requester PID; `ok: false, reason: caller_gone` when the
+  requester disconnected before the commit), `prev_scrub`, `panic`, `shutdown` (a stop request: requester PID and image),
   `daemon_stop`, `anchor`.
 - After every unlock the daemon verifies the chain **and** the anchors with
   the anchor key; a failure trips the daemon (`audit_integrity`) until the

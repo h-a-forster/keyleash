@@ -121,7 +121,8 @@ func writeTemp(dir string, data []byte) (name string, err error) {
 }
 
 // scrubStalePrev replaces path's .prev with a copy of the live state f when
-// .prev parses but does not authenticate under the live dek: a copy left
+// .prev parses, has a lower seq than f and does not authenticate under the
+// live dek: a copy left
 // under an older DEK by a re-key that crashed between its two renames (or
 // whose scrub failed), which the slots that re-key removed (an old recovery
 // code, a removed slot) would still open. found reports such a .prev; err
@@ -133,6 +134,11 @@ func scrubStalePrev(path string, f *fileV1, dek []byte) (found bool, err error) 
 		return false, nil
 	}
 	if ok, verr := verifyHeaderMAC(dek, pf); verr == nil && ok {
+		return false, nil
+	}
+	if pf.Seq >= f.Seq {
+		// Not an older copy: never overwrite it here. A newer .prev of this
+		// vault fails the unlock as a rollback before this is reached.
 		return false, nil
 	}
 	data, merr := json.MarshalIndent(f, "", "  ")

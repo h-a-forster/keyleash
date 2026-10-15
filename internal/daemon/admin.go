@@ -162,6 +162,7 @@ func (d *Daemon) status() client.Status {
 		s.PresenceDegraded, s.PresenceDegradedReason = true, d.osSource.DegradedReason()
 	}
 	s.Vault.ID, s.Vault.Seq, s.Vault.Unlocked = d.vault.ID(), d.vault.Seq(), d.vault.IsUnlocked()
+	s.DataDir = d.dataDir
 	s.Vault.RecoveredFromPrev = d.vault.RecoveredFromPrev()
 	s.Vault.Slots = []client.Slot{}
 	for _, sl := range d.vault.Slots() {

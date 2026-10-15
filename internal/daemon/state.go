@@ -1165,7 +1165,7 @@ func (d *Daemon) rekey(ctx context.Context, op string, fn func() error) error {
 		d.testBeforeRekey(ctx)
 	}
 	if err := ctx.Err(); err != nil {
-		d.auditEvent("rekey", map[string]any{"op": op, "ok": false, "reason": "caller_gone"})
+		d.auditEvent("rekey", map[string]any{"op": op, "ok": false, "reason": "caller_gone", "requester_pid": callerFrom(ctx).pid})
 		return err
 	}
 	d.anchor()
@@ -1176,7 +1176,7 @@ func (d *Daemon) rekey(ctx context.Context, op string, fn func() error) error {
 		d.mu.Unlock()
 	}
 	ok := err == nil || errors.Is(err, vault.ErrPrevNotScrubbed)
-	d.auditEvent("rekey", map[string]any{"op": op, "ok": ok, "prev_scrubbed": err == nil})
+	d.auditEvent("rekey", map[string]any{"op": op, "ok": ok, "prev_scrubbed": err == nil, "requester_pid": callerFrom(ctx).pid})
 	if ok {
 		d.auditEvent("slot_change", map[string]any{"op": op})
 	}

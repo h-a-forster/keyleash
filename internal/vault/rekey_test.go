@@ -630,3 +630,54 @@ func TestHelloPadding(t *testing.T) {
 		}
 	})
 }
+
+// Review finding A: an old vault file restored without its sidecar must not
+// unlock silently and must not overwrite the newer .prev. A .prev with a
+// higher seq is a rollback signal like a newer sidecar record.
+func TestNewerPrevIsRollback(t *testing.T) {
+	withSidecarModes(t, func(t *testing.T) {
+		v, path, oldCode := newTestVault(t)
+		if _, err := v.AddEntry("anthropic", KindAPIKey, "a", testSecret); err != nil {
+			t.Fatal(err)
+		}
+		backup := readBytes(t, path)
+		newCode, err := v.RotateRecovery()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := v.AddEntry("openai", KindAPIKey, "b", testSecret); err != nil {
+			t.Fatal(err)
+		}
+		v.Lock()
+		prev := readBytes(t, PrevPath(path))
+		// Restore the pre-rotation file and drop the sidecar.
+		if err := os.WriteFile(path, backup, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(SeqPath(path)); err != nil {
+			t.Fatal(err)
+		}
+		x, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var re *RollbackError
+		if err := x.UnlockRecovery(oldCode); !errors.As(err, &re) || re.RecordedSeq <= re.FileSeq {
+			t.Fatalf("old code on a restored file without sidecar = %v", err)
+		}
+		if !bytes.Equal(readBytes(t, PrevPath(path)), prev) {
+			t.Fatal("newer .prev overwritten")
+		}
+		if err := openCopy(t, prev).UnlockRecovery(newCode); err != nil {
+			t.Fatalf("new code on .prev = %v", err)
+		}
+		// The owner's explicit override still works.
+		x.AcceptRollback()
+		if err := x.UnlockRecovery(oldCode); err != nil {
+			t.Fatalf("accepted rollback: %v", err)
+		}
+		if x.Seq() <= re.RecordedSeq {
+			t.Fatalf("seq after accepting = %d, want above %d", x.Seq(), re.RecordedSeq)
+		}
+	})
+}
