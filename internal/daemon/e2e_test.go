@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
+	"github.com/h-a-forster/keyleash/internal/procinfo"
 	"github.com/h-a-forster/keyleash/internal/proxy"
 )
 
@@ -802,5 +805,35 @@ func TestInvalidConfigRefused(t *testing.T) {
 		AdminListener: newMemListener(), manualPresence: true, manualHousekeeping: true})
 	if err == nil || !strings.Contains(err.Error(), "keyleash init") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Where process identity is unavailable (procinfo unsupported), a pass that
+// asks to be bound to a process is refused, never issued unbound.
+func TestBindPIDUnsupportedFailsClosed(t *testing.T) {
+	if _, err := procinfo.Lookup(os.Getpid()); !errors.Is(err, procinfo.ErrUnsupported) {
+		t.Skip("process binding is supported here; covered by the bound-pass tests")
+	}
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	for _, req := range []client.PassCreateRequest{
+		{Name: "bound", Providers: []string{"anthropic"}, BindPID: os.Getpid()},
+		{Name: "run", Kind: "run", Providers: []string{"anthropic"}, BindPID: os.Getpid()},
+	} {
+		err := e.withOwner(func(ctx context.Context) error {
+			_, err := e.c.CreatePass(ctx, req)
+			return err
+		})
+		if !isAPI(err, 400, client.CodeBadRequest) {
+			t.Fatalf("%s pass bound to a process: %v", req.Name, err)
+		}
+	}
+	passes, err := e.c.Passes(e.ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(passes) != 0 {
+		t.Fatalf("passes issued: %+v", passes)
 	}
 }

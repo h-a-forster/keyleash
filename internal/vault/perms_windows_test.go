@@ -34,8 +34,14 @@ func checkOwnerOnly(t *testing.T, path string, dir bool) {
 		if len(f) != 6 || f[0] != "A" {
 			t.Fatalf("unexpected ACE %q in %s", ace, sddl)
 		}
-		if trustee := f[5]; trustee != user.User.Sid.String() && trustee != "SY" {
-			t.Fatalf("unexpected trustee %q in %s", trustee, sddl)
+		// SDDL abbreviates well-known SIDs (e.g. "LA" for the built-in
+		// Administrator, which CI runners use), so compare SIDs, not strings.
+		trustee, err := windows.StringToSid(f[5])
+		if err != nil {
+			t.Fatalf("bad trustee %q in %s: %v", f[5], sddl, err)
+		}
+		if !trustee.Equals(user.User.Sid) && !trustee.IsWellKnown(windows.WinLocalSystemSid) {
+			t.Fatalf("unexpected trustee %q in %s", f[5], sddl)
 		}
 	}
 	if strings.Contains(sddl, "(D;") {

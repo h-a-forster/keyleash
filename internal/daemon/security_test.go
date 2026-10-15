@@ -209,6 +209,7 @@ func TestDecideSecretRateLimitAndDenyMethod(t *testing.T) {
 // Finding 4: a process inside a run pass's tree may read status and revoke
 // its own pass, nothing else; an unidentified caller may only read.
 func TestConfinedCallers(t *testing.T) {
+	requireProcessBinding(t)
 	e := newEnv(t, nil)
 	e.unlock()
 	e.addKeys()
@@ -290,6 +291,7 @@ func TestConfinedCallers(t *testing.T) {
 // Finding 4: only a run pass bound to the caller's own verified PID, within
 // the defaults, is issued without a step-up.
 func TestRunPassWithoutStepUpOnlyWithinDefaults(t *testing.T) {
+	requireProcessBinding(t)
 	e := newEnv(t, nil)
 	e.unlock()
 	e.addKeys()
