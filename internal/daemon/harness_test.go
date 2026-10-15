@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
+	"github.com/h-a-forster/keyleash/internal/procinfo"
 	"github.com/h-a-forster/keyleash/internal/provider"
 	"github.com/h-a-forster/keyleash/internal/proxy"
 	"github.com/h-a-forster/keyleash/internal/vault"
@@ -369,7 +371,7 @@ func (e *env) start() {
 			return 0, errors.New("unknown peer")
 		},
 		PeerResolver: func(local, remote netip.AddrPort) proxy.ClientInfo {
-			return proxy.ClientInfo{PID: int(e.peerPID.Load()), Image: `C:\tools\agent.exe`}
+			return proxy.ClientInfo{PID: int(e.peerPID.Load()), Image: testClientImage}
 		},
 		manualPresence:     true,
 		manualHousekeeping: true,
@@ -773,4 +775,23 @@ func (j *fakeJobs) held() int {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return len(j.members)
+}
+
+// testClientImage is the executable path the fake PeerResolver attributes
+// proxy requests to, in this OS's path syntax (audit records keep its base
+// name, "agent.exe").
+var testClientImage = filepath.Join(string(filepath.Separator)+"tools", "agent.exe")
+
+// requireProcessBinding skips a test that needs process-bound passes on a
+// platform where procinfo has no implementation (Linux and macOS for now;
+// see README and docs/USAGE.md). The daemon refuses such passes there (fail
+// closed), which TestBindPIDUnsupportedFailsClosed checks. Any other lookup
+// failure is a real error.
+func requireProcessBinding(t *testing.T) {
+	t.Helper()
+	if _, err := procinfo.Lookup(os.Getpid()); errors.Is(err, procinfo.ErrUnsupported) {
+		t.Skip("process-bound passes are not supported on this platform (procinfo unsupported)")
+	} else if err != nil {
+		t.Fatalf("procinfo.Lookup(self): %v", err)
+	}
 }

@@ -278,7 +278,20 @@ func TestRequestLimit(t *testing.T) {
 	}
 }
 
+// Run shuts down and releases the instance lock both when its context is
+// cancelled (Ctrl-C) and when an admin caller asks it to stop (keyleash
+// stop, POST /v1/shutdown).
 func TestRunStopsOnCancel(t *testing.T) {
+	for _, viaShutdown := range []bool{false, true} {
+		name := "cancel"
+		if viaShutdown {
+			name = "shutdown"
+		}
+		t.Run(name, func(t *testing.T) { testRunStops(t, viaShutdown) })
+	}
+}
+
+func testRunStops(t *testing.T, viaShutdown bool) {
 	dir := t.TempDir()
 	if _, err := Init(dir, InitOptions{Method: "passphrase", Passphrase: testPassphrase}); err != nil {
 		t.Fatal(err)
@@ -287,23 +300,47 @@ func TestRunStopsOnCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	admin := newMemListener()
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(ctx, Options{DataDir: dir, Config: testConfig(t), PresenceSource: &fakePresence{},
-			ProxyListener: ln, AdminListener: newMemListener(), Logger: slog.New(slog.DiscardHandler)})
+			ProxyListener: ln, AdminListener: admin, Logger: slog.New(slog.DiscardHandler),
+			AdminPeerPID: func(net.Conn) (int, error) { return os.Getpid(), nil }})
 	}()
-	time.Sleep(200 * time.Millisecond)
-	cancel()
+	if viaShutdown {
+		c := client.New(admin.Dial)
+		defer c.Close()
+		var err error
+		for i := 0; i < 100; i++ {
+			sctx, scancel := context.WithTimeout(t.Context(), 5*time.Second)
+			err = c.Shutdown(sctx)
+			scancel()
+			if err == nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond) // Run may still be starting
+		}
+		if err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+	} else {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Run: %v", err)
 		}
 	case <-time.After(40 * time.Second):
-		t.Fatal("Run did not return after cancel")
+		t.Fatal("Run did not return")
 	}
 	// The instance lock was released.
+	if running, err := Running(dir); err != nil || running {
+		t.Fatalf("instance lock still held after Run returned (running=%v, err=%v)", running, err)
+	}
 	if _, err := Init(dir, InitOptions{Method: "passphrase", Passphrase: testPassphrase}); !errors.Is(err, ErrAlreadyInitialized) {
 		t.Fatalf("re-init: %v", err)
 	}

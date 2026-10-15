@@ -59,7 +59,7 @@ transitions are audited.
 
 | Event | From | To | Side effects |
 |---|---|---|---|
-| unlock (slot verified) | Locked | Unlocked | new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit |
+| unlock (slot verified) | Locked | Unlocked | a `vault.prev` left under an older DEK by an interrupted re-key is replaced (audit `prev_scrub` {ok}, spec §5.4); new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit |
 | presence Idle ≥ idle_after | Unlocked | Away | `ResetSession("away")`; away timer starts |
 | presence ScreenLocked | Unlocked | Away or Locked | per `presence.screen_lock` |
 | presence Active | Away | Unlocked | |
@@ -196,7 +196,8 @@ as `Requester`. Proxy approvals (`over_limit`, `unknown_model`) carry PID 0.
   `LOCAL_PEERPID`, FreeBSD `LOCAL_PEERCRED` `cr_pid`; elsewhere unknown;
   `Options.AdminPeerPID` overrides it). The `guard` middleware then applies
   confinement (SPEC §12): `GET /v1/status`, `POST /v1/lock` and
-  `POST /v1/panic` always pass; a confined caller (a member of any held run
+  `POST /v1/panic` always pass (`POST /v1/shutdown` does not: a confined
+  or unidentified caller gets 403 `confined`); a confined caller (a member of any held run
   job, or inside an active run pass's process tree) may only `DELETE
   /v1/passes` for its own pass (`inRunTree`: job member or descendant); an
   unidentified caller may only read; everything else → 403 `confined`.
@@ -214,10 +215,11 @@ as `Requester`. Proxy approvals (`over_limit`, `unknown_model`) carry PID 0.
 
 | Method | Path | Body → Response |
 |---|---|---|
-| GET | /v1/status | → state, trip reason, lease, session, limits status, in-flight, degraded presence, vault info, `approval_method` (the queue's current approver), `config_changes`, `pass_store_changes` |
+| GET | /v1/status | → state, trip reason, lease, session, limits status, in-flight, degraded presence, vault info, `data_dir` (absolute), `approval_method` (the queue's current approver), `config_changes`, `pass_store_changes` |
 | POST | /v1/unlock | {method: hello\|passphrase\|recovery\|dpapi, secret?, accept_rollback?} → status (a rollback → 409 `rollback` with the file and recorded seqs; `accept_rollback` accepts it for this unlock only, not with dpapi, audited `accept_rollback {file_seq, recorded_seq}`; status `vault.rollback_*`) |
 | POST | /v1/lock | → status (any caller) |
 | POST | /v1/panic | {revoke_upstream?} → summary (any caller) |
+| POST | /v1/shutdown | → 202 {stopping} (no step-up; not for confined or unidentified callers); audit `shutdown` {requester_pid, requester}, then the *Shutdown* sequence runs after the response |
 | POST | /v1/away | {budget ≤ `limits.away.max_grant`, for, pass?} (step-up, never coalesced) → grant |
 | POST | /v1/resume | (step-up) leave Tripped, accepting what the trip reported |
 | GET/POST/DELETE | /v1/passes | create {name, kind, providers, models, limits, ttl, bind?} (lists ≤ 32, no duplicates; step-up unless a run pass bound to the caller within the defaults; refused while Away; order: issue → job confine → audit `pass_issue` → limits, rolled back on failure) → {pass, token (once)}; list; revoke {id} (a confined caller: its own pass only) |
@@ -234,6 +236,8 @@ There is no rollback-arming endpoint (the former `POST
 `accept_rollback` flag of the unlock request.
 | GET | /v1/audit/tail | ?n= |
 | GET | /v1/config | effective config (TOML) |
+| POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` {op: rotate_recovery, ok, requester_pid} / `slot_change` {op}, never the code. Not committed if the caller has disconnected by the time the step-up is decided (audit `rekey` {ok: false, reason: caller_gone}); the CLI checks the audit log (its own requester_pid only) when it gets no answer |
+| DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key |
 
 Secrets travel only in request bodies over the ACL-protected channel and are
 wiped after use. Responses never contain provider keys; a pass token is
@@ -241,6 +245,8 @@ returned exactly once, at creation.
 
 ## Shutdown
 
+Triggered by the context ending (Ctrl-C, SIGTERM, logoff) or by `POST
+/v1/shutdown` (`keyleash stop`); both run the same sequence (`Close`).
 Stop accepting proxy connections; wait up to `ShutdownGrace` (30 s) for
 in-flight requests; set the state to Locked (no new reservation can start);
 if it was unlocked, settle every reservation still in flight at
@@ -248,4 +254,9 @@ its reserved amount (`ExpireInFlight(-1)`, while the ledger MAC key is set),
 flush the ledger, write the checkpoint to the vault and state.json, audit
 `lock` and anchor; then `ledger.Close`, `audit.Close`,
 `passes.SetMACKey(nil)`, `vault.Lock`; close the run jobs (members end with
-kill-on-close); remove the socket; release the instance lock.
+kill-on-close); remove the socket; release the instance lock. The admin
+server is shut down before all this, so `keyleash stop` waits for the
+instance lock to be free (`daemon.Running`) before reporting the daemon
+stopped. It waits on the `data_dir` the daemon reported in status, not its
+own `KEYLEASH_HOME`: on Windows the admin pipe is per user, so the two can
+differ.

@@ -154,6 +154,9 @@ type Vault struct {
 	acceptRollback bool           // AcceptRollback armed for the next strong unlock
 	accepted       *RollbackError // the rollback the last unlock accepted, if any
 	seqFloor       uint64         // the next commit's seq must exceed this
+
+	stalePrev    bool  // the last unlock found (and scrubbed) a .prev under another DEK
+	stalePrevErr error // ErrPrevNotScrubbed if that .prev could not be scrubbed
 }
 
 // RollbackError is the ErrRollback an unlock returns: the vault file's seq
@@ -305,6 +308,20 @@ func (v *Vault) RecoveredFromPrev() bool {
 	return v.fromPrev
 }
 
+// TakeStalePrev reports whether the last successful unlock found a .prev
+// that does not authenticate under the live DEK (left by a re-key that
+// crashed between its two renames, or whose scrub failed) and replaced it
+// with a copy of the live state. err is ErrPrevNotScrubbed when that .prev
+// could be neither replaced nor removed. Reading the result clears it, so
+// each finding is reported once.
+func (v *Vault) TakeStalePrev() (found bool, err error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	found, err = v.stalePrev, v.stalePrevErr
+	v.stalePrev, v.stalePrevErr = false, nil
+	return found, err
+}
+
 // ID returns the vault id.
 func (v *Vault) ID() string {
 	v.mu.RLock()
@@ -394,6 +411,7 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 
 	v.mu.RLock()
 	f := v.f // immutable snapshot
+	fromPrev := v.fromPrev
 	v.mu.RUnlock()
 
 	var dek *secmem.Buffer
@@ -445,6 +463,16 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 		dek.Destroy()
 		return err
 	}
+	if !fromPrev {
+		// A .prev of this vault with a higher seq than the main file means
+		// the main file was rolled back (e.g. an old backup restored
+		// without its sidecar). It is the same signal as a newer sidecar
+		// record, and .prev is left untouched (spec §5.4).
+		if pf, perr := readFile(PrevPath(v.path)); perr == nil && pf.VaultID == f.VaultID && pf.Seq > f.Seq {
+			sc.rollback = true
+			sc.seq = max(sc.seq, pf.Seq)
+		}
+	}
 
 	v.mu.Lock()
 	if v.f != f {
@@ -485,6 +513,11 @@ func (v *Vault) unlock(slotType string, kek func(s *slotV1) (*secmem.Buffer, err
 	} else if !sc.current {
 		// Missing, stale or unauthentic record: refresh it (best effort).
 		_ = writeSidecar(v.path, v.f.VaultID, v.f.Seq, dek.Bytes())
+	}
+	if !v.fromPrev {
+		// A crash between a re-key's two renames leaves .prev under the
+		// old DEK, openable by the slots that re-key removed (spec §5.4).
+		v.stalePrev, v.stalePrevErr = scrubStalePrev(v.path, v.f, dek.Bytes())
 	}
 	v.mu.Unlock()
 	old.Destroy()
@@ -868,7 +901,10 @@ func (v *Vault) AddSlot(spec SlotSpec) (SlotInfo, error) {
 
 // RotateRecovery replaces every recovery slot with a new one, re-keys the
 // vault (see rekeyLocked) and returns the new code. Once it returns, the old
-// code opens neither the live file nor .prev. Copies of the vault file taken
+// code opens neither the live file nor .prev. If the process dies between
+// the main rename and the .prev rename, .prev keeps the old DEK (and opens
+// with the old code) until the next unlock, which replaces it with a copy of
+// the live state (see TakeStalePrev). Copies of the vault file taken
 // before the rotation (backups) still open with the old code and reveal the
 // entries as they were then, but never the new DEK. ErrPrevNotScrubbed
 // comes with the new code: the rotation is committed but a stale .prev

@@ -360,14 +360,14 @@ func TestRecoveryConfirmed(t *testing.T) {
 func TestConfirmRecoveryLoopsUntilMatch(t *testing.T) {
 	code := "0123-4567-89AB-CDEF-GHJK-MNPQ-RSTV-WX10"
 	a, _, errb := newTestApp("nope\nRSTV\nwx10\n")
-	if err := a.confirmRecovery(code); err != nil {
+	if err := a.confirmRecovery(code, "not confirmed"); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Count(errb.String(), "does not match") != 2 {
 		t.Errorf("prompts: %s", errb.String())
 	}
 	a, _, _ = newTestApp("nope\n")
-	if err := a.confirmRecovery(code); err == nil {
+	if err := a.confirmRecovery(code, "not confirmed"); err == nil {
 		t.Error("EOF without a match must fail")
 	}
 }
@@ -552,12 +552,20 @@ func TestCommandsReportDaemonDown(t *testing.T) {
 	}
 }
 
+func TestStopWithoutDaemon(t *testing.T) {
+	a, out, errb := newTestApp("")
+	if code := a.main([]string{"stop"}); code != exitOK || !strings.Contains(out.String(), "not running") {
+		t.Fatalf("stop without a daemon: %d %q %q", code, out.String(), errb.String())
+	}
+}
+
 func TestUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{"nope"}, {"run"}, {"run", "--budget"}, {"away", "--budget", "5"}, {"pass"}, {"pass", "frob"},
 		{"audit"}, {"audit", "frob"}, {"config"}, {"usage", "--by", "day"}, {"limits", "set", "x"},
 		{"unlock", "--method", "telepathy"}, {"init", "--profile", "yolo"}, {"approvals", "approve"},
-		{"env", "--shell", "tcsh"}, {"help", "nope"},
+		{"env", "--shell", "tcsh"}, {"help", "nope"}, {"stop", "now"}, {"recovery"}, {"recovery", "frob"},
+		{"recovery", "rotate", "x"},
 	} {
 		a, _, errb := newTestApp("")
 		if code := a.main(args); code != exitUsage {

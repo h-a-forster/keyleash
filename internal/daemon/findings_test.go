@@ -53,6 +53,7 @@ func auditHas(t *testing.T, e *env, typ string, match func(map[string]any) bool)
 // use the run pass, while it is in the pass's job; a pass whose process
 // cannot be confined is not issued; restarting the daemon ends run passes.
 func TestFindingA_JobConfinement(t *testing.T) {
+	requireProcessBinding(t)
 	e := newEnv(t, nil)
 	e.unlock()
 	e.addKeys()
@@ -412,6 +413,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 
 // H: lock and panic work from a confined caller.
 func TestFindingH_LockPanicFromConfined(t *testing.T) {
+	requireProcessBinding(t)
 	e := newEnv(t, nil)
 	e.unlock()
 	e.addKeys()

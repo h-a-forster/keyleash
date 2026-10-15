@@ -50,9 +50,9 @@ var commands []*command
 
 func init() {
 	commands = []*command{
-		cmdInit, cmdDaemon, cmdStatus, cmdUnlock, cmdLock, cmdAdd, cmdKeys, cmdRmKey,
+		cmdInit, cmdDaemon, cmdStop, cmdStatus, cmdUnlock, cmdLock, cmdAdd, cmdKeys, cmdRmKey,
 		cmdRun, cmdEnv, cmdPass, cmdLimits, cmdAway, cmdResume, cmdUsage, cmdApprovals,
-		cmdAudit, cmdConfig, cmdDoctor, cmdPanic, cmdVersion, cmdHelp,
+		cmdAudit, cmdConfig, cmdRecovery, cmdDoctor, cmdPanic, cmdVersion, cmdHelp,
 	}
 }
 

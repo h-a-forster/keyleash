@@ -71,6 +71,7 @@ type testDaemon struct {
 	dir       string
 	d         *daemon.Daemon
 	adminAddr string // "" when the default admin pipe/socket is used
+	recovery  string // the recovery code from Init
 	logs      *syncBuffer
 	upHits    atomic.Int32
 }
@@ -83,9 +84,11 @@ func startTestDaemon(t *testing.T, tcpAdmin bool, mutate ...func(*daemon.Options
 	restore := vault.SetTestKDFParams()
 	t.Cleanup(restore)
 	td := &testDaemon{t: t, dir: t.TempDir(), logs: &syncBuffer{}}
-	if _, err := daemon.Init(td.dir, daemon.InitOptions{Method: "passphrase", Passphrase: []byte(testPassphrase)}); err != nil {
+	code, err := daemon.Init(td.dir, daemon.InitOptions{Method: "passphrase", Passphrase: []byte(testPassphrase)})
+	if err != nil {
 		t.Fatal(err)
 	}
+	td.recovery = code
 	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		td.upHits.Add(1)
 		io.Copy(io.Discard, r.Body)

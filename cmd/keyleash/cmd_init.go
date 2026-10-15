@@ -157,7 +157,7 @@ func runInit(ctx context.Context, a *app, args []string) error {
 	fmt.Fprintf(a.stdout, "    %s\n", code)
 	fmt.Fprintln(a.stdout)
 	if interactive {
-		if err := a.confirmRecovery(code); err != nil {
+		if err := a.confirmRecovery(code, "recovery code not confirmed; the vault was created, so keep the code you were shown"); err != nil {
 			return err
 		}
 		fmt.Fprintln(a.stdout, "Recovery code confirmed. Clear your terminal scrollback if others can see this screen.")
@@ -286,13 +286,13 @@ func recoveryConfirmed(code, typed string) bool {
 }
 
 // confirmRecovery asks for the last group of the recovery code until it
-// matches (or input ends).
-func (a *app) confirmRecovery(code string) error {
+// matches (or input ends, which returns an error with message notConfirmed).
+func (a *app) confirmRecovery(code, notConfirmed string) error {
 	for i := 0; ; i++ {
 		fmt.Fprint(a.stderr, "To confirm you saved it, type the LAST group of the recovery code: ")
 		line, err := readLineBounded(a.stdin)
 		if err != nil {
-			return errors.New("recovery code not confirmed; the vault was created, so keep the code you were shown")
+			return errors.New(notConfirmed)
 		}
 		ok := recoveryConfirmed(code, string(line))
 		secmem.Wipe(line)

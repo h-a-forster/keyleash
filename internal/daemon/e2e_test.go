@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,7 +16,9 @@ import (
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
+	"github.com/h-a-forster/keyleash/internal/procinfo"
 	"github.com/h-a-forster/keyleash/internal/proxy"
+	"github.com/h-a-forster/keyleash/internal/vault"
 )
 
 func TestLockedRefusesWith423(t *testing.T) {
@@ -802,5 +807,169 @@ func TestInvalidConfigRefused(t *testing.T) {
 		AdminListener: newMemListener(), manualPresence: true, manualHousekeeping: true})
 	if err == nil || !strings.Contains(err.Error(), "keyleash init") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Where process identity is unavailable (procinfo unsupported), a pass that
+// asks to be bound to a process is refused, never issued unbound.
+func TestBindPIDUnsupportedFailsClosed(t *testing.T) {
+	if _, err := procinfo.Lookup(os.Getpid()); !errors.Is(err, procinfo.ErrUnsupported) {
+		t.Skip("process binding is supported here; covered by the bound-pass tests")
+	}
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	for _, req := range []client.PassCreateRequest{
+		{Name: "bound", Providers: []string{"anthropic"}, BindPID: os.Getpid()},
+		{Name: "run", Kind: "run", Providers: []string{"anthropic"}, BindPID: os.Getpid()},
+	} {
+		err := e.withOwner(func(ctx context.Context) error {
+			_, err := e.c.CreatePass(ctx, req)
+			return err
+		})
+		if !isAPI(err, 400, client.CodeBadRequest) {
+			t.Fatalf("%s pass bound to a process: %v", req.Name, err)
+		}
+	}
+	passes, err := e.c.Passes(e.ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(passes) != 0 {
+		t.Fatalf("passes issued: %+v", passes)
+	}
+}
+
+// A rotation whose caller is gone by the time the step-up is decided (the
+// CLI was interrupted) is not committed: nobody would receive the new code,
+// and the old one would be dead.
+func TestRotateRecoveryNotCommittedWhenCallerGone(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.appr.approve.Store(true)
+	ctx, cancel := context.WithCancel(e.ctx())
+	defer cancel()
+	e.d.testBeforeRekey = func(rctx context.Context) {
+		cancel() // approved, then the caller is interrupted
+		select {
+		case <-rctx.Done():
+		case <-time.After(10 * time.Second):
+			t.Error("request context not cancelled after the caller went away")
+		}
+	}
+	if r, err := e.c.RotateRecovery(ctx); err == nil || r.Code != "" {
+		t.Fatalf("rotate for a gone caller: %+v %v", r, err)
+	}
+	// Unlock waits for the re-key to finish (unlockMu); the old code must
+	// still work.
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.c.Unlock(e.ctx(), client.MethodRecovery, []byte(e.recovery)); err != nil {
+		t.Fatalf("old recovery code after an aborted rotation: %v", err)
+	}
+	recs, err := e.c.AuditTail(e.ctx(), 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aborted := false
+	for _, rec := range recs {
+		if rec.Type == "rekey" && rec.Fields["ok"] == true {
+			t.Fatalf("rotation committed: %+v", rec.Fields)
+		}
+		aborted = aborted || (rec.Type == "rekey" && rec.Fields["reason"] == "caller_gone")
+	}
+	if !aborted {
+		t.Fatal("aborted rotation not audited")
+	}
+}
+
+// A re-key interrupted between its two renames leaves vault.prev under the
+// old vault key; the next unlock replaces it and audits that (spec §5.4).
+func TestUnlockScrubsStalePrev(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	vpath := filepath.Join(e.dir, VaultFile)
+	e.addKeys() // at least one write, so vault.prev exists
+	stale, err := os.ReadFile(vault.PrevPath(vpath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.appr.approve.Store(true)
+	if _, err := e.c.RotateRecovery(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.stop()
+	// The crash: main renamed, .prev not yet.
+	if err := os.WriteFile(vault.PrevPath(vpath), stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	e.unlock()
+	prev, err := os.ReadFile(vault.PrevPath(vpath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(prev, stale) {
+		t.Fatal("stale vault.prev kept after unlock")
+	}
+	p := filepath.Join(t.TempDir(), "vault.json")
+	if err := os.WriteFile(p, prev, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old, err := vault.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := old.UnlockRecovery(e.recovery); !errors.Is(err, vault.ErrWrongSecret) {
+		t.Fatalf("old recovery code on vault.prev after unlock: %v", err)
+	}
+	if !auditHas(t, e, "prev_scrub", func(f map[string]any) bool { return f["ok"] == true }) {
+		t.Fatal("scrub not audited")
+	}
+	if s := e.status(); s.Vault.PrevNotScrubbed {
+		t.Fatal("status reports vault.prev not scrubbed")
+	}
+}
+
+// An old vault file restored without its anti-rollback sidecar, next to a
+// newer vault.prev, is refused as a rollback (audited, shown in status)
+// instead of unlocking and overwriting the newer vault.prev (spec §5.4).
+func TestRestoredVaultWithoutSidecarIsRollback(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	vpath := filepath.Join(e.dir, VaultFile)
+	backup, err := os.ReadFile(vpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.appr.approve.Store(true)
+	if _, err := e.c.RotateRecovery(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.stop()
+	prev, err := os.ReadFile(vault.PrevPath(vpath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vpath, backup, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(vault.SeqPath(vpath)); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	if _, err := e.c.Unlock(e.ctx(), client.MethodRecovery, []byte(e.recovery)); !isAPI(err, 409, client.CodeRollback) {
+		t.Fatalf("unlock of a restored file = %v", err)
+	}
+	if s := e.status(); !s.Vault.RollbackDetected || s.Vault.RollbackRecordedSeq <= s.Vault.RollbackFileSeq {
+		t.Fatalf("status = %+v", s.Vault)
+	}
+	if !auditHas(t, e, "unlock", func(f map[string]any) bool { return f["reason"] == "rollback" }) {
+		t.Fatal("rollback not audited")
+	}
+	if now, _ := os.ReadFile(vault.PrevPath(vpath)); !bytes.Equal(now, prev) {
+		t.Fatal("newer vault.prev overwritten")
 	}
 }

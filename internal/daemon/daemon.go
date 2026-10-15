@@ -199,6 +199,10 @@ type Daemon struct {
 	// unlockMu serialises slow vault operations (unlock, re-key).
 	unlockMu sync.Mutex
 
+	// testBeforeRekey, set only by tests, runs in rekey under unlockMu
+	// just before the caller-gone check.
+	testBeforeRekey func(ctx context.Context)
+
 	// auditMu guards the audit health flag.
 	auditMu     sync.Mutex
 	auditBroken bool
@@ -214,6 +218,10 @@ type Daemon struct {
 	closed   bool
 	closeErr error
 	fatalCh  chan error
+	// stopCh is closed when an admin caller asks the daemon to stop
+	// (POST /v1/shutdown); Run then shuts down as on a signal.
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // DefaultDataDir returns the data directory: $KEYLEASH_HOME if set, else
@@ -247,8 +255,8 @@ func DefaultDataDir() (string, error) {
 	}
 }
 
-// Run starts the daemon and serves until ctx is done or a server fails,
-// then shuts down.
+// Run starts the daemon and serves until ctx is done, a server fails or an
+// admin caller asks it to stop (keyleash stop), then shuts down.
 func Run(ctx context.Context, opts Options) error {
 	d, err := Start(ctx, opts)
 	if err != nil {
@@ -257,6 +265,7 @@ func Run(ctx context.Context, opts Options) error {
 	var runErr error
 	select {
 	case <-ctx.Done():
+	case <-d.stopCh:
 	case runErr = <-d.fatalCh:
 	}
 	if err := d.Close(); err != nil && runErr == nil {
@@ -269,7 +278,7 @@ func Run(ctx context.Context, opts Options) error {
 // running daemon in state Locked. ctx bounds the daemon's lifetime; Close
 // shuts it down explicitly.
 func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
-	d := &Daemon{opts: opts, fatalCh: make(chan error, 4)}
+	d := &Daemon{opts: opts, fatalCh: make(chan error, 4), stopCh: make(chan struct{})}
 	d.log = opts.Logger
 	if d.log == nil {
 		d.log = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -538,8 +547,25 @@ func (d *Daemon) fatal(err error) {
 	}
 }
 
+// Running reports whether a daemon holds the instance lock of dataDir. The
+// lock is released last in Close, after the ledger, state, audit and vault
+// are saved and closed, so false means a stopping daemon has finished.
+// (The check briefly opens the lock file; a daemon starting at that very
+// moment may fail with "already running".)
+func Running(dataDir string) (bool, error) {
+	return instanceLockHeld(filepath.Join(dataDir, InstanceLock))
+}
+
 // Done returns a channel that receives a fatal server error, if any.
 func (d *Daemon) Done() <-chan error { return d.fatalCh }
+
+// StopRequested returns a channel that is closed once an admin caller has
+// asked the daemon to stop (POST /v1/shutdown). Run then calls Close; a
+// caller that uses Start directly should do the same.
+func (d *Daemon) StopRequested() <-chan struct{} { return d.stopCh }
+
+// requestStop asks Run to shut down. It is idempotent.
+func (d *Daemon) requestStop() { d.stopOnce.Do(func() { close(d.stopCh) }) }
 
 // ProxyAddr returns the proxy's listen address.
 func (d *Daemon) ProxyAddr() string { return d.proxyLn.Addr().String() }

@@ -209,6 +209,7 @@ func TestDecideSecretRateLimitAndDenyMethod(t *testing.T) {
 // Finding 4: a process inside a run pass's tree may read status and revoke
 // its own pass, nothing else; an unidentified caller may only read.
 func TestConfinedCallers(t *testing.T) {
+	requireProcessBinding(t)
 	e := newEnv(t, nil)
 	e.unlock()
 	e.addKeys()
@@ -245,6 +246,7 @@ func TestConfinedCallers(t *testing.T) {
 			return err
 		},
 		"revoke another": func() error { return e.c.RevokePass(e.ctx(), other.Pass.ID) },
+		"stop daemon":    func() error { return e.c.Shutdown(e.ctx()) },
 	} {
 		if err := call(); !isAPI(err, 403, client.CodeConfined) {
 			t.Errorf("%s from a confined caller: %v", name, err)
@@ -272,6 +274,14 @@ func TestConfinedCallers(t *testing.T) {
 	if err := e.c.RevokePass(e.ctx(), other.Pass.ID); !isAPI(err, 403, client.CodeConfined) {
 		t.Fatalf("unknown caller revoke: %v", err)
 	}
+	if err := e.c.Shutdown(e.ctx()); !isAPI(err, 403, client.CodeConfined) {
+		t.Fatalf("unknown caller stop: %v", err)
+	}
+	select {
+	case <-e.d.StopRequested():
+		t.Fatal("a refused stop request still stopped the daemon")
+	default:
+	}
 	// Locking only adds protection: any caller may (finding H).
 	if _, err := e.c.Lock(e.ctx()); err != nil {
 		t.Fatalf("unknown caller lock: %v", err)
@@ -281,6 +291,7 @@ func TestConfinedCallers(t *testing.T) {
 // Finding 4: only a run pass bound to the caller's own verified PID, within
 // the defaults, is issued without a step-up.
 func TestRunPassWithoutStepUpOnlyWithinDefaults(t *testing.T) {
+	requireProcessBinding(t)
 	e := newEnv(t, nil)
 	e.unlock()
 	e.addKeys()
@@ -747,4 +758,64 @@ func TestUpstreamRefusalCostsNothing(t *testing.T) {
 	if got, _ := limitSettled(e.status(), "global", "session"); got != 0 {
 		t.Fatalf("session spend after a refused request = %s", got)
 	}
+}
+
+// keyleash stop: an identified, unconfined caller may stop the daemon
+// without a step-up; the request is audited and the shutdown saves state
+// like a signal does (the ledger verifies after a restart).
+func TestShutdownRequest(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	if r := e.anthropic(tok); r.status != 200 {
+		t.Fatalf("request: %d", r.status)
+	}
+	asked := len(e.appr.requests())
+	select {
+	case <-e.d.StopRequested():
+		t.Fatal("stop requested before anyone asked")
+	default:
+	}
+	if err := e.c.Shutdown(e.ctx()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-e.d.StopRequested():
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopRequested not signalled")
+	}
+	if n := len(e.appr.requests()); n != asked {
+		t.Fatalf("stop asked for %d step-ups", n-asked)
+	}
+	// A second request is harmless.
+	if err := e.c.Shutdown(e.ctx()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	recs, err := e.c.AuditTail(e.ctx(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range recs {
+		if r.Type == "shutdown" {
+			found = true
+			if pid, _ := r.Fields["requester_pid"].(float64); int(pid) != int(e.adminPID.Load()) {
+				t.Fatalf("shutdown record = %+v", r)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no shutdown audit record")
+	}
+	e.restart()
+	e.unlock()
+	if st := e.status(); st.State != client.StateUnlocked {
+		t.Fatalf("after stop and restart: %s (%s)", st.State, st.TripReason)
+	}
+	v, err := e.c.AuditVerify(e.ctx())
+	if err != nil || !v.OK {
+		t.Fatalf("audit after stop = %+v %v", v, err)
+	}
+	e.assertNoSecrets(tok)
 }

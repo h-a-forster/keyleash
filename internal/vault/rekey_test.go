@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -163,6 +164,209 @@ func TestRotateRecoveryKillsOldCode(t *testing.T) {
 			t.Fatalf("%s: new code = %v", filepath.Base(p), err)
 		}
 	}
+}
+
+// TestRotateRecoveryKeepsOtherSlots: after a rotation the passphrase and
+// hello slots still open the live file and .prev, entries survive with
+// recomputed fingerprints, and exactly one recovery slot remains.
+func TestRotateRecoveryKeepsOtherSlots(t *testing.T) {
+	v, path, code := newTestVault(t)
+	h := newFakeHello(t, "keyleash-test-key", 2048)
+	if _, err := v.AddSlot(SlotSpec{Type: SlotHello, Label: "hello", Hello: h}); err != nil {
+		t.Fatal(err)
+	}
+	e, err := v.AddEntry("anthropic", KindAPIKey, "a", testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slotsBefore := len(v.Slots())
+	newCode, err := v.RotateRecovery()
+	if err != nil || newCode == code {
+		t.Fatalf("RotateRecovery: %v", err)
+	}
+	if _, err := parseRecoveryCode(newCode); err != nil {
+		t.Fatalf("new code does not parse: %v", err)
+	}
+	if strings.Contains(string(readBytes(t, path)), newCode) {
+		t.Fatal("vault file contains the recovery code")
+	}
+	recovery := 0
+	for _, s := range v.Slots() {
+		if s.Type == SlotRecovery {
+			recovery++
+		}
+	}
+	if recovery != 1 || len(v.Slots()) != slotsBefore {
+		t.Fatalf("slots after rotation: %d recovery of %d (before %d)", recovery, len(v.Slots()), slotsBefore)
+	}
+	fp, _ := v.Fingerprint(testSecret)
+	if v.Entries()[0].Fingerprint != fp || fp == e.Fingerprint {
+		t.Fatal("fingerprint not recomputed under the new DEK")
+	}
+	live := dekOf(v)
+	v.Lock()
+	for _, p := range []string{path, PrevPath(path)} {
+		unlocks := map[string]func(x *Vault) error{
+			"passphrase": func(x *Vault) error { return x.UnlockPassphrase(testPass) },
+			"hello":      func(x *Vault) error { return x.UnlockHello(context.Background(), h, "") },
+			"new code":   func(x *Vault) error { return x.UnlockRecovery(newCode) },
+		}
+		for name, unlock := range unlocks {
+			x := openCopy(t, readBytes(t, p))
+			if err := unlock(x); err != nil {
+				t.Fatalf("%s with %s: %v", filepath.Base(p), name, err)
+			}
+			if !bytes.Equal(dekOf(x), live) {
+				t.Fatalf("%s with %s: not the live DEK", filepath.Base(p), name)
+			}
+			if got := mustSecret(t, x, e.ID); !bytes.Equal(got, testSecret) {
+				t.Fatalf("%s with %s: secret mismatch", filepath.Base(p), name)
+			}
+		}
+	}
+	// The live vault reopens normally (sidecar matches the new state).
+	v2, _ := Open(path)
+	if err := v2.UnlockPassphrase(testPass); err != nil {
+		t.Fatal(err)
+	}
+	// Verifying (step-up) uses the new code, never the old one.
+	if err := v2.VerifyRecovery(newCode); err != nil {
+		t.Fatalf("verify new code: %v", err)
+	}
+	if err := v2.VerifyRecovery(code); !errors.Is(err, ErrWrongSecret) {
+		t.Fatalf("verify old code: %v", err)
+	}
+}
+
+// TestRotateRecoveryCrashAndRollback covers the states a crash or a restore
+// can leave around a rotation (writeAtomic in writeRekey mode).
+func TestRotateRecoveryCrashAndRollback(t *testing.T) {
+	type files struct{ main, prev, seq []byte }
+	snapshot := func(t *testing.T, path string) files {
+		return files{readBytes(t, path), readBytes(t, PrevPath(path)), readBytes(t, SeqPath(path))}
+	}
+	put := func(t *testing.T, path string, f files) {
+		t.Helper()
+		for p, b := range map[string][]byte{path: f.main, PrevPath(path): f.prev, SeqPath(path): f.seq} {
+			if b == nil {
+				if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err := os.WriteFile(p, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// rotated returns a vault path with one entry, rotated once, plus the
+	// files before and after the rotation and both codes.
+	rotated := func(t *testing.T) (path string, before, after files, oldCode, newCode string) {
+		v, path, oldCode := newTestVault(t)
+		if _, err := v.AddEntry("anthropic", KindAPIKey, "a", testSecret); err != nil {
+			t.Fatal(err)
+		}
+		before = snapshot(t, path)
+		newCode, err := v.RotateRecovery()
+		if err != nil {
+			t.Fatal(err)
+		}
+		v.Lock()
+		return path, before, snapshot(t, path), oldCode, newCode
+	}
+	unlockRecovery := func(t *testing.T, path, code string) error {
+		t.Helper()
+		x, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return x.UnlockRecovery(code)
+	}
+
+	withSidecarModes(t, func(t *testing.T) {
+		t.Run("crash before the main rename", func(t *testing.T) {
+			// Nothing was committed: the old state (and code) stands, and
+			// the new code (never shown) does not open it.
+			path, before, _, oldCode, newCode := rotated(t)
+			put(t, path, before)
+			if err := unlockRecovery(t, path, newCode); !errors.Is(err, ErrWrongSecret) {
+				t.Fatalf("new code = %v", err)
+			}
+			if err := unlockRecovery(t, path, oldCode); err != nil {
+				t.Fatalf("old code = %v", err)
+			}
+		})
+		t.Run("crash after the main rename", func(t *testing.T) {
+			// Main is new; .prev and the sidecar are still the old ones.
+			path, before, after, oldCode, newCode := rotated(t)
+			put(t, path, files{after.main, before.prev, before.seq})
+			if err := unlockRecovery(t, path, oldCode); !errors.Is(err, ErrWrongSecret) {
+				t.Fatalf("old code on main = %v", err)
+			}
+			x, _ := Open(path)
+			if err := x.UnlockRecovery(newCode); err != nil {
+				t.Fatalf("new code = %v", err)
+			}
+			if got := mustSecret(t, x, x.Entries()[0].ID); !bytes.Equal(got, testSecret) {
+				t.Fatal("secret mismatch")
+			}
+			// That unlock replaced the stale .prev (old DEK, old code) with
+			// a copy of the live state, and reports it once.
+			if found, err := x.TakeStalePrev(); !found || err != nil {
+				t.Fatalf("stale .prev not scrubbed: found=%v err=%v", found, err)
+			}
+			if found, _ := x.TakeStalePrev(); found {
+				t.Fatal("stale .prev reported twice")
+			}
+			prev := readBytes(t, PrevPath(path))
+			if bytes.Equal(prev, before.prev) {
+				t.Fatal(".prev still holds the pre-rotation state")
+			}
+			if err := openCopy(t, prev).UnlockRecovery(oldCode); !errors.Is(err, ErrWrongSecret) {
+				t.Fatalf("old code on .prev = %v", err)
+			}
+			if err := openCopy(t, prev).UnlockRecovery(newCode); err != nil {
+				t.Fatalf("new code on .prev = %v", err)
+			}
+			// A .prev under the live DEK is left alone.
+			x.Lock()
+			if err := x.UnlockRecovery(newCode); err != nil {
+				t.Fatal(err)
+			}
+			if found, _ := x.TakeStalePrev(); found {
+				t.Fatal("current .prev reported as stale")
+			}
+		})
+		t.Run("main lost after the rotation", func(t *testing.T) {
+			// .prev was replaced with the new state: falling back to it is
+			// not a rollback and the old code does not open it.
+			path, _, after, oldCode, newCode := rotated(t)
+			put(t, path, files{nil, after.prev, after.seq})
+			if err := unlockRecovery(t, path, oldCode); !errors.Is(err, ErrWrongSecret) {
+				t.Fatalf("old code on .prev = %v", err)
+			}
+			x, _ := Open(path)
+			if !x.RecoveredFromPrev() {
+				t.Fatal("not recovered from .prev")
+			}
+			if err := x.UnlockRecovery(newCode); err != nil {
+				t.Fatalf("new code on .prev = %v", err)
+			}
+		})
+		t.Run("pre-rotation copy restored", func(t *testing.T) {
+			// Restoring the old vault file next to the current sidecar is a
+			// rollback even with the old code; the old code opens it only
+			// with the owner's explicit override.
+			path, before, after, oldCode, newCode := rotated(t)
+			put(t, path, files{before.main, before.prev, after.seq})
+			if err := unlockRecovery(t, path, oldCode); !errors.Is(err, ErrRollback) {
+				t.Fatalf("old code on a restored copy = %v", err)
+			}
+			if err := unlockRecovery(t, path, newCode); !errors.Is(err, ErrWrongSecret) {
+				t.Fatalf("new code on a restored copy = %v", err)
+			}
+		})
+	})
 }
 
 // withSidecarModes runs f with the native sidecar encoding and, on
@@ -423,6 +627,57 @@ func TestHelloPadding(t *testing.T) {
 		_, err := v.AddSlot(SlotSpec{Type: SlotHello, Hello: &liarHello{newFakeHello(t, "l", 2048)}})
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+// Review finding A: an old vault file restored without its sidecar must not
+// unlock silently and must not overwrite the newer .prev. A .prev with a
+// higher seq is a rollback signal like a newer sidecar record.
+func TestNewerPrevIsRollback(t *testing.T) {
+	withSidecarModes(t, func(t *testing.T) {
+		v, path, oldCode := newTestVault(t)
+		if _, err := v.AddEntry("anthropic", KindAPIKey, "a", testSecret); err != nil {
+			t.Fatal(err)
+		}
+		backup := readBytes(t, path)
+		newCode, err := v.RotateRecovery()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := v.AddEntry("openai", KindAPIKey, "b", testSecret); err != nil {
+			t.Fatal(err)
+		}
+		v.Lock()
+		prev := readBytes(t, PrevPath(path))
+		// Restore the pre-rotation file and drop the sidecar.
+		if err := os.WriteFile(path, backup, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(SeqPath(path)); err != nil {
+			t.Fatal(err)
+		}
+		x, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var re *RollbackError
+		if err := x.UnlockRecovery(oldCode); !errors.As(err, &re) || re.RecordedSeq <= re.FileSeq {
+			t.Fatalf("old code on a restored file without sidecar = %v", err)
+		}
+		if !bytes.Equal(readBytes(t, PrevPath(path)), prev) {
+			t.Fatal("newer .prev overwritten")
+		}
+		if err := openCopy(t, prev).UnlockRecovery(newCode); err != nil {
+			t.Fatalf("new code on .prev = %v", err)
+		}
+		// The owner's explicit override still works.
+		x.AcceptRollback()
+		if err := x.UnlockRecovery(oldCode); err != nil {
+			t.Fatalf("accepted rollback: %v", err)
+		}
+		if x.Seq() <= re.RecordedSeq {
+			t.Fatalf("seq after accepting = %d, want above %d", x.Seq(), re.RecordedSeq)
 		}
 	})
 }

@@ -61,7 +61,7 @@ Linux. Set `KEYLEASH_HOME` to use another one.
 ### 3. Start the daemon and unlock
 
 ```sh
-keyleash daemon               # foreground; Ctrl-C stops it
+keyleash daemon               # foreground; Ctrl-C (or keyleash stop) stops it
 keyleash daemon --background  # or detached, logging to <data dir>/daemon.log
 keyleash unlock               # Windows Hello, or the passphrase at a hidden prompt
 ```
@@ -167,10 +167,10 @@ that its processes cannot leave: a process the agent starts stays confined
 stays confined after the run ends until it exits. When the daemon exits,
 the run's processes are ended too (`[run] kill_on_daemon_exit = true`; set
 it to `false` to let them keep running without keyleash). Restarting the
-daemon ends earlier `keyleash run` passes. On Linux and macOS keyleash can
-only follow the parent-process chain, which a process can leave by
-detaching (double fork, `setsid`); such a process is no longer recognised
-as part of the run. It still cannot approve anything.
+daemon ends earlier `keyleash run` passes. On Linux, macOS and the BSDs
+keyleash cannot identify processes yet: passes there are not bound to a
+process, `keyleash run` passes cannot be created, and no caller is treated
+as confined.
 
 The agent still runs as you and can read your files; a `--isolate` mode
 that runs it under a restricted account is planned, not available.
@@ -357,6 +357,32 @@ program may lock or panic, including one inside `keyleash run`. Rotate
 the keys at the provider if you think one leaked; automatic upstream
 revocation is not implemented yet.
 
+**Stopping the daemon.** `keyleash stop` shuts the daemon down like Ctrl-C
+in its terminal: in-flight requests get up to 30 s (any still running are
+charged at their reserved amount), spend is saved, the vault locks, and
+with `[run] kill_on_daemon_exit` (default) programs started by `keyleash
+run` end. The command returns once the daemon has finished shutting down
+(it releases its instance lock last). It needs no step-up (a stopped daemon
+spends nothing) but is refused from inside `keyleash run`; use lock or
+panic there. That refusal is defence in depth, not a boundary: a program
+running as your user can end the daemon process directly. The request is
+in the audit log.
+
+**Rotating the recovery code.** `keyleash recovery rotate` (unlocked,
+step-up: Hello, your passphrase or the current recovery code) prints a new
+code once, like `init`, and asks you to re-type its last group. The vault
+gets a new data key, so the old code opens neither `vault.json` nor
+`vault.prev` (if keyleash is killed in the middle of the rotation,
+`vault.prev` can keep the old key until the next unlock, which replaces it
+and records `prev_scrub` in the audit log). Backups of the vault file made
+before the rotation still open with the old code and show the keys as they
+were then; rotate provider keys if the old code may have leaked.
+Interrupting the command while it waits for approval cancels the rotation.
+If the connection is lost while the rotation is being committed, the
+command checks the audit log and tells you whether it happened; if it did,
+the old code no longer works and the new one is lost, so run `keyleash
+recovery rotate` again.
+
 **Audit.** Every decision is in a hash-chained log. `keyleash audit tail`
 shows recent records (passes by id, keys by fingerprint, never secrets);
 `keyleash audit verify` checks the chain, and the keyed anchors while
@@ -367,7 +393,7 @@ unlocked. `keyleash usage` shows spend by pass, model, provider and program.
 | Command | What it does |
 |---|---|
 | `init` | create the vault, recovery code and config |
-| `daemon [--background]` | run the daemon |
+| `daemon [--background]` / `stop` | run the daemon / stop it gracefully (refused inside `keyleash run`) |
 | `status [--json]` | state, lease, spend vs limits, active passes |
 | `unlock [--recovery] [--stdin]` / `lock` | unlock or lock the vault |
 | `add <provider> [--label] [--stdin]` | store a key (hidden prompt or stdin) |
@@ -381,6 +407,7 @@ unlocked. `keyleash usage` shows spend by pass, model, provider and program.
 | `approvals [approve <id> [--grant --for] [--stdin]\|deny <id>]` | pending step-up requests; approving asks for the passphrase or recovery code |
 | `audit verify\|tail` | check or read the audit log |
 | `config show\|check\|path` | effective configuration |
+| `recovery rotate` | new recovery code, shown once; re-keys the vault (step-up) |
 | `doctor [--json]` | environment checks |
 | `panic [--revoke-upstream]` | lock and revoke every pass |
 | `version`, `help [command]` | |
@@ -409,7 +436,7 @@ how old the pricing table is. Start there.
 | A tool still uses the real key | It reads a different variable or a config file. Remove the key from that file, and set the tool's base URL and key to the values from `keyleash env`. |
 | Requests go to a corporate proxy | `keyleash run`/`env` add loopback to `NO_PROXY`; tools that ignore `NO_PROXY` need their proxy setting changed. |
 | `proxy port … used by another program` | Free port 47114 or set `[proxy] port` and restart. |
-| `the vault file is older than the last recorded state` | A backup was restored or the file rolled back; the message shows the file's write number and the recorded one. If that was you: `keyleash unlock --accept-rollback` (passphrase, recovery code or Hello; it applies to that unlock only, is recorded in the audit log, and the regression is shown again). Review `keyleash keys` and vault slots afterwards. |
+| `the vault file is older than the last recorded state` | A backup was restored or the file rolled back (also detected when `vault.prev` is newer than `vault.json`, e.g. an old file restored without `vault.seq`); the message shows the file's write number and the recorded one. If that was you: `keyleash unlock --accept-rollback` (passphrase, recovery code or Hello; it applies to that unlock only, is recorded in the audit log, and the regression is shown again). Review `keyleash keys` and vault slots afterwards. |
 | `pass_store` trip / `pass store change: …` | `passes.json` no longer matches what keyleash recorded in the vault (edited, replaced or rolled back). `keyleash resume` revokes the added and changed passes; create new ones. |
 | Restoring a backup of the whole data directory | Restoring vault, ledger, audit log and passes.json together to an earlier point cannot be told apart from a deliberate restore: spend recorded since the backup is forgotten and passes revoked since then come back. Keep backups where agents cannot write, and revoke passes after a restore (`keyleash panic`, then unlock). |
 | `presence detection is degraded` | Low-level input hooks could not be installed; idle time falls back to `GetLastInputInfo`, which also counts injected input. |

@@ -41,6 +41,7 @@ func (d *Daemon) adminHandler() http.Handler {
 	mux.HandleFunc("POST /v1/unlock", d.hUnlock)
 	mux.HandleFunc("POST /v1/lock", d.hLock)
 	mux.HandleFunc("POST /v1/panic", d.hPanic)
+	mux.HandleFunc("POST /v1/shutdown", d.hShutdown)
 	mux.HandleFunc("POST /v1/away", d.hAway)
 	mux.HandleFunc("POST /v1/resume", d.hResume)
 	mux.HandleFunc("GET /v1/passes", d.hPassList)
@@ -161,6 +162,7 @@ func (d *Daemon) status() client.Status {
 		s.PresenceDegraded, s.PresenceDegradedReason = true, d.osSource.DegradedReason()
 	}
 	s.Vault.ID, s.Vault.Seq, s.Vault.Unlocked = d.vault.ID(), d.vault.Seq(), d.vault.IsUnlocked()
+	s.DataDir = d.dataDir
 	s.Vault.RecoveredFromPrev = d.vault.RecoveredFromPrev()
 	s.Vault.Slots = []client.Slot{}
 	for _, sl := range d.vault.Slots() {
@@ -236,6 +238,32 @@ func (d *Daemon) hPanic(w http.ResponseWriter, r *http.Request) {
 	}
 	sum.Status = d.status()
 	writeJSON(w, 200, sum)
+}
+
+// hShutdown asks the daemon to stop (keyleash stop). Stopping locks the
+// vault and ends every pass's use until the daemon runs again, so it needs
+// no step-up (spec §9 reserves those for calls that weaken protection or
+// spend more), but unlike lock and panic it is not open to every caller:
+// the guard refuses confined and unidentified callers (spec §12). That is
+// defence in depth, not a boundary: the daemon runs as the owner's user
+// with no restrictive process DACL, so a confined process can simply kill
+// it (which also locks the vault and spends nothing); the refusal only
+// keeps such a stop from passing as an orderly, owner-requested one. The
+// request is audited with the caller; the shutdown itself (docs/DAEMON.md
+// "Shutdown") runs after the response is sent.
+func (d *Daemon) hShutdown(w http.ResponseWriter, r *http.Request) {
+	pid := callerFrom(r.Context()).pid
+	name := "pid " + strconv.Itoa(pid)
+	if p, err := d.lookupProcess(pid); err == nil && p.Image != "" {
+		name = filepath.Base(p.Image)
+	}
+	d.auditEvent("shutdown", map[string]any{"requester_pid": pid, "requester": name})
+	d.log.Info("shutdown requested over the admin channel", "requester_pid", pid)
+	writeJSON(w, http.StatusAccepted, client.ShutdownResponse{Stopping: true})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	d.requestStop()
 }
 
 // ---- away / resume ---------------------------------------------------------
@@ -1200,6 +1228,12 @@ func (d *Daemon) hConfig(w http.ResponseWriter, _ *http.Request) {
 // ---- vault administration --------------------------------------------------
 
 func (d *Daemon) hRotateRecovery(w http.ResponseWriter, r *http.Request) {
+	// Reading the (empty) body to EOF also lets net/http notice a caller
+	// that disconnects, which cancels r.Context(); rekey checks it.
+	if err := readBody(r, &struct{}{}); err != nil {
+		d.writeErr(w, err)
+		return
+	}
 	if !d.vault.IsUnlocked() {
 		d.writeErr(w, statusErr(423, client.CodeLocked, "keyleash is locked"))
 		return
@@ -1210,7 +1244,7 @@ func (d *Daemon) hRotateRecovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var code string
-	err := d.rekey("rotate_recovery", func() error {
+	err := d.rekey(r.Context(), "rotate_recovery", func() error {
 		var rerr error
 		code, rerr = d.vault.RotateRecovery()
 		return rerr
@@ -1244,7 +1278,7 @@ func (d *Daemon) hRemoveSlot(w http.ResponseWriter, r *http.Request) {
 		d.writeErr(w, err)
 		return
 	}
-	err := d.rekey("remove_slot", func() error { return d.vault.RemoveSlot(id) })
+	err := d.rekey(r.Context(), "remove_slot", func() error { return d.vault.RemoveSlot(id) })
 	switch {
 	case err == nil, errors.Is(err, vault.ErrPrevNotScrubbed):
 		writeJSON(w, 200, struct{}{})
