@@ -32,7 +32,9 @@ go build -ldflags "-X main.version=$(git describe --tags --always)" -o keyleash 
 ```
 
 Windows is the primary platform. On Linux and macOS the vault, proxy and
-budgets work, but process-bound passes (`keyleash run`) are not supported yet.
+budgets work, but process-bound passes (`keyleash run`) are not supported yet,
+and idle and screen-lock detection are not implemented: only sleep and lease
+expiry lock the daemon automatically there.
 
 ### 2. Create the vault
 
@@ -409,7 +411,7 @@ unlocked. `keyleash usage` shows spend by pass, model, provider and program.
 | `config show\|check\|path` | effective configuration |
 | `recovery rotate` | new recovery code, shown once; re-keys the vault (step-up) |
 | `doctor [--json]` | environment checks |
-| `panic [--revoke-upstream]` | lock and revoke every pass |
+| `panic [--revoke-upstream]` | lock and revoke every pass (`--revoke-upstream` is not implemented yet) |
 | `version`, `help [command]` | |
 
 Read commands accept `--json`. `keyleash help <command>` has details.

@@ -24,8 +24,11 @@ Ledger.
 
 > **Status: pre-alpha.** The vault, proxy, budgets, presence lock and CLI
 > work and are tested end to end, but the project is new and unaudited. Try
-> it with keys you can rotate. Windows is the main platform; Linux and macOS
-> run everything except Windows Hello and process-bound passes.
+> it with keys you can rotate. Windows is the main platform. On Linux and
+> macOS the vault, proxy and hard limits work, but idle and screen-lock
+> detection, Windows Hello, DPAPI unlock and process-bound passes
+> (`keyleash run`) do not yet; only sleep and lease expiry lock it
+> automatically there.
 
 ## Quick start
 
@@ -106,7 +109,9 @@ administrator- or kernel-level attacker is out of scope. See
 
 - [Usage](docs/USAGE.md): setup, agents, editors, defaults, troubleshooting
 - [Specification](docs/SPEC.md): threat model, crypto design, behaviour
+- [Daemon](docs/DAEMON.md): daemon wiring and admin API
 - [Plan](docs/PLAN.md): build phases
+- [Changelog](CHANGELOG.md)
 
 ## License
 
