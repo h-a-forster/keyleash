@@ -416,8 +416,8 @@ worst case until they settle.
 - Embedded pricing table (JSON) with per-model rates per million tokens:
   input, output, cache write, cache read; plus `source_url` and `as_of` per
   entry. Model ids are matched exactly first, then by declared prefix/glob.
-- User override file merged on top. `keyleash doctor` reports models
-  seen in traffic that lack a price.
+- User override file merged on top. Models seen in traffic without a price
+  are recorded in `state.json`; no command lists them yet.
 
 ### 7.7 Persistence
 
