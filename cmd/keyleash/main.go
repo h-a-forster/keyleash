@@ -22,10 +22,31 @@ import (
 	"syscall"
 )
 
-// version is set at build time:
+// version can be set at build time:
 //
 //	go build -ldflags "-X main.version=v0.1.0" ./cmd/keyleash
+//
+// `go install` and plain `go build` record the module version instead, which
+// buildVersion falls back to.
 var version = "dev"
+
+// buildVersion picks the version to report: stamp when it was set at build
+// time, else the module version in the build info, else "dev".
+func buildVersion(stamp, module string) string {
+	if stamp != "dev" || module == "" || module == "(devel)" {
+		return stamp
+	}
+	return module
+}
+
+// currentVersion is the running binary's version.
+func currentVersion() string {
+	module := ""
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		module = bi.Main.Version
+	}
+	return buildVersion(version, module)
+}
 
 // Exit codes.
 const (
@@ -210,11 +231,12 @@ var cmdVersion = &command{
 		if _, err := parseFlags(fs, args, false); err != nil {
 			return err
 		}
-		info := map[string]string{"version": version, "go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH}
+		v := currentVersion()
+		info := map[string]string{"version": v, "go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH}
 		if *asJSON {
 			return a.printJSON(info)
 		}
-		fmt.Fprintf(a.stdout, "keyleash %s (%s, %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(a.stdout, "keyleash %s (%s, %s/%s)\n", v, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return nil
 	},
 }

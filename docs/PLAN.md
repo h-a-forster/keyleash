@@ -42,8 +42,9 @@ Each package is independent and builds against the interfaces in the spec.
 ## Phase 3: hardening
 
 - Independent security review of the full tree; fix findings.
-- `scan`, `import`, `reveal`, `panic`.
-- Fuzz tests: vault parser, SSE parser, path matcher, pass parser.
+- `scan`, `import`, `reveal`.
+- Done: `panic`; fuzz tests for the vault parser, usage parser, path matcher
+  and pass parser.
 
 ## Phase 4: reach
 

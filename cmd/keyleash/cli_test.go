@@ -586,7 +586,7 @@ func TestHelpAndVersion(t *testing.T) {
 		}
 	}
 	a, out, _ = newTestApp("")
-	if code := a.main([]string{"version"}); code != 0 || !strings.HasPrefix(out.String(), "keyleash "+version) {
+	if code := a.main([]string{"version"}); code != 0 || !strings.HasPrefix(out.String(), "keyleash "+currentVersion()) {
 		t.Fatalf("version: %d %s", code, out.String())
 	}
 	a, out, _ = newTestApp("")
@@ -688,5 +688,20 @@ func TestSetApprovalMethod(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(path); string(b) != orig {
 		t.Fatalf("config not reverted:\n%s", b)
+	}
+}
+
+// `go install ...@v0.1.0` sets no ldflags: the reported version must come
+// from the build info, since bug reports quote it.
+func TestBuildVersion(t *testing.T) {
+	for _, tc := range []struct{ stamp, module, want string }{
+		{"v0.1.0", "v0.0.9", "v0.1.0"},
+		{"dev", "v0.1.0", "v0.1.0"},
+		{"dev", "(devel)", "dev"},
+		{"dev", "", "dev"},
+	} {
+		if got := buildVersion(tc.stamp, tc.module); got != tc.want {
+			t.Errorf("buildVersion(%q, %q) = %q, want %q", tc.stamp, tc.module, got, tc.want)
+		}
 	}
 }

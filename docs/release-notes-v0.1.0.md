@@ -26,11 +26,18 @@ Windows is the main platform. On Linux and macOS the vault, proxy and limits
 work; process-bound passes (`keyleash run`), idle and screen-lock detection,
 Windows Hello and DPAPI do not yet.
 
+OpenRouter has no built-in price table: each request needs a step-up unless
+the model is priced in a `pricing.override` file. Fallback lists and presets
+are refused, because limits and model scopes can only speak for one model.
+
 ## Install
 
 ```sh
 go install github.com/h-a-forster/keyleash/cmd/keyleash@v0.1.0
 ```
+
+This needs Go 1.27.3 or later, which carries the current `crypto/x509`
+denylist for the proxy's TLS connections to providers.
 
 See [USAGE.md](USAGE.md) to get started and [CHANGELOG.md](../CHANGELOG.md)
 for the full list.
