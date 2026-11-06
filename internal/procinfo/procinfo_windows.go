@@ -155,10 +155,14 @@ func peerPID(local, remote netip.AddrPort) (int, error) {
 	return matchPeer(rows, local, remote)
 }
 
-// openErr maps OpenProcess failures for a vanished PID to ErrNotFound.
+// openErr maps OpenProcess failures for a vanished PID to ErrNotFound and a
+// refusal to ErrAccessDenied.
 func openErr(pid int, err error) error {
 	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		return fmt.Errorf("procinfo: pid %d: %w", pid, ErrNotFound)
+	}
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return fmt.Errorf("procinfo: pid %d: %w", pid, ErrAccessDenied)
 	}
 	return fmt.Errorf("procinfo: open pid %d: %w", pid, err)
 }

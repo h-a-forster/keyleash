@@ -68,7 +68,8 @@ func (d *Daemon) connContext(ctx context.Context, c net.Conn) context.Context {
 // daemon holds (Windows; this covers descendants whose parent chain is
 // broken and processes that outlived their pass), or the bind process of an
 // active run pass or one of its descendants by the parent-process walk.
-// Any error while checking counts as confined (fail closed).
+// Any error while checking counts as confined (fail closed); a parent the OS
+// will not reveal is not an error, it ends the walk (procinfo.IsDescendant).
 func (d *Daemon) confinedPID(pid int) bool {
 	if d.jobs != nil {
 		if in, err := d.jobs.MemberOfAny(pid); err != nil || in {

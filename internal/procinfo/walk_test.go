@@ -12,8 +12,9 @@ type fakeProc struct {
 }
 
 type fakeTable struct {
-	procs  map[int]fakeProc
-	errPID int
+	procs     map[int]fakeProc
+	errPID    int
+	deniedPID int
 }
 
 func (f fakeTable) parent(pid int) (int, bool) {
@@ -23,7 +24,10 @@ func (f fakeTable) parent(pid int) (int, bool) {
 
 func (f fakeTable) startTime(pid int) (int64, error) {
 	if pid == f.errPID {
-		return 0, errors.New("access denied")
+		return 0, errors.New("process query failed")
+	}
+	if pid == f.deniedPID {
+		return 0, ErrAccessDenied
 	}
 	p, ok := f.procs[pid]
 	if !ok {
@@ -65,7 +69,9 @@ func TestWalk(t *testing.T) {
 		{"self parent", fakeTable{procs: tree}, 90, anc, false, false},
 		{"ancestor pid reused", fakeTable{procs: tree}, 30, Process{PID: 10, StartTime: 99}, false, false},
 		{"ancestor itself not running", fakeTable{procs: tree}, 1234, anc, false, true},
-		{"access denied mid-walk", fakeTable{procs: tree, errPID: 20}, 30, anc, false, true},
+		{"query error mid-walk", fakeTable{procs: tree, errPID: 20}, 30, anc, false, true},
+		{"refused parent ends the walk", fakeTable{procs: tree, deniedPID: 1}, 95, anc, false, false},
+		{"refused caller stays an error", fakeTable{procs: tree, deniedPID: 30}, 30, anc, false, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

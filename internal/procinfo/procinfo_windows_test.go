@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // TestMain lets the test binary act as a child process for descendant tests.
@@ -174,6 +176,18 @@ func TestLookupMissing(t *testing.T) {
 	// PIDs on Windows are multiples of 4; an odd huge one never exists.
 	if _, err := Lookup(0x7ffffff1); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestOpenErrClassifies(t *testing.T) {
+	if err := openErr(4, windows.ERROR_ACCESS_DENIED); !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("access denied: %v", err)
+	}
+	if err := openErr(4, windows.ERROR_INVALID_PARAMETER); !errors.Is(err, ErrNotFound) {
+		t.Errorf("gone: %v", err)
+	}
+	if err := openErr(4, windows.ERROR_NOT_ENOUGH_MEMORY); errors.Is(err, ErrAccessDenied) || errors.Is(err, ErrNotFound) {
+		t.Errorf("other: %v", err)
 	}
 }
 

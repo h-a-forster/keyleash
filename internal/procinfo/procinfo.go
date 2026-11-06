@@ -18,6 +18,10 @@ import (
 // owns the connection, or the PID does not exist (any more).
 var ErrNotFound = errors.New("procinfo: not found")
 
+// ErrAccessDenied is returned when a process exists but the OS refuses to
+// reveal it to this user (a system service, or another user's process).
+var ErrAccessDenied = errors.New("procinfo: access denied")
+
 // ErrUnsupported is returned on platforms without an implementation.
 var ErrUnsupported = errors.New("procinfo: not supported on this platform")
 
@@ -76,10 +80,13 @@ func Lookup(pid int) (Process, error) {
 // known (non-zero) or the answer is false.
 //
 // The walk follows parent PIDs and stops (answering false) when a parent has
-// exited, when a "parent" started after its child (the PID was reused, so it
-// is not the real parent), or when a cycle is detected. Intermediate
-// processes that have exited therefore break the chain: this errs on the
-// side of denying.
+// exited, when the OS refuses to reveal a parent, when a "parent" started
+// after its child (the PID was reused, so it is not the real parent), or when
+// a cycle is detected. Intermediate processes that have exited therefore
+// break the chain: this errs on the side of denying. A refused parent ends
+// the walk for the same reason, and because any ordinary process's chain can
+// reach one (apps activated by the shell descend from a system svchost): it
+// is no process the owner started, so the ancestor cannot lie above it.
 func IsDescendant(pid int, ancestor Process) (bool, error) {
 	if pid <= 0 || ancestor.PID <= 0 || ancestor.StartTime == 0 {
 		return false, nil
@@ -122,8 +129,8 @@ func walk(t walkTable, pid int, ancestor Process) (bool, error) {
 		}
 		pStart, err := t.startTime(ppid)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return false, nil // parent exited: chain broken
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrAccessDenied) {
+				return false, nil // parent exited or out of reach: chain broken
 			}
 			return false, err
 		}
