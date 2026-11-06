@@ -10,8 +10,10 @@ unaudited: try it with keys you can rotate.
   loopback-only **pass** instead of the key.
 - Checks every request against hard limits (per request, session, day,
   month) before it is sent, and settles to the cost the provider reports.
-- Ties access to your presence: idle time caps spending, screen lock, sleep
-  or lease expiry lock the vault (Windows).
+- Ties access to your presence: idle time or a screen lock caps spending and
+  locks the vault after `away_max`; sleep or lease expiry lock it at once
+  (idle and screen-lock detection are Windows-only; the strict profile locks
+  on a screen lock).
 - Asks for Windows Hello, a passphrase or the recovery code before risky
   spend.
 - Records every decision in a tamper-evident audit log.

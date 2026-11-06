@@ -71,8 +71,10 @@ for LLM API keys.
   arrives, including streamed responses, it *settles* to the real cost the
   provider reported. Concurrency caps and a burn-rate tripwire stop runaway
   loops.
-- **Presence.** Access is a lease. Idle time puts the daemon into *away mode*
-  with tight limits; screen lock, sleep or lease expiry lock it.
+- **Presence.** Access is a lease. Idle time or a screen lock puts the daemon
+  into *away mode* with tight limits, which ends in a lock after two hours by
+  default; sleep or lease expiry lock it at once. The strict profile also
+  locks on a screen lock.
 - **Step-up approval.** Exceeding a limit, using an unknown model or making a
   long unattended run can require a fresh Windows Hello confirmation, like
   pressing the button on a hardware wallet.
@@ -89,9 +91,9 @@ the key from agents. keyleash also **governs** it:
 
 | | keyleash |
 |---|---|
-| Bound to your presence | Idle → away limits; screen lock, sleep or lease end → locked |
+| Bound to your presence | Idle or screen lock → away limits, then locked; sleep or lease end → locked |
 | Limits hold under concurrency | Reserve-then-settle, not count-after-the-fact |
-| Leaked passes are worthless | Loopback-only, scoped, expiring, optionally bound to one process |
+| Leaked passes are useless elsewhere | Loopback-only, scoped, expiring, optionally bound to one process |
 | Confirm on device | Windows Hello step-up for risky spend |
 | Hardware-bound vault | TPM-backed Hello slot, with passphrase and recovery slots so you can't lock yourself out |
 | Tamper-evident record | Hash-chained, keyed audit log with per-process attribution |
@@ -112,6 +114,7 @@ administrator- or kernel-level attacker is out of scope. See
 - [Daemon](docs/DAEMON.md): daemon wiring and admin API
 - [Plan](docs/PLAN.md): build phases
 - [Changelog](CHANGELOG.md)
+- [Security policy](SECURITY.md)
 
 ## License
 

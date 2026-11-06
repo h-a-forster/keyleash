@@ -94,8 +94,9 @@ limits, and `away_max` is extended to `until`.
 
 ### Gate.Admit
 
-1. Model policy: config deny/allow globs, then pass `AllowsModel` → `403
-   model_denied`.
+1. Model policy: a request that can reach models outside its `model` field
+   (OpenRouter `models` or a preset, spec §7.5) → `403 model_denied`; config
+   deny/allow globs, then pass `AllowsModel` → `403 model_denied`.
 2. Unmetered endpoint → admit with a no-op ticket (still audited).
 3. `meter.Estimate`. If not priced:
    - *unpriced* = the model is not in the pricing table; *unbounded* =

@@ -19,7 +19,7 @@ only while you are there, and only up to the limits you set.
 
 ### 1. Install
 
-keyleash is a single Go binary (Go 1.27 or later, no cgo):
+keyleash is a single Go binary (Go 1.27.3 or later, no cgo):
 
 ```sh
 go install github.com/h-a-forster/keyleash/cmd/keyleash@latest
@@ -69,7 +69,9 @@ keyleash unlock               # Windows Hello, or the passphrase at a hidden pro
 ```
 
 The daemon starts **locked**. Unlocking starts a lease (12 hours by default);
-locking the screen, sleeping or reaching the end of the lease locks it again.
+sleeping or reaching the end of the lease locks it again. Locking the screen
+enters away mode with tight limits, and locks after `away_max` (the strict
+profile locks at once).
 
 ### 4. Add a key
 
@@ -127,6 +129,12 @@ By default the pass covers the providers you stored keys for that have a
 standard base-URL variable (Anthropic and OpenAI). OpenRouter and Gemini have
 no such variable, so name them with `--providers` and point the tool at
 `$KEYLEASH_OPENROUTER_BASE_URL` / `$KEYLEASH_GEMINI_BASE_URL`.
+
+OpenRouter models have no entry in the built-in price table, so each
+OpenRouter request needs a step-up unless the model is priced in a
+`pricing.override`. Fallback lists and presets (`models`, `preset`,
+`model@preset/…`) are refused with `403 model_denied`: they could reach
+models your limits and `--models` scope never saw.
 
 Examples:
 
@@ -425,13 +433,13 @@ how old the pricing table is. Start there.
 | Symptom | Cause and fix |
 |---|---|
 | `the keyleash daemon is not running` | Start it: `keyleash daemon` (or `--background`). |
-| `keyleash is locked — run: keyleash unlock` / HTTP `423 locked` | The screen locked, the machine slept, the lease ended or you were away too long. Unlock. |
+| `keyleash is locked — run: keyleash unlock` / HTTP `423 locked` | The machine slept, the lease ended or you were away too long (with `screen_lock = "lock"`, also a screen lock). Unlock. |
 | HTTP `423 tripped` | The tripwire or an integrity check fired, or `config.toml` changed. `keyleash status`, `keyleash audit verify`, then `keyleash resume`. |
 | `refused: this command runs inside a keyleash run session` (`confined`) | Admin commands other than `status` are refused from inside `keyleash run` (and from processes keyleash cannot identify). Run them from a normal terminal. |
 | `too many wrong passphrases or recovery codes` | Approving with a secret is slowed down after five wrong tries. Wait the time shown. |
 | HTTP `401 pass_invalid` | Wrong, revoked or expired pass, or a `run` pass used from outside its process tree (e.g. a tool started separately). Use `keyleash run` for that tool or a named pass from `keyleash env`. |
 | HTTP `403 budget_exceeded` | A limit is used up. `keyleash limits` shows which; wait for the window, raise it in config, or use `on_exceed = "approve"`. |
-| HTTP `403 model_denied` / `approval_denied` / `approval_timeout` | The model is denied or unknown and the step-up was refused or not answered in time. Check `keyleash approvals` while the request waits. |
+| HTTP `403 model_denied` / `approval_denied` / `approval_timeout` | The model is denied or unknown and the step-up was refused or not answered in time, or an OpenRouter request used a fallback list or preset. Check `keyleash approvals` while the request waits. |
 | HTTP `429 concurrency` | Too many parallel requests for the global or pass limit; SDKs retry. |
 | `passes ... away mode` | New passes are refused while away. Touch the keyboard, or use `keyleash away --budget … --for …` first. |
 | `no terminal for a hidden prompt` | Standard input is not a console (for example Git Bash's mintty, or a pipe). Use `winpty keyleash …`, PowerShell/cmd, or `--stdin`. |

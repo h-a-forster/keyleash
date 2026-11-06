@@ -39,8 +39,8 @@ This document is normative for the engine. UI is out of scope here.
 | # | Threat | Example | Defense |
 |---|---|---|---|
 | T1 | Key read from disk/config | `.env` committed, agent config scraped, infostealer grabs dotfiles | Keys only in the encrypted vault; clients hold passes |
-| T2 | Key shown on screen | Livestream, screen share, screenshot, terminal scrollback | Keys never printed; reveal requires step-up and goes to an auto-clearing clipboard |
-| T3 | Unattended machine | Owner asleep or away while a session is open | Presence lock: idle → away mode (tight caps), screen lock/sleep/lease expiry → locked |
+| T2 | Key shown on screen | Livestream, screen share, screenshot, terminal scrollback | Keys never printed; a planned `reveal` needs step-up and goes to an auto-clearing clipboard |
+| T3 | Unattended machine | Owner asleep or away while a session is open | Presence lock: idle or screen lock → away mode (tight caps), then locked after `away_max`; sleep/lease expiry → locked. `screen_lock = "lock"` (strict profile) locks at once |
 | T4 | Runaway or hijacked agent | Agent loops, spawns a swarm, picks the priciest model | Reserve-then-settle budgets, concurrency caps, velocity tripwire, model allowlist, step-up approval |
 | T5 | Pass leaks | Pass visible on stream or in a log | Pass is useless off-loopback; scoped; expiring; process-bound passes die with the process |
 | T6 | Credential exfiltration via the proxy | Redirect to attacker host, Host-header tricks, browser page calling localhost | Fixed upstream host allowlist, redirects never followed, Host/Origin checks, client auth stripped |
@@ -250,7 +250,6 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
 - Scope:
   - `providers` allowed (and which vault entry each maps to)
   - `models`: allow/deny glob lists
-  - `endpoints`: optional narrowing of provider endpoints
   - `budget`: per-pass windows (see §7)
   - `max_concurrency`
   - `expires_at` (default 24 h for named passes)
@@ -405,14 +404,19 @@ worst case until they settle.
   the request does not show.
 - Only listed endpoints are forwarded per provider (messages, chat completions,
   responses, embeddings, model listing, token counting, …). Anything else is
-  denied unless explicitly allowed in config.
+  denied.
+- A request must name the one model it may use. OpenRouter tries a body
+  `models` list when the first model returns any error, and a preset (`preset`
+  or `model@preset/…`) can carry such a list, so those requests could reach
+  models the policy and the estimate never saw. They are refused (`403
+  model_denied`).
 
 ### 7.6 Pricing
 
 - Embedded pricing table (JSON) with per-model rates per million tokens:
   input, output, cache write, cache read; plus `source_url` and `as_of` per
   entry. Model ids are matched exactly first, then by declared prefix/glob.
-- User override file merged on top. `keyleash pricing check` reports models
+- User override file merged on top. `keyleash doctor` reports models
   seen in traffic that lack a price.
 
 ### 7.7 Persistence
@@ -714,15 +718,15 @@ keyleash approvals [approve|deny <id>]
                                     list or decide step-ups; approve asks for the passphrase or recovery code
 keyleash run [--budget $] [--ttl] [--models] -- <cmd…>
                                     ephemeral process-bound pass; env injected; revoked on exit
-keyleash env [--provider] [--shell] print base URL + pass exports for a shell (never keys)
+keyleash env [--providers] [--shell] print base URL + pass exports for a shell (never keys)
 keyleash pass create|list|revoke
-keyleash limits [set …]
+keyleash limits                     effective limits and current spend
 keyleash away --budget $ --for 8h   unattended grant
 keyleash usage [--by pass|model|process] [--since]
-keyleash scan [paths…]              find plaintext provider keys (files, env, shell history)
-keyleash import <.env>              move keys into the vault, rewrite file to use passes (dry-run by default)
-keyleash reveal <entry>             step-up, copy to clipboard (excluded from history), auto-clear 30 s
-keyleash panic [--revoke-upstream]  lock, revoke all passes, optionally deactivate keys at provider
+keyleash scan [paths…]              planned: find plaintext provider keys (files, env, shell history)
+keyleash import <.env>              planned: move keys into the vault, rewrite file to use passes (dry-run by default)
+keyleash reveal <entry>             planned: step-up, copy to clipboard (excluded from history), auto-clear 30 s
+keyleash panic [--revoke-upstream]  lock, revoke all passes; deactivating keys at the provider is planned (§15)
 keyleash recovery rotate            new recovery code (step-up, re-keys the vault, §5.2)
 keyleash audit verify|tail
 keyleash doctor                     environment checks (Hello, TPM, permissions, clock, ports)
