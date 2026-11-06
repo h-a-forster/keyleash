@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use keyleash, please cite it as below."
+title: keyleash
+abstract: >-
+  Local API-key wallet for AI providers: keys stay in an encrypted vault and tools get
+  scoped, budgeted, machine-local passes, with spend limits checked before each request
+  is sent, a presence lock and a hash-chained audit log.
+type: software
+authors:
+  - alias: h-a-forster
+repository-code: "https://github.com/h-a-forster/keyleash"
+license: MIT
+keywords:
+  - api-keys
+  - secrets-management
+  - llm
+  - ai-agents
+  - spend-limits
