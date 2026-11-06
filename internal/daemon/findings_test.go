@@ -61,7 +61,7 @@ func TestFindingA_JobConfinement(t *testing.T) {
 	if len(e.jobs.confined) != 1 || e.jobs.confined[0] != r.Pass.ID {
 		t.Fatalf("run pass not confined in a job: %v", e.jobs.confined)
 	}
-	orphan := os.Getppid() // alive, and not a descendant of the bound process
+	orphan := outsiderPID // not a descendant of the bound process
 	e.setAdminPID(orphan)
 	if _, err := e.c.Passes(e.ctx()); err != nil {
 		t.Fatalf("outsider confined before joining the job: %v", err)
@@ -95,7 +95,7 @@ func TestFindingA_JobConfinement(t *testing.T) {
 	e.peerPID.Store(int64(os.Getpid()))
 
 	// Confinement failure: no pass.
-	e.setAdminPID(os.Getppid())
+	e.setAdminPID(outsiderPID)
 	e.jobs.mu.Lock()
 	e.jobs.fail = errors.New("access denied")
 	e.jobs.mu.Unlock()
@@ -304,7 +304,7 @@ func TestFindingD_ApprovalPrompts(t *testing.T) {
 	}
 	reqs := e.appr.requests()
 	last := reqs[len(reqs)-1]
-	if last.Requester != os.Getppid() || last.RequesterName == "" || last.RequesterName == "unknown process" {
+	if last.Requester != outsiderPID || last.RequesterName == "" || last.RequesterName == "unknown process" {
 		t.Fatalf("requester not named: %d %q", last.Requester, last.RequesterName)
 	}
 	if p := approval.PromptText(last); !strings.Contains(p, "pid ") || !strings.Contains(p, last.RequesterName) {
@@ -425,7 +425,7 @@ func TestFindingH_LockPanicFromConfined(t *testing.T) {
 	if _, err := e.c.Lock(e.ctx()); err != nil {
 		t.Fatalf("confined lock: %v", err)
 	}
-	e.setAdminPID(os.Getppid())
+	e.setAdminPID(outsiderPID)
 	e.unlock()
 	e.setAdminPID(os.Getpid())
 	if _, err := e.c.Panic(e.ctx(), false); err != nil {

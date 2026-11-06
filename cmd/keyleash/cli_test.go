@@ -532,6 +532,7 @@ func TestFriendlyErrors(t *testing.T) {
 		{&client.APIError{Status: 401, Code: client.CodeWrongSecret, Message: "wrong secret"}, "wrong passphrase"},
 		{&client.APIError{Status: 403, Code: client.CodeStepUpDenied}, "denied"},
 		{&client.APIError{Status: 400, Code: client.CodeBadRequest, Message: "bad limit"}, "bad limit"},
+		{&client.APIError{Status: 403, Code: client.CodeConfined, Message: "could not identify this process"}, "could not identify"},
 	}
 	for _, tt := range tests {
 		if got := friendly(tt.err).Error(); !strings.Contains(got, tt.want) {

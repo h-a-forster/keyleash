@@ -699,8 +699,8 @@ func TestBoundPassFromOtherProcessDenied(t *testing.T) {
 		t.Fatalf("own process: %d %s", res.status, res.body)
 	}
 	hits := e.up.hits.Load()
-	// A different process (our parent is never our descendant): denied.
-	e.peerPID.Store(int64(os.Getppid()))
+	// A different process: denied.
+	e.peerPID.Store(outsiderPID)
 	wantReason(t, e.anthropic(r.Token), 401, proxy.ReasonPassInvalid)
 	// Attribution unknown: denied, never treated as unbound.
 	e.peerPID.Store(0)

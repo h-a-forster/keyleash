@@ -381,7 +381,7 @@ func (d *Daemon) hPassCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	caller := callerFrom(r.Context())
 	if caller.confined || !caller.known() {
-		d.writeErr(w, statusErr(403, client.CodeConfined, "passes cannot be created from inside a keyleash run pass or by an unidentified process"))
+		d.writeErr(w, confinedErr(caller))
 		return
 	}
 	p, err := d.passFromRequest(req)
@@ -662,7 +662,7 @@ func (d *Daemon) hPassRevoke(w http.ResponseWriter, r *http.Request) {
 		p, ok := d.passes.Get(req.ID)
 		own := ok && c.known() && d.inRunTree(p, c.pid)
 		if !own {
-			d.writeErr(w, statusErr(403, client.CodeConfined, "this process runs under a keyleash run pass; it may only revoke its own pass"))
+			d.writeErr(w, confinedErr(c))
 			return
 		}
 	}

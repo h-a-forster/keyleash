@@ -44,6 +44,9 @@ type caller struct {
 	pid int
 	// confined is set by the guard middleware (see confinedPID).
 	confined bool
+	// unverified is set with confined when the check failed, so nothing shows
+	// the caller is in a run tree.
+	unverified bool
 }
 
 func (c caller) known() bool { return c.pid > 0 }
@@ -68,12 +71,16 @@ func (d *Daemon) connContext(ctx context.Context, c net.Conn) context.Context {
 // daemon holds (Windows; this covers descendants whose parent chain is
 // broken and processes that outlived their pass), or the bind process of an
 // active run pass or one of its descendants by the parent-process walk.
-// Any error while checking counts as confined (fail closed); a parent the OS
-// will not reveal is not an error, it ends the walk (procinfo.IsDescendant).
-func (d *Daemon) confinedPID(pid int) bool {
+// Any error while checking counts as confined (fail closed) and is reported
+// as unverified, unless another check places pid in a run tree; a parent the
+// OS will not reveal is not an error, it ends the walk (procinfo.IsDescendant).
+func (d *Daemon) confinedPID(pid int) (confined, unverified bool) {
 	if d.jobs != nil {
-		if in, err := d.jobs.MemberOfAny(pid); err != nil || in {
-			return true
+		in, err := d.jobs.MemberOfAny(pid)
+		if err != nil {
+			unverified = true
+		} else if in {
+			return true, false
 		}
 	}
 	now := d.clk.Now()
@@ -82,11 +89,25 @@ func (d *Daemon) confinedPID(pid int) bool {
 			continue
 		}
 		ok, err := d.isDescendant(pid, procinfo.Process{PID: p.Bind.PID, StartTime: p.Bind.StartTime})
-		if err != nil || ok {
-			return true
+		if err != nil {
+			unverified = true
+		} else if ok {
+			return true, false
 		}
 	}
-	return false
+	return unverified, unverified
+}
+
+// confinedErr is the refusal for a confined or unidentified caller. It names
+// the actual reason: an unidentified caller may be no agent at all, and being
+// told it runs under a run pass would give it nothing to act on.
+func confinedErr(c caller) error {
+	if !c.known() || c.unverified {
+		return statusErr(http.StatusForbidden, client.CodeConfined,
+			"keyleash could not identify this process, so it is refused (fail closed); lock and panic still work. Run the command from a normal terminal, like the one that started the daemon")
+	}
+	return statusErr(http.StatusForbidden, client.CodeConfined,
+		"this process runs under a keyleash run pass; it may only read status, lock, panic and revoke its own pass. Run the command from a normal terminal")
 }
 
 // inRunTree reports whether pid belongs to run pass p: a member of its job,
@@ -129,12 +150,11 @@ func (d *Daemon) guard(next http.Handler) http.Handler {
 				return
 			}
 		default:
-			c.confined = d.confinedPID(c.pid)
+			c.confined, c.unverified = d.confinedPID(c.pid)
 		}
 		r = r.WithContext(context.WithValue(r.Context(), callerKey{}, c))
 		if c.confined && !(r.Method == http.MethodDelete && r.URL.Path == "/v1/passes" && c.known()) {
-			d.writeErr(w, statusErr(http.StatusForbidden, client.CodeConfined,
-				"this process runs under a keyleash run pass (or could not be identified); it may only read status, lock, panic and revoke its own pass"))
+			d.writeErr(w, confinedErr(c))
 			return
 		}
 		next.ServeHTTP(w, r)

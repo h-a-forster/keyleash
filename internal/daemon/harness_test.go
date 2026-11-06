@@ -259,8 +259,8 @@ type env struct {
 	up       *upstream
 	peerPID  atomic.Int64
 	// adminPID is the verified PID the daemon sees for admin calls (default:
-	// the parent of the test process, so a run pass bound to the test
-	// process does not confine the test's own admin calls); 0 = unknown.
+	// outsiderPID, so a run pass bound to the test process does not confine
+	// the test's own admin calls); 0 = the real lookup, negative = unknown.
 	adminPID atomic.Int64
 	approver approval.Approver // overrides appr when set
 	// noApprover starts the daemon without Options.Approver, so the
@@ -294,7 +294,7 @@ func newEnv(t *testing.T, mutate func(*config.Config)) *env {
 	t.Helper()
 	e := &env{t: t, dir: t.TempDir(), clk: newFakeClock(), pres: &fakePresence{}, appr: &switchApprover{}, jobs: newFakeJobs()}
 	e.peerPID.Store(int64(os.Getpid()))
-	e.adminPID.Store(int64(os.Getppid()))
+	e.adminPID.Store(outsiderPID)
 	e.cfg = testConfig(t)
 	if mutate != nil {
 		mutate(e.cfg)
@@ -372,6 +372,18 @@ func (e *env) start() {
 		},
 		PeerResolver: func(local, remote netip.AddrPort) proxy.ClientInfo {
 			return proxy.ClientInfo{PID: int(e.peerPID.Load()), Image: testClientImage}
+		},
+		IsDescendant: func(pid int, ancestor procinfo.Process) (bool, error) {
+			if pid == outsiderPID {
+				return false, nil
+			}
+			return procinfo.IsDescendant(pid, ancestor)
+		},
+		LookupProcess: func(pid int) (procinfo.Process, error) {
+			if pid == outsiderPID {
+				return procinfo.Process{PID: pid, ParentPID: 1, Image: testOutsiderImage, StartTime: 1}, nil
+			}
+			return procinfo.Lookup(pid)
 		},
 		manualPresence:     true,
 		manualHousekeeping: true,
@@ -673,6 +685,14 @@ func (e *env) waitPending(kind string) string {
 // ownerSecret is the passphrase as a fresh slice (Decide wipes its copy).
 func ownerSecret() []byte { return append([]byte(nil), testPassphrase...) }
 
+// outsiderPID stands for the owner's terminal: a process outside every run
+// tree. It is simulated, because a real one (say the test's parent) may be
+// unreadable in a restricted shell, which would make the daemon fail closed.
+const (
+	outsiderPID       = 0x7ffffff0
+	testOutsiderImage = "outsider-terminal"
+)
+
 // setAdminPID changes the PID the daemon sees for admin calls. The PID is
 // fixed per connection (as with a real pipe), so idle connections are
 // dropped first.
@@ -685,13 +705,14 @@ func (e *env) setAdminPID(pid int) {
 // its bound process plus pids added with add (processes that outlive their
 // pass); a released job is dropped once none of the added pids is alive.
 type fakeJobs struct {
-	mu       sync.Mutex
-	members  map[string]map[int]bool
-	extra    map[string]map[int]bool
-	dead     map[int]bool
-	fail     error
-	confined []string
-	closed   bool
+	mu        sync.Mutex
+	members   map[string]map[int]bool
+	extra     map[string]map[int]bool
+	dead      map[int]bool
+	fail      error
+	memberErr error
+	confined  []string
+	closed    bool
 }
 
 func newFakeJobs() *fakeJobs {
@@ -734,9 +755,18 @@ func (j *fakeJobs) Member(id string, pid int) (bool, error) {
 	return m[pid] && !j.dead[pid], nil
 }
 
+func (j *fakeJobs) setMemberErr(err error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.memberErr = err
+}
+
 func (j *fakeJobs) MemberOfAny(pid int) (bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.memberErr != nil {
+		return true, j.memberErr
+	}
 	for _, m := range j.members {
 		if m[pid] && !j.dead[pid] {
 			return true, nil

@@ -17,6 +17,8 @@ unaudited: try it with keys you can rotate.
 - Asks for Windows Hello, a passphrase or the recovery code before risky
   spend.
 - Records every decision in a tamper-evident audit log.
+- Refuses what it cannot identify: a process it cannot verify (a restricted
+  shell, for example) may only read status, lock and panic, and is told why.
 - `keyleash run -- <cmd>` gives one agent its own pass and budget, revoked
   when it exits.
 

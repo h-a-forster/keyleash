@@ -682,7 +682,8 @@ table, so the audit log answers "which program spent this".
   revoke its own pass; everything else gets `403 confined`. A caller whose
   PID cannot be determined may read, lock and panic, but every other mutating
   call gets `403 confined`. An error while checking counts as confined (fail
-  closed). `POST /v1/lock` and `POST /v1/panic` are allowed from any caller:
+  closed). In both cases the message says the caller could not be identified,
+  not that it runs under a run pass. `POST /v1/lock` and `POST /v1/panic` are allowed from any caller:
   they only add protection. `POST /v1/shutdown` (stop the daemon) needs no
   step-up, since a stopped daemon locks the vault and spends nothing, but is
   not on that list: stopping also ends confinement (run jobs are closed) and

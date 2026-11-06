@@ -28,3 +28,8 @@
 - `keyleash doctor` lists the models seen in traffic without a price.
 - Pricing table refreshed: gpt-6.1-terra and the Mythos models added, gpt-5.6-sol promo end date rechecked before 2026-11-21.
 - Fuzz targets for the ledger, audit log and pass store loaders.
+- `keyleash doctor` says whether the daemon can identify the calling process.
+- `TestRunEndToEnd` runs without reaching the per-user admin pipe, so it neither probes a real daemon nor skips beside one.
+- README and USAGE name the tag instead of the no-tag note once v0.1.0 exists.
+- `tmp/` scratch Go packages stay out of `go test ./...` and `go vet ./...`.
+- README lead paragraph no longer implies a cryptographic machine binding: "only works on your machine" is loopback plus optional process binding.

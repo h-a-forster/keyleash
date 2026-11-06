@@ -25,7 +25,9 @@ keyleash is a single Go binary (Go 1.27.3 or later, no cgo):
 go install github.com/h-a-forster/keyleash/cmd/keyleash@latest
 ```
 
-or from a checkout, with the version embedded:
+No release is tagged yet, so `@latest` installs the newest commit on `master`
+as an untagged pre-release (`v0.0.0-<date>-<commit>`); use `@<commit>` to pin
+one. Or from a checkout, with the version embedded:
 
 ```sh
 go build -ldflags "-X main.version=$(git describe --tags --always)" -o keyleash ./cmd/keyleash
@@ -435,7 +437,8 @@ how old the pricing table is. Start there.
 | `the keyleash daemon is not running` | Start it: `keyleash daemon` (or `--background`). |
 | `keyleash is locked — run: keyleash unlock` / HTTP `423 locked` | The machine slept, the lease ended or you were away too long (with `screen_lock = "lock"`, also a screen lock). Unlock. |
 | HTTP `423 tripped` | The tripwire or an integrity check fired, or `config.toml` changed. `keyleash status`, `keyleash audit verify`, then `keyleash resume`. |
-| `refused: this command runs inside a keyleash run session` (`confined`) | Admin commands other than `status` are refused from inside `keyleash run` (and from processes keyleash cannot identify). Run them from a normal terminal. |
+| `this process runs under a keyleash run pass` (`confined`) | Admin commands other than `status`, `lock` and `panic` are refused from inside `keyleash run`. Run them from a normal terminal. |
+| `keyleash could not identify this process` (`confined`) | The OS would not show keyleash who is calling, so it fails closed (a sandboxed or restricted shell, for example). No run pass is involved. Run the command from a normal terminal, like the one that started the daemon. |
 | `too many wrong passphrases or recovery codes` | Approving with a secret is slowed down after five wrong tries. Wait the time shown. |
 | HTTP `401 pass_invalid` | Wrong, revoked or expired pass, or a `run` pass used from outside its process tree (e.g. a tool started separately). Use `keyleash run` for that tool or a named pass from `keyleash env`. |
 | HTTP `403 budget_exceeded` | A limit is used up. `keyleash limits` shows which; wait for the window, raise it in config, or use `on_exceed = "approve"`. |

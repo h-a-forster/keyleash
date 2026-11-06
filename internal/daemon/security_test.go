@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -230,6 +231,9 @@ func TestConfinedCallers(t *testing.T) {
 	if _, err := e.c.Status(e.ctx()); err != nil {
 		t.Fatalf("status: %v", err)
 	}
+	if _, err := e.c.Passes(e.ctx()); err == nil || !strings.Contains(err.Error(), "run pass") {
+		t.Fatalf("a caller in a run tree is not told why: %v", err)
+	}
 	for name, call := range map[string]func() error{
 		"create pass": func() error {
 			_, err := e.c.CreatePass(e.ctx(), client.PassCreateRequest{Name: "x", Kind: "run", Providers: []string{"anthropic"}, BindPID: os.Getpid()})
@@ -266,14 +270,23 @@ func TestConfinedCallers(t *testing.T) {
 	if _, err := e.c.Passes(e.ctx()); err != nil {
 		t.Fatalf("after the job was released: %v", err)
 	}
+	// A check that fails confines (fail closed), but proves no run pass.
+	wantUnidentified := func(name string, err error) {
+		t.Helper()
+		if !isAPI(err, 403, client.CodeConfined) || strings.Contains(err.Error(), "run pass") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	e.jobs.setMemberErr(errors.New("access denied"))
+	_, err := e.c.Passes(e.ctx())
+	wantUnidentified("unverifiable caller", err)
+	e.jobs.setMemberErr(nil)
 	// A caller whose PID cannot be verified may read but not mutate.
 	e.setAdminPID(-1)
 	if _, err := e.c.Passes(e.ctx()); err != nil {
 		t.Fatalf("unknown caller read: %v", err)
 	}
-	if err := e.c.RevokePass(e.ctx(), other.Pass.ID); !isAPI(err, 403, client.CodeConfined) {
-		t.Fatalf("unknown caller revoke: %v", err)
-	}
+	wantUnidentified("unknown caller revoke", e.c.RevokePass(e.ctx(), other.Pass.ID))
 	if err := e.c.Shutdown(e.ctx()); !isAPI(err, 403, client.CodeConfined) {
 		t.Fatalf("unknown caller stop: %v", err)
 	}
@@ -301,7 +314,7 @@ func TestRunPassWithoutStepUpOnlyWithinDefaults(t *testing.T) {
 	asked := len(e.appr.requests())
 	denied := map[string]client.PassCreateRequest{
 		"named pass":         {Name: "n", Providers: []string{"anthropic"}},
-		"bound to another":   {Name: "r", Kind: "run", Providers: []string{"anthropic"}, BindPID: os.Getppid()},
+		"bound to another":   {Name: "r", Kind: "run", Providers: []string{"anthropic"}, BindPID: outsiderPID},
 		"over budget":        {Name: "r", Kind: "run", Providers: []string{"anthropic"}, BindPID: self, Limits: []client.PassLimit{{Window: "month", Amount: 50 * money.Dollar}}},
 		"provider w/o key":   {Name: "r", Kind: "run", Providers: []string{"gemini"}, BindPID: self},
 		"all providers":      {Name: "r", Kind: "run", Providers: []string{"*"}, BindPID: self},

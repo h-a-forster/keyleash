@@ -110,8 +110,6 @@ func friendly(err error) error {
 			return errors.New("step-up approval was denied")
 		case client.CodeStepUpTimeout:
 			return errors.New("step-up approval timed out — approve with Windows Hello or in the daemon console, or from a terminal with: keyleash approvals approve <id> (asks for your passphrase or recovery code)")
-		case client.CodeConfined:
-			return errors.New("refused: this command runs inside a `keyleash run` session (or could not be identified); from there keyleash allows only `keyleash status` and revoking the session's own pass. Run it from a normal terminal")
 		case client.CodeRateLimited:
 			if ae.Message != "" {
 				return errors.New(ae.Message)
