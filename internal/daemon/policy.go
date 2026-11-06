@@ -162,6 +162,10 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 	model := a.Info.Model
 
 	// 1. Model policy.
+	if a.Info.ModelRouted {
+		return deny(denial(http.StatusForbidden, proxy.ReasonModelDenied,
+			"keyleash checks one model per request: OpenRouter fallback lists and presets are refused, name the model instead"))
+	}
 	if a.Endpoint.Metered || model != "" {
 		if reason := d.modelDenied(p, model); reason != "" {
 			return deny(denial(http.StatusForbidden, proxy.ReasonModelDenied, reason))

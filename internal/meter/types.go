@@ -10,6 +10,10 @@ type RequestInfo struct {
 	Kind string
 	// Model is the requested model id ("" if the endpoint has none).
 	Model string
+	// ModelRouted is true when the request can reach models other than Model
+	// (an OpenRouter fallback list or preset). Model policy and the estimate
+	// only ever see Model, so the daemon refuses such a request.
+	ModelRouted bool
 	// Stream is true when the client asked for a streamed (SSE) response.
 	Stream bool
 	// MaxOutputTokens is the output ceiling the request declares, or 0 when

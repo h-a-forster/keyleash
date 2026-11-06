@@ -973,3 +973,40 @@ func TestRestoredVaultWithoutSidecarIsRollback(t *testing.T) {
 		t.Fatal("newer vault.prev overwritten")
 	}
 }
+
+// OpenRouter tries a request's `models` list (or a preset's) when the named
+// model fails, so a body that names one allowed model could spend on any
+// other: neither the model scope nor the reservation would ever see it.
+func TestOpenRouterModelRoutingRefused(t *testing.T) {
+	e := newEnv(t, nil)
+	e.appr.approve.Store(true)
+	e.unlock()
+	e.addKeys()
+	if err := e.withOwner(func(ctx context.Context) error {
+		_, err := e.c.AddKey(ctx, "openrouter", "main", []byte("sk-or-v1-testkey"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tok := e.newPass(client.PassCreateRequest{Providers: []string{"openrouter"}, Models: []string{"cheap/*"}})
+	for _, tc := range []struct{ name, path, body string }{
+		{"fallback list", "/v1/chat/completions", `{"model":"cheap/a","models":["costly/b"],"max_tokens":10,"messages":[]}`},
+		{"responses fallback list", "/v1/responses", `{"model":"cheap/a","models":["costly/b"],"max_output_tokens":10,"input":"x"}`},
+		{"preset field", "/v1/chat/completions", `{"model":"cheap/a","preset":"@preset/p","max_tokens":10,"messages":[]}`},
+		{"preset in model", "/v1/chat/completions", `{"model":"cheap/a@preset/p","max_tokens":10,"messages":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := e.up.hits.Load()
+			wantReason(t, e.post("openrouter", tc.path, tok, tc.body), 403, proxy.ReasonModelDenied)
+			if e.up.hits.Load() != before {
+				t.Fatal("routed request reached upstream")
+			}
+		})
+	}
+	// Control: the plain request passes policy and reaches upstream.
+	before := e.up.hits.Load()
+	e.post("openrouter", "/v1/chat/completions", tok, `{"model":"cheap/a","max_tokens":10,"messages":[]}`)
+	if e.up.hits.Load() != before+1 {
+		t.Fatal("plain request did not reach upstream")
+	}
+}

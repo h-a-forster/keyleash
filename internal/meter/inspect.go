@@ -207,6 +207,10 @@ func (m *Meter) Inspect(p *provider.Provider, ep provider.Endpoint, path string,
 		return info, fmt.Errorf("meter: unsupported endpoint kind %q", ep.Kind)
 	}
 
+	if p.Name == "openrouter" {
+		info.ModelRouted = routesModel(obj, info.Model)
+	}
+
 	// Content the body references but does not contain.
 	scan, err := scanServerSide(body)
 	if err != nil {
@@ -257,6 +261,17 @@ func (m *Meter) Inspect(p *provider.Provider, ep provider.Endpoint, path string,
 		info.InputTokensEstimate = UnboundedInputTokens - 1
 	}
 	return info, nil
+}
+
+// routesModel reports whether an OpenRouter request names models outside its
+// "model" field. OpenRouter tries a "models" list when the first model
+// returns any error, and a preset can carry such a list
+// (https://openrouter.ai/docs/guides/routing/model-fallbacks,
+// https://openrouter.ai/docs/guides/features/presets).
+func routesModel(obj *jsonObject, model string) bool {
+	_, models := obj.get("models")
+	_, preset := obj.get("preset")
+	return models || preset || strings.Contains(strings.ToLower(model), "@preset/")
 }
 
 // UnboundedInputTokens as RequestInfo.InputTokensEstimate means the
