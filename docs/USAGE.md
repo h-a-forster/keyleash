@@ -132,7 +132,7 @@ no such variable, so name them with `--providers` and point the tool at
 
 OpenRouter models have no entry in the built-in price table, so each
 OpenRouter request needs a step-up unless the model is priced in a
-`pricing.override`. Fallback lists and presets (`models`, `preset`,
+`pricing.override` file. Fallback lists and presets (`models`, `preset`,
 `model@preset/…`) are refused with `403 model_denied`: they could reach
 models your limits and `--models` scope never saw.
 
