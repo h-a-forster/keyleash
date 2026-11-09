@@ -73,6 +73,10 @@ type stateData struct {
 	// Latest presence readings (edge-triggered events folded into flags).
 	idle, screenLocked bool
 
+	// requests ends the proxied requests of this unlocked period (nil while
+	// Locked).
+	requests *requestScope
+
 	grant *grantInfo
 	// passGrants are allowances carried by over-limit approvals, each
 	// scoped to the requesting pass and one exceeded limit.
@@ -419,6 +423,7 @@ func (d *Daemon) afterUnlock(method string) error {
 	d.mu.Lock()
 	d.st.keys = keys
 	d.st.session = sid
+	d.st.requests = newRequestScope()
 	d.st.leaseUntil = now.Add(d.cfg.Presence.MaxLease.Duration)
 	d.st.rollback = false
 	d.st.integrityOK = len(problems) == 0
@@ -542,10 +547,10 @@ func budgetSessionScope(id string) string { return budget.ScopeSessionPrefix + i
 
 // ---- lock / panic / trip / resume ------------------------------------------
 
-// lock performs any → Locked: no new reservations, in-flight ones are
-// settled at their reserved amount (so every record is written while the MAC
-// key is still set), the checkpoint is saved, the audit anchored, and then the
-// vault and every derived key are wiped.
+// lock performs any → Locked: no new reservations, running requests are
+// stopped and their reservations settled at the reserved amount (so every
+// record is written while the MAC key is still set), the checkpoint is saved,
+// the audit anchored, and then the vault and every derived key are wiped.
 func (d *Daemon) lock(reason string) {
 	d.unlockMu.Lock()
 	defer d.unlockMu.Unlock()
@@ -561,6 +566,8 @@ func (d *Daemon) lockHeld(reason string) {
 	}
 	prev, sid := d.st.state, d.st.session
 	d.st.state = StateLocked
+	d.st.requests.end()
+	d.st.requests = nil
 	d.st.session = ""
 	d.st.awaySince = time.Time{}
 	d.st.leaseUntil = time.Time{}

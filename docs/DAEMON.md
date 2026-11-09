@@ -68,7 +68,7 @@ transitions are audited.
 | lease expiry | Unlocked/Away | Locked | |
 | tripwire fired / integrity failure / security audit record rejected | Unlocked/Away | Tripped | in-flight requests finish; new ones get 423 `tripped` |
 | step-up approved "resume" | Tripped | Unlocked | approved with the accepted method for owner trips (integrity, audit_integrity, pass_store, config_changed; never console); `ledger.ResetTrip()`; `audit_integrity`: move `audit/*.jsonl` to `audit/rejected-<UTC time>/` and start a new chain; `pass_store`: revoke added and changed passes, `Commit()`; `config_changed`: record the config and its approval method as accepted; audit `resume` |
-| lock / panic | any | Locked | settle in-flight at their reserved amount; checkpoint to the vault; `passes.SetMACKey(nil)`, `vault.Lock()`, `audit.ClearAnchorKey()`, wipe derived keys; drop pass grants and pending config; panic also revokes all passes |
+| lock / panic | any | Locked | end every running request (`Principal.Stop`: not yet sent → 423 `locked`; mid-stream → cancelled upstream, client connection aborted); settle in-flight at their reserved amount; checkpoint to the vault; `passes.SetMACKey(nil)`, `vault.Lock()`, `audit.ClearAnchorKey()`, wipe derived keys; drop pass grants and pending config; panic also revokes all passes |
 
 An **unattended grant** (`keyleash away --budget $X --for D`, step-up
 required) records `{id, amount, until, pass?}`. While it is active, Away uses
@@ -86,7 +86,10 @@ limits, and `away_max` is extended to `until`.
    `401 pass_invalid` (never fall back to unbound).
 5. Away state: passes created after Away began are refused (`403
    away_limit`), except `run` passes with `limits.away.allow_new_run_passes`.
-6. Principal.EntryID = the vault entry for this provider: the pass's
+6. Principal.Stop = the context that ends this request: on lock, or when this
+   pass is revoked. Taken with the state, so a request either sees Locked or is
+   ended by that lock, even if the owner has unlocked again since.
+7. Principal.EntryID = the vault entry for this provider: the pass's
    `entries` mapping if it has one for the provider (mapped entry gone → `403
    no_key`, never redirected); else the provider's active key from the
    daemon-state entry; else its **oldest** `api_key`; none → `403 no_key`.
@@ -94,6 +97,8 @@ limits, and `away_max` is extended to `until`.
 
 ### Gate.Admit
 
+0. The pass again: revoked, expired or bound process gone since Authenticate
+   → `401 pass_invalid` / `pass_expired` (repeated after each approval wait).
 1. Model policy: a request that can reach models outside its `model` field
    (OpenRouter `models` or a preset, spec §7.5) → `403 model_denied`; config
    deny/allow globs, then pass `AllowsModel` → `403 model_denied`.

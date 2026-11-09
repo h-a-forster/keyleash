@@ -1,13 +1,17 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -536,5 +540,215 @@ func TestFindingK_Residuals(t *testing.T) {
 	e.unlock()
 	if _, err := e.c.AddKey(e.ctx(), "anthropic", "again", []byte(anthropicKey)); !isAPI(err, 403, client.CodeStepUpDenied) {
 		t.Fatalf("after restart: %v", err)
+	}
+}
+
+// Regression tests for the state-machine audit of 2026-11-09 (D1...).
+
+// slowBody sends a request's headers with a Content-Length and no body: the
+// proxy has authenticated it and waits for the body. send delivers the body
+// and returns the response.
+func slowBody(t *testing.T, e *env, tok string) (send func() *http.Response) {
+	t.Helper()
+	conn, err := net.Dial("tcp", e.d.ProxyAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	hdr := "POST /anthropic/v1/messages HTTP/1.1\r\nHost: " + e.d.ProxyAddr() + "\r\nX-Api-Key: " + tok +
+		"\r\nAnthropic-Version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(anthropicReq)) + "\r\n\r\n"
+	if _, err := conn.Write([]byte(hdr)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // Authenticate has run; the handler waits for the body
+	return func() *http.Response {
+		t.Helper()
+		if _, err := conn.Write([]byte(anthropicReq)); err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+}
+
+// stream starts a streaming request that pauses after each of its first steps
+// events (see X-Test-Steps) and returns once the headers are back.
+func (e *env) stream(t *testing.T, tok string, steps int) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+e.d.ProxyAddr()+"/anthropic/v1/messages", strings.NewReader(anthropicStreamReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", tok)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("X-Test-Steps", strconv.Itoa(steps))
+	resp, err := e.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// D1: a request authenticated while its pass was good is refused at admission
+// once the pass is revoked, expired or its bound process is gone.
+func TestDeadPassCannotSpendOnHeldRequest(t *testing.T) {
+	cases := []struct {
+		name   string
+		req    client.PassCreateRequest
+		kill   func(t *testing.T, e *env)
+		reason string
+	}{
+		{"revoked", client.PassCreateRequest{}, func(t *testing.T, e *env) {
+			ps, err := e.c.Passes(e.ctx())
+			if err != nil || len(ps) != 1 {
+				t.Fatalf("passes %v %v", ps, err)
+			}
+			if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+				t.Fatal(err)
+			}
+		}, proxy.ReasonPassInvalid},
+		{"expired", client.PassCreateRequest{TTL: time.Hour}, func(t *testing.T, e *env) {
+			e.clk.Advance(2 * time.Hour)
+		}, proxy.ReasonPassExpired},
+		{"bound process gone", client.PassCreateRequest{BindPID: os.Getpid()}, func(t *testing.T, e *env) {
+			e.treeGone.Store(true)
+		}, proxy.ReasonPassInvalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.req.BindPID != 0 {
+				requireProcessBinding(t)
+			}
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(tc.req)
+			hits := e.up.hits.Load()
+			send := slowBody(t, e, tok)
+			tc.kill(t, e)
+			resp := send()
+			if resp.StatusCode != 401 || resp.Header.Get(proxy.ReasonHeader) != tc.reason {
+				t.Fatalf("got %d %q, want 401 %q", resp.StatusCode, resp.Header.Get(proxy.ReasonHeader), tc.reason)
+			}
+			if e.up.hits.Load() != hits {
+				t.Fatal("the request reached upstream")
+			}
+		})
+	}
+}
+
+// D1: a request waiting on an approval ends when its pass is revoked.
+func TestRevokeEndsRequestWaitingForApproval(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Limits.OnExceed = "approve" })
+	e.approver = blockingApprover{}
+	e.restart()
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{Limits: []client.PassLimit{{Window: "day", Amount: 1}}})
+	done := make(chan result, 1)
+	go func() { done <- e.anthropic(tok) }()
+	e.waitPending("over_limit")
+	ps, err := e.c.Passes(e.ctx())
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("passes %v %v", ps, err)
+	}
+	if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		wantReason(t, r, 401, proxy.ReasonPassInvalid)
+	case <-time.After(e.cfg.Approval.Timeout.Duration / 2):
+		t.Fatal("the request kept waiting after its pass was revoked")
+	}
+}
+
+// D2: lock, panic and revoke end running requests: one waiting for upstream's
+// answer gets the refusal, one mid-stream has its connection aborted so the
+// client cannot take the truncated body for a complete one.
+func TestStopEndsRunningRequests(t *testing.T) {
+	stops := []struct {
+		name   string
+		status int
+		reason string
+		stop   func(t *testing.T, e *env)
+	}{
+		{"lock", 423, proxy.ReasonLocked, func(t *testing.T, e *env) {
+			if _, err := e.c.Lock(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"panic", 423, proxy.ReasonLocked, func(t *testing.T, e *env) {
+			if _, err := e.c.Panic(e.ctx(), false); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"revoke", 401, proxy.ReasonPassInvalid, func(t *testing.T, e *env) {
+			ps, err := e.c.Passes(e.ctx())
+			if err != nil || len(ps) != 1 {
+				t.Fatalf("passes %v %v", ps, err)
+			}
+			if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	waitHeld := func(t *testing.T, e *env) {
+		t.Helper()
+		select {
+		case <-e.up.held:
+		case <-time.After(10 * time.Second):
+			t.Fatal("upstream did not get the request")
+		}
+	}
+	for _, tc := range stops {
+		t.Run(tc.name+" before the response", func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{})
+			done := make(chan result, 1)
+			go func() { done <- e.anthropic(tok, "X-Test-Hold", "1") }()
+			waitHeld(t, e)
+			tc.stop(t, e)
+			select {
+			case r := <-done:
+				wantReason(t, r, tc.status, tc.reason)
+			case <-time.After(3 * time.Second):
+				t.Fatal("the request kept running")
+			}
+		})
+		t.Run(tc.name+" mid-stream", func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{})
+			resp := e.stream(t, tok, 1)
+			defer resp.Body.Close()
+			waitHeld(t, e)
+			if _, err := resp.Body.Read(make([]byte, 1)); err != nil { // the proxy is relaying
+				t.Fatal(err)
+			}
+			errc := make(chan error, 1)
+			go func() {
+				_, err := io.ReadAll(resp.Body)
+				errc <- err
+			}()
+			tc.stop(t, e)
+			select {
+			case err := <-errc:
+				if err == nil {
+					t.Fatal("the stream ended cleanly; a client would take the truncated body as complete")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the stream kept running")
+			}
+		})
 	}
 }

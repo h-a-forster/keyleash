@@ -261,6 +261,11 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
 - Kinds: `named` (created by the owner, e.g. for an editor), `run` (ephemeral,
   created by `keyleash run`, process-bound, revoked on exit), `admin` (none —
   the admin channel uses OS-level access control, not passes).
+- **A pass is checked when the request is admitted, not only when it arrives.**
+  A pass revoked or expired, or whose bound process is gone, after its request
+  was authenticated (a slow body, an approval wait) spends nothing. Revoking
+  also cancels the pass's running requests, like a lock; a pass that merely
+  expires lets a request already sent finish.
 - **Run pass jobs (Windows).** When a `run` pass is issued, the daemon places
   the bound process in a new unnamed job object that it alone holds, without
   breakaway rights; every process started from it later is a member and
@@ -466,7 +471,12 @@ ledger becomes the checkpoint; a rejected audit log is moved to
 accepted one.
 
 - **Locked**: DEK wiped. All proxied requests get `423 Locked` with a clear
-  JSON error. Admin API works (status, unlock).
+  JSON error. Entering Locked also ends every request authenticated before it:
+  one waiting for its body, an approval or upstream's answer gets the 423, and
+  a running stream is cancelled upstream and its client connection aborted, so
+  a truncated body cannot pass as complete. It is charged its reserved amount;
+  the provider may still bill for work it had started. Admin API works (status,
+  unlock).
 - **Unlocked**: normal limits. Has a lease (`max_lease`, default 12 h).
 - **Away**: entered after `idle_after` (default 10 min) without keyboard/mouse
   input, or on screen lock (configurable: `screen_lock = "away" | "lock"`,

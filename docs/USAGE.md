@@ -365,7 +365,10 @@ grant for later requests; grants are capped at `approval.grant_max_multiple`
 `keyleash approvals --json`.
 
 **Panic.** `keyleash panic` locks immediately and revokes every pass. Any
-program may lock or panic, including one inside `keyleash run`. Rotate
+program may lock or panic, including one inside `keyleash run`. A lock of any
+kind stops requests already running: their streams are cut off, and each is
+charged its reserved amount. `keyleash pass revoke` does the same for that
+pass's requests. The provider may still bill for work it had started. Rotate
 the keys at the provider if you think one leaked; automatic upstream
 revocation is not implemented yet.
 

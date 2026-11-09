@@ -673,6 +673,7 @@ func (d *Daemon) hPassRevoke(w http.ResponseWriter, r *http.Request) {
 		}
 		d.log.Error("pass revoke persistence failed (revoked in memory)", "err", err)
 	}
+	d.endPassRequests(req.ID)
 	d.applyLimits()
 	d.auditEvent("pass_revoke", map[string]any{"pass": req.ID, "reason": "admin"})
 	writeJSON(w, 200, struct{}{})
@@ -693,6 +694,7 @@ func (d *Daemon) sweepRunPasses() {
 		if err := d.passes.Revoke(p.ID); err != nil && !errors.Is(err, pass.ErrNotFound) {
 			d.log.Warn("revoking pass of exited process", "pass", p.ID, "err", err)
 		}
+		d.endPassRequests(p.ID)
 		d.auditEvent("pass_revoke", map[string]any{"pass": p.ID, "reason": "process_exited"})
 	}
 	if d.jobs != nil {
