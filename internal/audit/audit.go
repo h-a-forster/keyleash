@@ -479,6 +479,13 @@ func (l *Log) Flush() error {
 	return l.f.Sync()
 }
 
+// Head returns the newest record's sequence number and hash.
+func (l *Log) Head() Head {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return Head{Seq: l.seq, Hash: l.last}
+}
+
 // Close flushes and closes the log and forgets the anchor key.
 func (l *Log) Close() error {
 	l.mu.Lock()

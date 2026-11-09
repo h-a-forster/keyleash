@@ -1214,7 +1214,11 @@ func (d *Daemon) hAuditVerify(w http.ResponseWriter, _ *http.Request) {
 	}
 	d.mu.RUnlock()
 	defer secmem.Wipe(key)
-	rep, err := audit.Verify(filepath.Join(d.dataDir, AuditDir), key)
+	var head *audit.Head
+	if vs := d.vaultStateSnapshot(); key != nil && vs != nil {
+		head = vs.AuditHead
+	}
+	rep, err := audit.Verify(filepath.Join(d.dataDir, AuditDir), key, audit.VerifyOptions{Head: head})
 	out := client.AuditVerify{OK: err == nil, Records: rep.Records, Files: rep.Files, Anchors: rep.Anchors,
 		AnchorsVerified: rep.AnchorsVerified, KeyUsed: key != nil}
 	if rep.FirstBad != nil {

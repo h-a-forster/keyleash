@@ -360,7 +360,7 @@ func (d *Daemon) afterUnlock(method string) error {
 			auditProblem = "audit log cannot be flushed"
 			return
 		}
-		rep, aerr := audit.Verify(filepath.Join(d.dataDir, AuditDir), keys.anchor.Bytes())
+		rep, aerr := audit.Verify(filepath.Join(d.dataDir, AuditDir), keys.anchor.Bytes(), audit.VerifyOptions{Head: vs.AuditHead})
 		switch {
 		case rep.FirstBad != nil:
 			auditProblem = rep.FirstBad.String()
@@ -609,9 +609,9 @@ func (d *Daemon) lockHeld(reason string) {
 	} else if n > 0 {
 		d.log.Info("in-flight requests charged at their reserved amount on lock", "count", n)
 	}
-	d.saveState()
 	d.auditEvent("lock", map[string]any{"reason": reason, "from": string(prev), "session": sid})
 	d.anchor()
+	d.saveState()
 
 	d.withAudit(func(l *audit.Log) { l.ClearAnchorKey() })
 	d.ledger.SetMACKey(nil)
@@ -1179,7 +1179,19 @@ func (d *Daemon) saveState() {
 	}
 	cp := d.ledger.Checkpoint()
 	trip, reset := d.st.heldTrip, d.st.tripReset
-	if err := d.updateVaultState(func(s *vaultState) { s.Checkpoint, s.Trip, s.TripReset = &cp, trip, reset }); err != nil {
+	var head *audit.Head
+	d.withAudit(func(l *audit.Log) {
+		if l.Flush() == nil {
+			h := l.Head()
+			head = &h
+		}
+	})
+	if err := d.updateVaultState(func(s *vaultState) {
+		s.Checkpoint, s.Trip, s.TripReset = &cp, trip, reset
+		if head != nil {
+			s.AuditHead = head
+		}
+	}); err != nil {
 		d.log.Error("saving the ledger checkpoint to the vault failed", "err", err)
 	}
 	body := stateBody{Version: 1, VaultID: d.vault.ID(), Saved: now.UTC(), ModelsSeen: models}

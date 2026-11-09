@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/h-a-forster/keyleash/internal/audit"
 	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/secmem"
@@ -51,6 +52,9 @@ type vaultState struct {
 	// KeysEverAdded is set once the vault has held an api_key: only before
 	// that may a key be added without a step-up (spec §9).
 	KeysEverAdded bool `json:"keys_ever_added,omitempty"`
+	// AuditHead is the audit log's newest durable record at the last save: the
+	// log must still contain it (spec §11).
+	AuditHead *audit.Head `json:"audit_head,omitempty"`
 	// Trip is a trip awaiting a resume that the next unlock would not derive
 	// from the files (spec §8). TripReset is when the last resume reset the
 	// tripwire: earlier spend does not count towards it after a restart.

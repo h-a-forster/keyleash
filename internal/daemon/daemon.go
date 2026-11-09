@@ -628,9 +628,9 @@ func (d *Daemon) Close() error {
 		if err := d.ledger.Flush(); err != nil {
 			errs = append(errs, err)
 		}
-		d.saveState()
 		d.auditEvent("lock", map[string]any{"reason": "shutdown", "session": d.sessionID()})
 		d.anchor()
+		d.saveState()
 	}
 	d.auditEvent("daemon_stop", nil)
 	if err := d.ledger.Close(); err != nil {

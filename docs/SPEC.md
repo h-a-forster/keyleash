@@ -671,6 +671,11 @@ table, so the audit log answers "which program spent this".
   (op, ok, requester PID; `ok: false, reason: caller_gone` when the
   requester disconnected before the commit), `prev_scrub`, `panic`, `shutdown` (a stop request: requester PID and image),
   `daemon_stop`, `anchor`.
+- The daemon-state entry records the log's newest durable record (sequence
+  number and hash) on every save: on lock, on shutdown and at least every 5
+  minutes. The log must still contain that record, so deleting the log or
+  cutting it back trips the next unlock. Records after the last save can still
+  be cut unnoticed if the daemon dies before saving again.
 - After every unlock the daemon verifies the chain **and** the anchors with
   the anchor key; a failure trips the daemon (`audit_integrity`) until the
   owner resumes (§8).

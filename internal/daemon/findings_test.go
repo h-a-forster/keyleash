@@ -969,3 +969,47 @@ func TestRevokeReportsFailedSaveAndRetrySticks(t *testing.T) {
 	e.unlock()
 	wantReason(t, e.anthropic(tok), 401, proxy.ReasonPassInvalid)
 }
+
+// D14: the vault records the audit log's head, so a log deleted or cut back
+// while the daemon is down trips the next unlock, like the ledger.
+func TestAuditLogCutBackTrips(t *testing.T) {
+	for name, cut := range map[string]func(t *testing.T, files []string){
+		"all files removed": func(t *testing.T, files []string) {
+			for _, f := range files {
+				if err := os.Remove(f); err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+		"tail cut": func(t *testing.T, files []string) {
+			last := files[len(files)-1]
+			raw, err := os.ReadFile(last)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ls := strings.SplitAfter(strings.TrimSuffix(string(raw), "\n"), "\n")
+			if err := os.WriteFile(last, []byte(strings.Join(ls[:len(ls)-3], "")), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.stop()
+			files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
+			cut(t, files)
+			e.start()
+			st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+			if err != nil || st.State != client.StateTripped || st.TripReason != TripAuditIntegrity {
+				t.Fatalf("%v: %s (%s)", err, st.State, st.TripReason)
+			}
+			e.appr.approve.Store(true)
+			if _, err := e.c.Resume(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+			e.restart()
+			e.unlock() // the new chain's head is recorded
+		})
+	}
+}
