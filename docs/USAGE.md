@@ -386,10 +386,7 @@ panic there. That refusal is defence in depth, not a boundary: a program
 running as your user can end the daemon process directly. The request is
 in the audit log.
 
-**Rotating the recovery code.** If the command loses the daemon midway it says
-whether the rotation happened; if only the start was recorded (audit record
-`rekey_start` with no `rekey` after it), treat the old code as gone and rotate
-again, which works with your passphrase. `keyleash recovery rotate` (unlocked,
+**Rotating the recovery code.** `keyleash recovery rotate` (unlocked,
 step-up: Hello, your passphrase or the current recovery code) prints a new
 code once, like `init`, and asks you to re-type its last group. The vault
 gets a new data key, so the old code opens neither `vault.json` nor
@@ -400,9 +397,10 @@ before the rotation still open with the old code and show the keys as they
 were then; rotate provider keys if the old code may have leaked.
 Interrupting the command while it waits for approval cancels the rotation.
 If the connection is lost while the rotation is being committed, the
-command checks the audit log and tells you whether it happened; if it did,
-the old code no longer works and the new one is lost, so run `keyleash
-recovery rotate` again.
+command checks the audit log and tells you whether it happened; if it did, or
+if only its start was recorded (`rekey_start` with no `rekey` after it, as when
+the daemon died), treat the old code as gone and the new one as lost, and run
+`keyleash recovery rotate` again.
 
 **Audit.** Every decision is in a hash-chained log. `keyleash audit tail`
 shows recent records (passes by id, keys by fingerprint, never secrets);

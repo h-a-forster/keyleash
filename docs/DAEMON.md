@@ -244,7 +244,7 @@ There is no rollback-arming endpoint (the former `POST
 | GET | /v1/audit/tail | ?n= |
 | GET | /v1/config | effective config (TOML) |
 | POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` {op: rotate_recovery, ok, requester_pid} / `slot_change` {op}, never the code. Not committed if the caller has disconnected by the time the step-up is decided (audit `rekey` {ok: false, reason: caller_gone}); the CLI checks the audit log (its own requester_pid only) when it gets no answer |
-| DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key |
+| DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key → {warning?} (vault.prev not scrubbed) |
 
 Secrets travel only in request bodies over the ACL-protected channel and are
 wiped after use. Responses never contain provider keys; a pass token is

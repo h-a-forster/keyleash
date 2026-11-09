@@ -671,9 +671,9 @@ func (d *Daemon) trip(reason, detail string) {
 
 // resume leaves Tripped after a step-up approval. It also accepts what the
 // trip reported: a failed ledger verification (the current ledger is copied to
-// ledger/rejected-<time>/ and re-authenticated as it stands), a failed audit verification (the rejected log is moved to
-// audit/rejected-<time>/ and a new chain starts) and a changed config (it
-// becomes the accepted config).
+// ledger/rejected-<time>/ and re-authenticated as it stands), a failed audit
+// verification (the rejected log is moved to audit/rejected-<time>/ and a new
+// chain starts) and a changed config (it becomes the accepted config).
 func (d *Daemon) resume(ctx context.Context) error {
 	d.mu.RLock()
 	state, reason, session := d.st.state, d.st.tripReason, d.st.session
