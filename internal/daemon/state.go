@@ -666,8 +666,8 @@ func (d *Daemon) trip(reason, detail string) {
 }
 
 // resume leaves Tripped after a step-up approval. It also accepts what the
-// trip reported: a failed ledger verification (the current ledger becomes
-// the checkpoint), a failed audit verification (the rejected log is moved to
+// trip reported: a failed ledger verification (the current ledger is copied to
+// ledger/rejected-<time>/ and re-authenticated as it stands), a failed audit verification (the rejected log is moved to
 // audit/rejected-<time>/ and a new chain starts) and a changed config (it
 // becomes the accepted config).
 func (d *Daemon) resume(ctx context.Context) error {
@@ -743,10 +743,20 @@ func (d *Daemon) resume(ctx context.Context) error {
 		}
 		d.queue.SetApprover(d.configured)
 	}
+	d.mu.RLock()
+	accepted := !d.st.integrityOK
+	d.mu.RUnlock()
+	ledgerArchived := ""
+	if accepted {
+		ledgerArchived = "rejected-" + d.clk.Now().UTC().Format("20060102T150405Z")
+		if err := d.ledger.AcceptCurrent(ledgerArchived); err != nil {
+			d.log.Error("accepting the ledger failed", "err", err)
+			return statusErr(503, client.CodeInternal, "the ledger could not be accepted; check the data directory and retry")
+		}
+	}
 	d.ledger.ResetTrip()
 	now := d.clk.Now()
 	d.mu.Lock()
-	accepted := !d.st.integrityOK
 	d.st.integrityOK = true
 	if accepted {
 		d.st.integrityMsg = "accepted by owner after failure"
@@ -766,6 +776,9 @@ func (d *Daemon) resume(ctx context.Context) error {
 	f := map[string]any{"approved_by": dec.Method, "reason": reason, "integrity_accepted": accepted}
 	if archived != "" {
 		f["audit_archived"] = archived
+	}
+	if ledgerArchived != "" {
+		f["ledger_archived"] = filepath.Join(LedgerDir, ledgerArchived)
 	}
 	if pending != nil {
 		f["config_accepted"] = changes

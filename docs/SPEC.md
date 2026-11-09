@@ -437,6 +437,9 @@ worst case until they settle.
   under a vault-derived key. After unlock the daemon verifies the chain and
   MACs against its last stored checkpoint; any break, MAC failure or missing
   month trips the daemon, so deleting the ledger cannot silently reset spend.
+  A damaged line does not stop the daemon starting: it trips at unlock. Records
+  stay in the newest month file when the clock or timezone steps back over a
+  month end, so the chain stays in order.
 - The checkpoint (current month, record count, last hash, settled total and a
   monotonic counter) lives in an authenticated **vault entry** (provider
   `keyleash`, label `daemon-state`; hidden from `keyleash keys`), sealed under
@@ -485,7 +488,9 @@ and unlock or a restart do not end it; a trip derived from the files at unlock
 ends once the files verify. A resumed tripwire stays resumed across a restart.
 `keyleash resume` (step-up) applies to the session it was asked in: an
 approval that arrives after a lock is refused. It accepts what the trip reported: the current
-ledger becomes the checkpoint; a rejected audit log is moved to
+ledger is copied to `ledger/rejected-<time>/` and authenticated again as it
+stands, so a damaged line is dropped (its amount cannot be known) and a later
+change is caught like any other; a rejected audit log is moved to
 `audit/rejected-<time>/` and a new chain starts; a changed config becomes the
 accepted one.
 

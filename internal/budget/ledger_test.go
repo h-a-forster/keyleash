@@ -481,7 +481,9 @@ func TestCompleteLineMissingNewline(t *testing.T) {
 	}
 }
 
-func TestCorruptionRejected(t *testing.T) {
+// A damaged line does not stop the ledger opening (the daemon must start to
+// report it); verification reports it, so the daemon trips before any spend.
+func TestCorruptionReported(t *testing.T) {
 	ok := `{"ts":"2026-06-15T11:00:00Z","id":"a","scopes":["global"],"amount_micros":1,"reserved_micros":1}`
 	cases := map[string]string{
 		"garbage mid-file":   ok + "\nnot json\n" + ok + "\n",
@@ -499,9 +501,12 @@ func TestCorruptionRejected(t *testing.T) {
 			}
 			clk := &fakeClock{t: time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)}
 			l, err := Open(Options{Dir: dir, Clock: clk, Location: time.UTC})
-			if err == nil {
-				l.Close()
-				t.Fatal("corruption accepted")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			if in, err := l.VerifyIntegrity(nil); err != nil || in.OK() || in.Corrupt == 0 {
+				t.Fatalf("corruption not reported: %v %+v", err, in)
 			}
 		})
 	}

@@ -314,8 +314,10 @@ override file it names) changed, or a security record could not be written
 to the audit log, keyleash is **tripped**: new requests get `423 tripped`
 and in-flight ones finish. Check `keyleash status` and `keyleash audit
 verify`, then leave it with `keyleash resume` (step-up). Resuming after a
-failed audit check moves the rejected log to `audit/rejected-<time>/` and
-starts a new chain. Resuming after `passes.json` changed (`keyleash status`
+failed ledger check accepts the ledger as it stands (a copy stays in
+`ledger/rejected-<time>/`, and a line too damaged to read no longer counts).
+Resuming after a failed audit check moves the rejected log to
+`audit/rejected-<time>/` and starts a new chain. Resuming after `passes.json` changed (`keyleash status`
 lists the added, removed and changed passes) revokes every added or changed
 pass. After a config change, an integrity failure or an edited
 `passes.json`, the resume is approved with the approval method of the

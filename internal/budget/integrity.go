@@ -251,6 +251,102 @@ func (l *Ledger) VerifyIntegrity(key []byte, opts ...VerifyOptions) (Integrity, 
 	return in, nil
 }
 
+// AcceptCurrent makes the ledger as it stands the accepted one, after the owner
+// accepted a failed verification: every record is chained and MAC'd again under
+// the current key, in file order, so the result verifies, and any later change
+// is caught like any other. Corrupt lines are dropped (their amounts cannot be
+// known) and each original file is first copied to the subdirectory archive.
+// A failure leaves each file either as it was or rebuilt; retrying is safe.
+func (l *Ledger) AcceptCurrent(archive string) error {
+	l.w.mu.Lock()
+	defer l.w.mu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	batch := l.w.take()
+	if n, err := l.w.writeLocked(batch); err != nil {
+		l.w.putBack(batch[n:])
+		return err
+	}
+	l.journalDoneLocked(batch)
+	if err := l.w.closeLocked(false); err != nil {
+		return err
+	}
+	names, err := ledgerFiles(l.dir)
+	if err != nil || len(names) == 0 {
+		return err
+	}
+	tmp := filepath.Join(l.dir, archive+".tmp")
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		return fmt.Errorf("budget: accept ledger: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+	if err := os.MkdirAll(filepath.Join(l.dir, archive), 0o700); err != nil {
+		return fmt.Errorf("budget: accept ledger: %w", err)
+	}
+	head := Checkpoint{}
+	prev := ""
+	for _, name := range names {
+		orig, err := os.ReadFile(filepath.Join(l.dir, name))
+		if err != nil {
+			return fmt.Errorf("budget: accept ledger: %w", err)
+		}
+		if err := writeSynced(filepath.Join(l.dir, archive, name), orig); err != nil {
+			return err
+		}
+		var out bytes.Buffer
+		cp := Checkpoint{Month: monthOf(name)}
+		for _, ln := range bytes.Split(orig, []byte{'\n'}) {
+			var r record
+			if len(bytes.TrimSpace(ln)) == 0 || parseLine(ln, &r) != nil {
+				continue
+			}
+			data, h, err := l.w.encode(r, prev)
+			if err != nil {
+				return err
+			}
+			out.Write(data)
+			out.WriteByte('\n')
+			prev = h
+			cp.Records++
+			cp.Settled = addSat(cp.Settled, r.Amount)
+			cp.LastHash = h
+		}
+		if err := writeSynced(filepath.Join(tmp, name), out.Bytes()); err != nil {
+			return err
+		}
+		if cp.Records > 0 {
+			head = cp
+		}
+	}
+	for _, name := range names {
+		if err := os.Rename(filepath.Join(tmp, name), filepath.Join(l.dir, name)); err != nil {
+			return fmt.Errorf("budget: accept ledger: %w", err)
+		}
+	}
+	l.w.head, l.w.work, l.w.durable = head.LastHash, head, head
+	l.tornAtOpen = 0
+	return nil
+}
+
+// writeSynced creates p with data and fsyncs it.
+func writeSynced(p string, data []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("budget: accept ledger: %w", err)
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("budget: accept ledger: %w", err)
+	}
+	return nil
+}
+
 // prevMonth returns the "YYYY-MM" before month, or "".
 func prevMonth(month string) string {
 	t, err := time.Parse("2006-01", month)

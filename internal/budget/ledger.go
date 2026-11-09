@@ -593,16 +593,21 @@ func (l *Ledger) flushWLocked() error {
 	}
 	// Everything that failed earlier was put back (or re-synced) and is now
 	// on disk.
+	l.mu.Lock()
+	l.persistErr = nil
+	l.journalDoneLocked(batch)
+	l.mu.Unlock()
+	return nil
+}
+
+// journalDoneLocked ends the holds of records now on disk. A failed write only
+// means a later process charges them once more.
+func (l *Ledger) journalDoneLocked(batch []line) {
 	done := make([]journalLine, 0, len(batch))
 	for _, ln := range batch {
 		done = append(done, journalLine{ID: ln.id, Done: true})
 	}
-	l.mu.Lock()
-	l.persistErr = nil
-	// A failed write only means a later process charges these once more.
 	_ = l.journal.write(done...)
-	l.mu.Unlock()
-	return nil
 }
 
 // SetMACKey makes every record enqueued from now on carry

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -1127,4 +1128,119 @@ func TestAuditAgreesWithLockChargeOnUnsentRequest(t *testing.T) {
 	}) {
 		t.Fatal("the audit record does not show the 500 the ledger charged")
 	}
+}
+
+func tamperFirstAmount(t *testing.T, dir string) {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(dir, LedgerDir, "ledger-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`"amount_micros":(\d+)`)
+	loc := re.FindSubmatchIndex(raw)
+	n, _ := strconv.Atoi(string(raw[loc[2]:loc[3]]))
+	out := append(append(append([]byte{}, raw[:loc[2]]...), strconv.Itoa(n-1)...), raw[loc[3]:]...)
+	if err := os.WriteFile(files[0], out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// acceptLedger unlocks into an integrity trip, resumes it, and checks the
+// acceptance sticks: lock and unlock, restart and unlock, and a request.
+func acceptLedger(t *testing.T, e *env, tok string) {
+	t.Helper()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.State != client.StateTripped || st.TripReason != TripIntegrity {
+		t.Fatalf("unlock: %v %s (%s)", err, st.State, st.TripReason)
+	}
+	e.appr.approve.Store(true)
+	if st, err = e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked {
+		t.Fatalf("resume: %v %s", err, st.State)
+	}
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.unlock() // fatals unless Unlocked
+	e.restart()
+	e.unlock()
+	wantReason(t, e.anthropic(tok), 200, "")
+	e.restart()
+	e.unlock()
+}
+
+// D4: accepting a failed ledger check sticks, keeps the spend, keeps the
+// original where the owner can read it, and a new change is still caught.
+func TestAcceptedLedgerStaysAccepted(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	for range 2 {
+		wantReason(t, e.anthropic(tok), 200, "")
+	}
+	e.stop()
+	tamperFirstAmount(t, e.dir)
+	e.start()
+	before, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay)
+	acceptLedger(t, e, tok)
+	if after, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); after <= before {
+		t.Fatalf("spend %d, had %d before accepting and one more request", after, before)
+	}
+	arch, _ := filepath.Glob(filepath.Join(e.dir, LedgerDir, "rejected-*", "ledger-*.jsonl"))
+	if len(arch) != 1 {
+		t.Fatalf("rejected copies: %v", arch)
+	}
+	e.stop()
+	tamperFirstAmount(t, e.dir)
+	e.start()
+	if st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil || st.TripReason != TripIntegrity {
+		t.Fatalf("a new change after accepting: %v %s (%s)", err, st.State, st.TripReason)
+	}
+}
+
+// D5: a clock stepped back over a month end does not break the chain, and the
+// spend written meanwhile still counts after a restart.
+func TestClockBackOverMonthEndKeepsChain(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 200, "")
+	if err := e.d.ledger.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(-15 * 24 * time.Hour) // 11 October to 26 September
+	wantReason(t, e.anthropic(tok), 200, "")
+	settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowMonth)
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.unlock() // fatals unless Unlocked
+	e.restart()
+	e.unlock()
+	if got, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowMonth); got != settled {
+		t.Fatalf("after a restart the month shows %d, it was %d", got, settled)
+	}
+}
+
+// D7: a damaged line does not stop the daemon starting: it trips at unlock and
+// the owner has the documented way out.
+func TestCorruptLedgerLineTripsInsteadOfStoppingStart(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 200, "")
+	e.stop()
+	files, _ := filepath.Glob(filepath.Join(e.dir, LedgerDir, "ledger-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files[0], append([]byte("garbage\n"), raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	acceptLedger(t, e, tok)
 }
