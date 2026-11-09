@@ -126,6 +126,7 @@ type Store struct {
 	authBody json.RawMessage // body as last written or loaded (nil: none)
 	authMAC  string
 	pending  map[string]time.Time // revocations not in authBody
+	unsaved  bool                 // the last change could not be written
 	hook     func(Baseline)
 }
 
@@ -490,7 +491,8 @@ func (s *Store) Verify(token string) (Pass, error) {
 	return p, nil
 }
 
-// Revoke revokes pass id. Revoking an already revoked pass is a no-op. The
+// Revoke revokes pass id. Revoking an already revoked pass is a no-op, unless
+// an earlier change could not be saved: then it is a retry of the save. The
 // in-memory revocation takes effect even if persisting it fails (fail
 // closed); the error reports the persistence failure.
 func (s *Store) Revoke(id string) error {
@@ -501,7 +503,10 @@ func (s *Store) Revoke(id string) error {
 		return ErrNotFound
 	}
 	if e.p.Revoked {
-		return nil
+		if !s.unsaved {
+			return nil
+		}
+		return s.saveLocked(true)
 	}
 	e.p.Revoked = true
 	e.p.RevokedAt = s.clk.Now()
@@ -552,7 +557,7 @@ func (s *Store) revokeWhere(match func(Pass) bool) (int, error) {
 			n++
 		}
 	}
-	if n == 0 {
+	if n == 0 && !s.unsaved {
 		return 0, nil
 	}
 	return n, s.saveLocked(true)
@@ -698,7 +703,11 @@ func (s *Store) saveLocked(change bool) error {
 		return fmt.Errorf("pass: encode store: %w", err)
 	}
 	if err := writeAtomic(s.path, data); err != nil {
+		s.unsaved = s.unsaved || change
 		return err
+	}
+	if change {
+		s.unsaved = false
 	}
 	for _, e := range s.byID {
 		e.lastSave = e.p.LastUsed

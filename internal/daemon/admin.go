@@ -671,16 +671,19 @@ func (d *Daemon) hPassRevoke(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := d.passes.Revoke(req.ID); err != nil {
-		if errors.Is(err, pass.ErrNotFound) {
-			d.writeErr(w, statusErr(404, client.CodeNotFound, "no such pass"))
-			return
-		}
-		d.log.Error("pass revoke persistence failed (revoked in memory)", "err", err)
+	rerr := d.passes.Revoke(req.ID)
+	if errors.Is(rerr, pass.ErrNotFound) {
+		d.writeErr(w, statusErr(404, client.CodeNotFound, "no such pass"))
+		return
 	}
 	d.endPassRequests(req.ID)
 	d.applyLimits()
-	d.auditEvent("pass_revoke", map[string]any{"pass": req.ID, "reason": "admin"})
+	d.auditEvent("pass_revoke", map[string]any{"pass": req.ID, "reason": "admin", "saved": rerr == nil})
+	if rerr != nil {
+		d.log.Error("pass revoke persistence failed (revoked in memory)", "err", rerr)
+		d.writeErr(w, statusErr(503, client.CodeInternal, "the pass is revoked for now, but saving that failed, so it would come back after a restart; fix the disk problem and revoke it again"))
+		return
+	}
 	writeJSON(w, 200, struct{}{})
 }
 

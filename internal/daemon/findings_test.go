@@ -936,3 +936,36 @@ func TestResumedTripwireStaysResumedAfterRestart(t *testing.T) {
 	e.unlock()
 	wantReason(t, e.anthropic(tok), 200, "")
 }
+
+// D11: a revocation that could not be saved is reported as a failure, and
+// retrying it saves it, so the pass does not come back after a restart.
+func TestRevokeReportsFailedSaveAndRetrySticks(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	ps, err := e.c.Passes(e.ctx())
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("passes %v %v", ps, err)
+	}
+	store := filepath.Join(e.dir, PassesFile)
+	if err := os.Remove(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(store, 0o700); err != nil { // the rename onto it fails
+		t.Fatal(err)
+	}
+	if err := e.c.RevokePass(e.ctx(), ps[0].ID); err == nil {
+		t.Fatal("a revocation that was not saved was reported as done")
+	}
+	wantReason(t, e.anthropic(tok), 401, proxy.ReasonPassInvalid) // effective in memory all the same
+	if err := os.Remove(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	e.restart()
+	e.unlock()
+	wantReason(t, e.anthropic(tok), 401, proxy.ReasonPassInvalid)
+}
