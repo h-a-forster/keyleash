@@ -323,7 +323,12 @@ pass. After a config change, an integrity failure or an edited
 `passes.json`, the resume is approved with the approval method of the
 config you last accepted, never with the one the changed file names: if
 that is `console` or `deny`, or Windows Hello is unavailable, `keyleash
-resume` asks for your passphrase or recovery code.
+resume` asks for your passphrase or recovery code. Any other trip is approved
+with the configured method, except that `deny` asks for the same secret, so a
+trip always has a way out. Accepting a failed ledger check shows what it found:
+lines dropped, bad MACs, chain breaks, forged in-flight lines, and the total the
+vault recorded against the one the files hold; the audit `resume` record keeps
+them.
 
 **Step-up approvals prove you are there.** Every program running as you can
 reach keyleash's admin channel, including the agents it governs, so being
@@ -351,7 +356,8 @@ and presence keys first; `keyleash status` lists them all.
   same.
 - `"console"`: the daemon's terminal asks `Approve? [y/N]`; the passphrase
   route works too.
-- `"deny"`: every step-up is refused (servers, CI).
+- `"deny"`: every step-up is refused (servers, CI), except that `keyleash
+  resume` can be approved with your passphrase or recovery code.
 
 With every method except `deny`, `keyleash approvals approve <id>` approves
 with your passphrase or recovery code (`--stdin` reads it from standard

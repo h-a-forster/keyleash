@@ -6,13 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -574,7 +577,23 @@ func slowBody(t *testing.T, e *env, tok string) (send func() *http.Response) {
 	if _, err := conn.Write([]byte(hdr)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond) // Authenticate has run; the handler waits for the body
+	// Authenticate's last step takes the pass's scope; the handler then waits
+	// for the body.
+	for i := 0; ; i++ {
+		e.d.mu.RLock()
+		scope := e.d.st.requests
+		e.d.mu.RUnlock()
+		scope.mu.Lock()
+		n := len(scope.passes)
+		scope.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if i > 1000 {
+			t.Fatal("the request was not authenticated")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	return func() *http.Response {
 		t.Helper()
 		if _, err := conn.Write([]byte(anthropicReq)); err != nil {
@@ -611,6 +630,31 @@ func (e *env) stream(t *testing.T, tok string, steps int) *http.Response {
 
 // D1: a request authenticated while its pass was good is refused at admission
 // once the pass is revoked, expired or its bound process is gone.
+// A pass still live after a lock and unlock does not revive a request the lock
+// ended while its body arrived, and the refusal is on the record.
+func TestStoppedRequestRefusedOnTheRecord(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	hits := e.up.hits.Load()
+	send := slowBody(t, e, tok)
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.unlock()
+	resp := send()
+	if resp.StatusCode != 423 || resp.Header.Get(proxy.ReasonHeader) != proxy.ReasonLocked {
+		t.Fatalf("got %d %q", resp.StatusCode, resp.Header.Get(proxy.ReasonHeader))
+	}
+	if e.up.hits.Load() != hits {
+		t.Fatal("the request reached upstream")
+	}
+	if !auditHas(t, e, "request", func(f map[string]any) bool { return f["deny_reason"] == proxy.ReasonLocked }) {
+		t.Fatal("the refusal left no audit record")
+	}
+}
+
 func TestDeadPassCannotSpendOnHeldRequest(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -652,6 +696,9 @@ func TestDeadPassCannotSpendOnHeldRequest(t *testing.T) {
 			}
 			if e.up.hits.Load() != hits {
 				t.Fatal("the request reached upstream")
+			}
+			if !auditHas(t, e, "request", func(f map[string]any) bool { return f["deny_reason"] == tc.reason }) {
+				t.Fatal("the refusal left no audit record")
 			}
 		})
 	}
@@ -998,6 +1045,25 @@ func TestAuditLogCutBackTrips(t *testing.T) {
 				t.Fatal(err)
 			}
 		},
+		"chain rebuilt longer": func(t *testing.T, files []string) {
+			for _, f := range files {
+				if err := os.Remove(f); err != nil {
+					t.Fatal(err)
+				}
+			}
+			l, err := audit.Open(filepath.Dir(files[0]), newFakeClock())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 200 {
+				if err := l.Append("note", nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t, nil)
@@ -1006,10 +1072,24 @@ func TestAuditLogCutBackTrips(t *testing.T) {
 			files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
 			cut(t, files)
 			e.start()
-			st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
-			if err != nil || st.State != client.StateTripped || st.TripReason != TripAuditIntegrity {
-				t.Fatalf("%v: %s (%s)", err, st.State, st.TripReason)
+			wantTrip := func(what string) {
+				t.Helper()
+				st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+				if err != nil || st.State != client.StateTripped || st.TripReason != TripAuditIntegrity {
+					t.Fatalf("%s: %v: %s (%s)", what, err, st.State, st.TripReason)
+				}
+				if v, err := e.c.AuditVerify(e.ctx()); err != nil || v.OK {
+					t.Fatalf("%s: audit verify: %v %+v", what, err, v)
+				}
 			}
+			wantTrip("first unlock")
+			// Nothing but a resume ends it: not a lock, not a restart.
+			if _, err := e.c.Lock(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+			wantTrip("after lock")
+			e.restart()
+			wantTrip("after restart")
 			e.appr.approve.Store(true)
 			if _, err := e.c.Resume(e.ctx()); err != nil {
 				t.Fatal(err)
@@ -1032,9 +1112,39 @@ func TestUnlockUnderLockedScreenStaysLocked(t *testing.T) {
 	if s := e.status(); s.State != client.StateLocked || s.Vault.Unlocked {
 		t.Fatalf("state %s, vault unlocked %v", s.State, s.Vault.Unlocked)
 	}
+	// It never served in between.
+	if auditHas(t, e, "unlock", func(f map[string]any) bool { return f["state"] == "away" || f["state"] == "unlocked" }) {
+		t.Fatal("the unlock passed through a serving state")
+	}
+	// The screen is unlocked but the monitor has not polled yet: no false refusal.
 	e.pres.set(0, false)
-	e.d.stepPresence()
 	e.unlock()
+}
+
+// copyDataDir is what a daemon killed now leaves on disk.
+func copyDataDir(t *testing.T, dir string) string {
+	t.Helper()
+	kept := t.TempDir()
+	root := os.DirFS(dir)
+	err := fs.WalkDir(root, ".", func(p string, ent fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case ent.IsDir():
+			return os.MkdirAll(filepath.Join(kept, p), 0o700)
+		case p == InstanceLock:
+			return nil // held open by the daemon, and of no use to the next one
+		}
+		b, err := fs.ReadFile(root, p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(kept, p), b, 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kept
 }
 
 // D8: a reservation left by a daemon that died is charged at the next unlock
@@ -1042,17 +1152,12 @@ func TestUnlockUnderLockedScreenStaysLocked(t *testing.T) {
 func TestInFlightOfDeadDaemonChargedAtUnlock(t *testing.T) {
 	e := newEnv(t, nil)
 	e.unlock()
+	if _, err := e.d.ledger.Reserve(nil, 777, budget.Meta{RequestID: "req_dead", Model: "claude-sonnet-4-5"}); err != nil {
+		t.Fatal(err)
+	}
+	kept := copyDataDir(t, e.dir)
 	e.stop()
-	l, err := budget.Open(budget.Options{Dir: filepath.Join(e.dir, LedgerDir), Clock: e.clk})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := l.Reserve(nil, 777, budget.Meta{RequestID: "req_dead", Model: "claude-sonnet-4-5"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
-	}
+	e.dir = kept
 	e.start()
 	e.unlock() // fatals unless Unlocked: the charge verifies
 	if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled != 777 {
@@ -1412,5 +1517,239 @@ func TestRemoveSlotReportsPrevNotScrubbed(t *testing.T) {
 	}
 	if resp.Warning == "" {
 		t.Fatal("no warning about vault.prev")
+	}
+}
+
+// Review of PR 3, item 3: a forged journal line charges nothing and is noticed.
+func TestForgedJournalLineChargesNothing(t *testing.T) {
+	for name, amount := range map[string]int64{"negative": -5_000_000, "positive": 123_456_789} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{})
+			wantReason(t, e.anthropic(tok), 200, "")
+			settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay)
+			e.stop()
+			line := fmt.Sprintf(`{"id":"forged","scopes":["global"],"amount_micros":%d,"meta":{"PassID":"p_x"},"created":"2026-10-11T12:00:00Z","mac":"%s"}`+"\n",
+				amount, strings.Repeat("ab", 32))
+			f, err := os.OpenFile(filepath.Join(e.dir, LedgerDir, "inflight.jsonl"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.WriteString(line)
+			f.Close()
+			e.start()
+			st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+			if err != nil || st.State != client.StateTripped || st.TripReason != TripIntegrity {
+				t.Fatalf("unlock: %v %s (%s)", err, st.State, st.TripReason)
+			}
+			if got, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); got != settled {
+				t.Fatalf("spend %d after the forged line, was %d", got, settled)
+			}
+			// Noticed once is not accepted: only a resume ends it.
+			if _, err := e.c.Lock(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+			st, err = e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+			if err != nil || st.State != client.StateTripped || st.TripReason != TripIntegrity {
+				t.Fatalf("unlock again: %v %s (%s)", err, st.State, st.TripReason)
+			}
+			e.appr.approve.Store(true)
+			if st, err = e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked {
+				t.Fatalf("resume: %v %s", err, st.State)
+			}
+			e.restart()
+			e.unlock() // the line is gone: fatals unless Unlocked
+			if got, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); got != settled {
+				t.Fatalf("spend %d after the resume, was %d", got, settled)
+			}
+		})
+	}
+}
+
+// Review of PR 3, item 5: accepting a failed ledger check says what is accepted,
+// in the prompt and in the resume record.
+func TestLedgerAcceptShowsWhatIsAccepted(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 200, "")
+	wantReason(t, e.anthropic(tok), 200, "")
+	e.stop()
+	tamperFirstAmount(t, e.dir)
+	files, _ := filepath.Glob(filepath.Join(e.dir, LedgerDir, "ledger-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files[0], append([]byte("garbage\n"), raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	if _, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+	if s := e.status(); len(s.Warnings) == 0 {
+		t.Fatal("status does not describe the failed check")
+	}
+	e.appr.approve.Store(true)
+	if _, err := e.c.Resume(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if !auditHas(t, e, "resume", func(f map[string]any) bool {
+		return f["ledger_dropped"] == float64(1) && f["ledger_mac_failures"] == float64(1) &&
+			f["ledger_found_micros"].(float64) < f["ledger_recorded_micros"].(float64)
+	}) {
+		t.Fatal("the resume record does not say what was accepted")
+	}
+	var note string
+	for _, r := range e.appr.requests() {
+		if r.Kind == "resume" {
+			note = r.Note
+		}
+	}
+	if !strings.Contains(note, "1") {
+		t.Fatalf("the prompt does not show the counts: %q", note)
+	}
+}
+
+// Review of PR 3, item 6: a held trip under approval.method = "deny" has an
+// exit, the vault passphrase over the admin API.
+func TestHeldTripCanBeResumedUnderDeny(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Approval.Method = "deny" })
+	e.noApprover = true
+	e.restart()
+	e.unlock()
+	e.d.trip(TripAudit, "test")
+	errc := make(chan error, 1)
+	go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+	id := e.waitPending("resume")
+	if err := e.c.Decide(e.ctx(), id, client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if s := e.status(); s.State != client.StateUnlocked {
+		t.Fatalf("state %s (%s)", s.State, s.TripReason)
+	}
+}
+
+// Review of PR 3, item 7: an approval covers the trip its prompt showed, also
+// within one session.
+func TestSecondResumePromptDoesNotClearNewerTrip(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	e.approver = blockingApprover{}
+	e.restart()
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.tripBySpend(tok)
+	errc := make(chan error, 2)
+	var ids []string
+	for i := range 2 {
+		go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+		for j := 0; len(ids) <= i; j++ {
+			list, _ := e.c.Approvals(e.ctx())
+			for _, ap := range list {
+				if ap.Kind == "resume" && !slices.Contains(ids, ap.ID) {
+					ids = append(ids, ap.ID)
+				}
+			}
+			if j > 500 {
+				t.Fatal("no prompt")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := e.c.Decide(e.ctx(), ids[0], client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("first resume: %v", err)
+	}
+	e.d.trip(TripAudit, "newer")
+	if err := e.c.Decide(e.ctx(), ids[1], client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; !isAPI(err, 409, client.CodeConflict) {
+		t.Fatalf("second resume: %v", err)
+	}
+	if s := e.status(); s.State != client.StateTripped || s.TripReason != TripAudit {
+		t.Fatalf("state %s (%s)", s.State, s.TripReason)
+	}
+}
+
+// Mutation gap: the pass is checked again after each kind of approval wait.
+func TestPassExpiringDuringApprovalSpendsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		kind, body string
+		limits     []client.PassLimit
+	}{
+		{"unknown_model", `{"model":"claude-from-the-future","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, nil},
+		{"over_limit", anthropicReq, []client.PassLimit{{Window: "day", Amount: 1}}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			e := newEnv(t, func(c *config.Config) { c.Limits.OnExceed = "approve" })
+			ra := &resumeGate{kind: tc.kind, gate: make(chan struct{}), seen: make(chan approval.Request, 1)}
+			e.approver = ra
+			e.restart()
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{TTL: time.Hour, Limits: tc.limits})
+			hits := e.up.hits.Load()
+			done := make(chan result, 1)
+			go func() { done <- e.post("anthropic", "/v1/messages", tok, tc.body) }()
+			<-ra.seen
+			e.clk.Advance(2 * time.Hour)
+			close(ra.gate)
+			wantReason(t, <-done, 401, proxy.ReasonPassExpired)
+			if e.up.hits.Load() != hits {
+				t.Fatal("the request reached upstream")
+			}
+		})
+	}
+}
+
+// Mutation gap: a trip is on disk at once, so a killed daemon does not forget it.
+func TestTripSurvivesKilledDaemon(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.d.trip(TripAudit, "test")
+	// What a kill leaves: the files as they are now, no shutdown save.
+	kept := copyDataDir(t, e.dir)
+	e.stop()
+	e.dir = kept
+	e.start()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.State != client.StateTripped || st.TripReason != TripAudit {
+		t.Fatalf("after a kill: %v %s (%s)", err, st.State, st.TripReason)
+	}
+}
+
+// Mutation gap: when the sweep revokes the pass of an exited process it also
+// ends that pass's running requests.
+func TestSweepEndsRequestsOfExitedProcess(t *testing.T) {
+	requireProcessBinding(t)
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{BindPID: os.Getpid()})
+	done := make(chan result, 1)
+	go func() { done <- e.anthropic(tok, "X-Test-Hold", "1") }()
+	select {
+	case <-e.up.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("upstream did not get the request")
+	}
+	e.treeGone.Store(true)
+	e.d.sweepRunPasses()
+	select {
+	case r := <-done:
+		wantReason(t, r, 401, proxy.ReasonPassInvalid)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the request kept running")
 	}
 }

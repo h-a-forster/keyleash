@@ -406,6 +406,9 @@ func (e *env) start() {
 			if pid == outsiderPID {
 				return procinfo.Process{PID: pid, ParentPID: 1, Image: testOutsiderImage, StartTime: 1}, nil
 			}
+			if e.treeGone.Load() {
+				return procinfo.Process{}, procinfo.ErrNotFound
+			}
 			return procinfo.Lookup(pid)
 		},
 		manualPresence:     true,

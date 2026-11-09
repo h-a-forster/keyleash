@@ -70,6 +70,9 @@ type stateData struct {
 	// resume. tripReset is when a resume last reset the tripwire.
 	heldTrip  *heldTrip
 	tripReset time.Time
+	// tripGen counts entries into Tripped and unlocks: a resume approval covers
+	// only the generation its prompt showed.
+	tripGen uint64
 
 	session    string
 	leaseUntil time.Time
@@ -103,6 +106,8 @@ type stateData struct {
 	// vaultStateBad: the daemon-state entry could not be read. It is left as it
 	// is (d.vs stays nil, so nothing can write it) until a resume replaces it.
 	vaultStateBad bool
+	// ledgerFail describes the failed ledger check a resume would accept.
+	ledgerFail *ledgerFailure
 	// rollbackFileSeq/RecordedSeq describe the last rollback detected or
 	// accepted at unlock; rollbackAccepted marks an accepted one.
 	rollbackFileSeq, rollbackRecordedSeq uint64
@@ -123,6 +128,22 @@ type stateData struct {
 	concScopes map[string]bool
 	// modelsSeen records provider/model pairs that had no price.
 	modelsSeen map[string]bool
+}
+
+// ledgerFailure is what a failed ledger check found, for the owner deciding
+// whether to accept it.
+type ledgerFailure struct {
+	Corrupt, MACFailures, ChainBreaks, JournalRejected int
+	CheckpointSettled, CheckpointFound                 money.Micros
+}
+
+// summary is the failure in one line ("" for none).
+func (f *ledgerFailure) summary() string {
+	if f == nil {
+		return ""
+	}
+	return fmt.Sprintf("ledger: %d lines dropped, %d bad MACs, %d chain breaks, %d forged in-flight lines; vault records %s, files hold %s",
+		f.Corrupt, f.MACFailures, f.ChainBreaks, f.JournalRejected, f.CheckpointSettled, f.CheckpointFound)
 }
 
 // heldTrip is the reason and detail of a trip awaiting a resume.
@@ -305,16 +326,20 @@ func (d *Daemon) afterUnlock(method string) error {
 	}
 	d.withAudit(func(l *audit.Log) { l.SetAnchorKey(keys.anchor.Bytes()) })
 	d.ledger.SetMACKey(keys.ledger.Bytes())
-	// Nothing runs while locked, so what is in flight now was left by a daemon
-	// that died (spec §7.7): charge it, now that the record can carry a MAC.
-	if n, err := d.ledger.ExpireInFlight(-1); err != nil {
-		d.log.Warn("charging requests a previous daemon left in flight", "err", err)
-	} else if n > 0 {
-		d.log.Warn("requests a previous daemon left in flight charged at their reserved amount", "count", n)
-		d.auditEvent("inflight_recovered", map[string]any{"count": n})
-	}
-
 	var problems []string
+	// What a daemon that died left in flight (spec §7.7): charge it, now that
+	// its journal lines can be checked and the records can carry a MAC.
+	rec, rerr := d.ledger.RecoverInFlight()
+	if rerr != nil {
+		d.log.Error("charging requests a previous daemon left in flight", "err", rerr)
+		problems = append(problems, "the in-flight journal could not be processed")
+	} else if rec.Charged+rec.Rejected > 0 {
+		d.log.Warn("requests a previous daemon left in flight", "charged", rec.Charged, "micros", int64(rec.Amount), "rejected", rec.Rejected)
+		d.auditEvent("inflight_recovered", map[string]any{"count": rec.Charged, "total_micros": int64(rec.Amount), "rejected": rec.Rejected})
+		if rec.Rejected > 0 {
+			problems = append(problems, "the in-flight journal held lines keyleash did not write (not charged)")
+		}
+	}
 	vs, vsExists, vserr := d.loadVaultState()
 	if vserr != nil {
 		problems = append(problems, "the daemon state in the vault cannot be read")
@@ -355,6 +380,7 @@ func (d *Daemon) afterUnlock(method string) error {
 		problems = append(problems, "the ledger checkpoint is missing but the ledger has records")
 	}
 	in, verr := d.ledger.VerifyIntegrity(keys.ledger.Bytes(), budget.VerifyOptions{Checkpoint: cp})
+	var ledgerFail *ledgerFailure
 	if verr != nil {
 		problems = append(problems, "ledger verification error")
 	} else if !in.OK() {
@@ -362,6 +388,10 @@ func (d *Daemon) afterUnlock(method string) error {
 		if len(in.Problems) == 0 {
 			problems = append(problems, "ledger integrity check failed")
 		}
+	}
+	if verr == nil && (!in.OK() || rec.Rejected > 0) {
+		ledgerFail = &ledgerFailure{Corrupt: in.Corrupt, MACFailures: in.MACFailures, ChainBreaks: in.ChainBreaks, JournalRejected: rec.Rejected,
+			CheckpointSettled: in.CheckpointSettled, CheckpointFound: in.CheckpointFound}
 	}
 
 	// The audit chain and its anchors (spec §11), with the anchor key.
@@ -443,9 +473,20 @@ func (d *Daemon) afterUnlock(method string) error {
 		}
 	}
 
+	// The monitor's flag can be up to a poll old, either way: ask the source.
+	relockSetting := d.cfg.Presence.ScreenLock == "lock"
+	var screen bool
+	var screenErr error
+	if relockSetting {
+		screen, screenErr = d.presSrc.ScreenLocked()
+	}
 	now := d.clk.Now()
 	sid := newID("s_")
 	d.mu.Lock()
+	if relockSetting && screenErr == nil {
+		d.st.screenLocked = screen
+	}
+	relock := relockSetting && d.st.screenLocked
 	d.st.keys = keys
 	d.st.session = sid
 	d.st.requests = newRequestScope()
@@ -461,6 +502,7 @@ func (d *Daemon) afterUnlock(method string) error {
 	d.st.passDiff = passDiff
 	d.st.acceptedMethod = accMethod
 	d.st.vaultStateBad = vserr != nil
+	d.st.ledgerFail = ledgerFail
 	if d.st.heldTrip == nil && vserr == nil {
 		d.st.heldTrip = vs.Trip
 	}
@@ -480,7 +522,11 @@ func (d *Daemon) afterUnlock(method string) error {
 	}
 	d.ledger.ResetSession(budgetSessionScope(sid))
 	d.st.state = StateUnlocked
+	d.st.tripGen++
 	switch {
+	case relock:
+		// Not serving while the rest of this unlock runs; it ends Locked below.
+		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, "screen_lock", "the screen is locked"
 	case !d.st.integrityOK:
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripIntegrity, "ledger or state verification failed"
 	case d.st.auditBad:
@@ -499,7 +545,6 @@ func (d *Daemon) afterUnlock(method string) error {
 		d.enterAwayLocked(now, "idle")
 	}
 	state := d.st.state
-	relock := d.st.screenLocked && d.cfg.Presence.ScreenLock == "lock"
 	d.mu.Unlock()
 
 	// While a changed config is unaccepted, approvals use the accepted
@@ -613,7 +658,7 @@ func (d *Daemon) lockHeld(reason string) {
 	d.st.leaseUntil = time.Time{}
 	d.st.grant = nil
 	d.st.passGrants = nil
-	d.st.configChanges, d.st.configPending, d.st.auditBad = nil, nil, false
+	d.st.configChanges, d.st.configPending = nil, nil
 	d.st.passDiff = nil
 	d.applyLimitsLocked()
 	d.mu.Unlock()
@@ -634,6 +679,7 @@ func (d *Daemon) lockHeld(reason string) {
 	d.passes.SetMACKey(nil)
 	d.vault.Lock()
 	d.mu.Lock()
+	d.st.auditBad = false // after the save above, which must not take this log's head
 	d.st.keys.destroy()
 	d.st.keys = nil
 	d.mu.Unlock()
@@ -659,6 +705,7 @@ func (d *Daemon) trip(reason, detail string) {
 		d.st.state = StateTripped
 		d.st.tripReason, d.st.tripDetail = reason, detail
 		d.st.heldTrip = &heldTrip{Reason: reason, Detail: detail}
+		d.st.tripGen++
 		changed = true
 	}
 	d.mu.Unlock()
@@ -676,11 +723,11 @@ func (d *Daemon) trip(reason, detail string) {
 // chain starts) and a changed config (it becomes the accepted config).
 func (d *Daemon) resume(ctx context.Context) error {
 	d.mu.RLock()
-	state, reason, session := d.st.state, d.st.tripReason, d.st.session
+	state, reason, gen := d.st.state, d.st.tripReason, d.st.tripGen
 	changes := append([]string(nil), d.st.configChanges...)
 	passDiff, accMethod := d.st.passDiff, d.st.acceptedMethod
 	owner := ownerTrip(reason) || passDiff != nil || d.st.configPending != nil || !d.st.integrityOK || d.st.auditBad
-	vsBad := d.st.vaultStateBad
+	vsBad, ledgerFail := d.st.vaultStateBad, d.st.ledgerFail
 	d.mu.RUnlock()
 	if state != StateTripped {
 		return statusErr(409, client.CodeConflict, "not tripped")
@@ -689,30 +736,38 @@ func (d *Daemon) resume(ctx context.Context) error {
 	if vsBad {
 		det = "Daemon state unreadable, will be replaced; " + det
 	}
+	if s := ledgerFail.summary(); s != "" {
+		note = strings.TrimSuffix(s+"; "+note, "; ")
+	}
 	req := approval.Request{Kind: "resume", Title: "Resume keyleash", Detail: det, Note: note}
 	var dec approval.Decision
 	var err error
-	if owner {
+	switch {
+	case owner:
 		// Approved with the accepted config's method (never the console,
 		// and never a method a changed config.toml names).
 		dec, err = d.stepUpWith(ctx, d.approverFor(accMethod, true), req)
-	} else {
+	case d.cfg.Approval.Method == "deny":
+		// A trip needs a way out: "deny" refuses spending more, and this is the
+		// vault secret proving the owner is there.
+		dec, err = d.stepUpWith(ctx, d.approverFor("deny", true), req)
+	default:
 		dec, err = d.stepUp(ctx, req)
 	}
 	if err != nil {
 		return err
 	}
-	// The approval covers the trip it showed, in the session it was shown in:
-	// after a lock and unlock the trip may be a newer one, with another
-	// approver. From here on unlockMu keeps a lock out, so the derived keys
+	// The approval covers the trip it showed: since then a lock and unlock, or
+	// a resume and a new trip, may have put a newer one in its place, perhaps
+	// with another approver. From here on unlockMu keeps a lock out, so the derived keys
 	// used below cannot be wiped and then reinstalled.
 	d.unlockMu.Lock()
 	defer d.unlockMu.Unlock()
 	d.mu.RLock()
-	same := d.st.state == StateTripped && d.st.session == session
+	same := d.st.state == StateTripped && d.st.tripGen == gen
 	d.mu.RUnlock()
 	if !same {
-		return statusErr(409, client.CodeConflict, "keyleash locked during the approval, so it does not apply; check `keyleash status`")
+		return statusErr(409, client.CodeConflict, "the state changed during the approval, so it does not apply; check `keyleash status`")
 	}
 	if d.testResumeApproved != nil {
 		d.testResumeApproved()
@@ -768,6 +823,10 @@ func (d *Daemon) resume(ctx context.Context) error {
 			return statusErr(503, client.CodeInternal, "the ledger could not be accepted; check the data directory and retry")
 		}
 	}
+	if err := d.ledger.DropRejectedInFlight(); err != nil {
+		d.log.Error("ending the rejected in-flight lines failed", "err", err)
+		return statusErr(503, client.CodeInternal, "the in-flight journal could not be written; check the data directory and retry")
+	}
 	d.ledger.ResetTrip()
 	now := d.clk.Now()
 	d.mu.Lock()
@@ -781,7 +840,7 @@ func (d *Daemon) resume(ctx context.Context) error {
 	if pending != nil || vsBad {
 		d.st.acceptedMethod = d.cfg.Approval.Method
 	}
-	d.st.vaultStateBad = false
+	d.st.vaultStateBad, d.st.ledgerFail = false, nil
 	d.st.state, d.st.tripReason, d.st.tripDetail = StateUnlocked, "", ""
 	d.st.heldTrip, d.st.tripReset = nil, now
 	if d.st.idle || d.st.screenLocked {
@@ -794,6 +853,11 @@ func (d *Daemon) resume(ctx context.Context) error {
 	}
 	if ledgerArchived != "" {
 		f["ledger_archived"] = filepath.Join(LedgerDir, ledgerArchived)
+	}
+	if ledgerFail != nil {
+		f["ledger_dropped"], f["ledger_mac_failures"], f["ledger_chain_breaks"] = ledgerFail.Corrupt, ledgerFail.MACFailures, ledgerFail.ChainBreaks
+		f["ledger_recorded_micros"], f["ledger_found_micros"] = int64(ledgerFail.CheckpointSettled), int64(ledgerFail.CheckpointFound)
+		f["inflight_rejected"] = ledgerFail.JournalRejected
 	}
 	if pending != nil {
 		f["config_accepted"] = changes
@@ -1219,13 +1283,17 @@ func (d *Daemon) saveState() {
 	}
 	cp := d.ledger.Checkpoint()
 	trip, reset := d.st.heldTrip, d.st.tripReset
+	// A log that failed verification must not become the recorded one: only
+	// a resume accepts it, so the next unlock checks against the old head.
 	var head *audit.Head
-	d.withAudit(func(l *audit.Log) {
-		if l.Flush() == nil {
-			h := l.Head()
-			head = &h
-		}
-	})
+	if !d.st.auditBad {
+		d.withAudit(func(l *audit.Log) {
+			if l.Flush() == nil {
+				h := l.Head()
+				head = &h
+			}
+		})
+	}
 	if err := d.updateVaultState(func(s *vaultState) {
 		s.Checkpoint, s.Trip, s.TripReset = &cp, trip, reset
 		if head != nil {

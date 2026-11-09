@@ -258,8 +258,8 @@ Stop accepting proxy connections; wait up to `ShutdownGrace` (30 s) for
 in-flight requests; set the state to Locked (no new reservation can start);
 if it was unlocked, settle every reservation still in flight at
 its reserved amount (`ExpireInFlight(-1)`, while the ledger MAC key is set),
-flush the ledger, write the checkpoint to the vault and state.json, audit
-`lock` and anchor; then `ledger.Close`, `audit.Close`,
+flush the ledger, audit `lock` and anchor, write the checkpoint to the vault
+and state.json; then `ledger.Close`, `audit.Close`,
 `passes.SetMACKey(nil)`, `vault.Lock`; close the run jobs (members end with
 kill-on-close); remove the socket; release the instance lock. The admin
 server is shut down before all this, so `keyleash stop` waits for the

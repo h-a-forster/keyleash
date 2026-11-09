@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -66,7 +67,8 @@ type Ledger struct {
 	persistErr error
 	w          *writer
 	journal    *journal
-	tornAtOpen int // torn final lines cut by Open; read-only afterwards
+	orphans    []journalLine // holds of an earlier process, until RecoverInFlight
+	tornAtOpen int           // torn final lines cut by Open; read-only afterwards
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -84,6 +86,7 @@ type Reservation struct {
 	created time.Time    // set under l.mu when the reservation is taken
 	done    bool         // guarded by l.mu
 	touched atomic.Int64 // UnixNano of the request's last sign of life
+	hold    journalLine  // its journal line, kept for compaction
 }
 
 // ID is the reservation's record id (Meta.RequestID or a random id).
@@ -102,8 +105,8 @@ func (r *Reservation) Touch() { r.touched.Store(r.l.clock.Now().UnixNano()) }
 // VerifyIntegrity). A corrupt line is skipped: its amount is unknown, so the
 // caller must not spend until VerifyIntegrity has reported it. Open does not
 // verify the hash chain: call VerifyIntegrity once the MAC key is available.
-// Reservations a previous process left in flight (see journal.go) are in flight
-// again; they count towards limits until settled with ExpireInFlight.
+// Reservations a previous process left in flight (see journal.go) wait for
+// RecoverInFlight.
 func Open(opts Options) (*Ledger, error) {
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: ledger dir is required", ErrInvalid)
@@ -142,15 +145,7 @@ func Open(opts Options) (*Ledger, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, h := range holds {
-		r := &Reservation{l: l, id: h.ID, scopes: h.Scopes, amount: h.Amount, created: h.Created}
-		if h.Meta != nil {
-			r.meta = *h.Meta
-		}
-		r.touched.Store(h.Created.UnixNano())
-		l.active[r] = struct{}{}
-	}
-	l.journal = j
+	l.journal, l.orphans = j, holds
 	l.hist = hist
 	l.tornAtOpen = torn + torn2
 	l.w = newWriter(opts.Dir, head)
@@ -343,7 +338,11 @@ func (l *Ledger) ReserveWith(scopes []string, amount money.Micros, meta Meta, op
 		r.created = now
 		r.touched.Store(now.UnixNano())
 		// On disk before the request can leave (journal.go).
-		if err := l.journal.write(journalLine{ID: r.id, Scopes: r.scopes, Amount: amount, Meta: &r.meta, Created: now}); err != nil {
+		r.hold = journalLine{ID: r.id, Scopes: r.scopes, Amount: amount, Meta: &r.meta, Created: now.UTC()}
+		if len(l.w.macKey) > 0 {
+			r.hold.MAC = journalMAC(l.w.macKey, r.hold)
+		}
+		if err := l.journal.write(r.hold); err != nil {
 			return fmt.Errorf("%w: %v", ErrPersist, err)
 		}
 		l.active[r] = struct{}{}
@@ -575,9 +574,7 @@ func (l *Ledger) flushWLocked() error {
 	l.mu.Unlock()
 	if len(batch) == 0 && !l.w.unsynced {
 		l.mu.Lock()
-		if len(l.active) == 0 && len(l.w.pending) == 0 {
-			l.journal.compact()
-		}
+		l.compactJournalLocked()
 		l.mu.Unlock()
 		return nil
 	}
@@ -596,8 +593,22 @@ func (l *Ledger) flushWLocked() error {
 	l.mu.Lock()
 	l.persistErr = nil
 	l.journalDoneLocked(batch)
+	l.compactJournalLocked()
 	l.mu.Unlock()
 	return nil
+}
+
+// compactJournalLocked rewrites an oversized journal to the holds still open. A
+// charge waiting to be written needs its hold, so that waits for a later flush.
+func (l *Ledger) compactJournalLocked() {
+	if len(l.w.pending) > 0 || !l.journal.oversized() {
+		return
+	}
+	holds := slices.Clone(l.orphans)
+	for r := range l.active {
+		holds = append(holds, r.hold)
+	}
+	l.journal.rewrite(holds)
 }
 
 // journalDoneLocked ends the holds of records now on disk. A failed write only
@@ -651,6 +662,105 @@ func (l *Ledger) InFlight() []InFlightInfo {
 		return strings.Compare(a.ID, b.ID)
 	})
 	return out
+}
+
+// Recovered is what RecoverInFlight did.
+type Recovered struct {
+	Charged  int          // holds charged at their reserved amount
+	Amount   money.Micros // their total
+	Rejected int          // holds whose MAC did not verify: not charged, still in the journal
+}
+
+// RecoverInFlight deals with the holds an earlier process left in the journal.
+// One whose record is already in the ledger (the process died, or a flush failed,
+// after the record was written and before its done line) is ended: it is charged.
+// The others that authenticate under the MAC key are charged at their reserved
+// amount, marked estimated. One that does not is counted and charges nothing; it
+// stays until DropRejectedInFlight, so a caller treating it as tampering sees it
+// again until that is accepted. It needs the MAC key, and leaves every hold in
+// place if it cannot read the ledger.
+func (l *Ledger) RecoverInFlight() (Recovered, error) {
+	l.mu.Lock()
+	holds := l.orphans
+	key := slices.Clone(l.w.macKey)
+	l.mu.Unlock()
+	var rec Recovered
+	if len(holds) == 0 {
+		return rec, nil
+	}
+	if len(key) == 0 {
+		return rec, errors.New("budget: recovering in-flight reservations needs the MAC key")
+	}
+	seen, err := l.recordIDs()
+	if err != nil {
+		return rec, err
+	}
+	var first error
+	var rejected []journalLine
+	for _, h := range holds {
+		switch {
+		case !h.verified(key):
+			rec.Rejected++
+			rejected = append(rejected, h)
+			continue
+		case seen[h.ID]:
+		default:
+			r := &Reservation{l: l, id: h.ID, scopes: h.Scopes, amount: h.Amount, created: h.Created, hold: h}
+			if h.Meta != nil {
+				r.meta = *h.Meta
+			}
+			l.mu.Lock()
+			l.active[r] = struct{}{}
+			l.mu.Unlock()
+			if err := r.Settle(h.Amount, true); err != nil && first == nil {
+				first = err
+			}
+			rec.Charged++
+			rec.Amount = addSat(rec.Amount, h.Amount)
+			continue // its done line follows the record
+		}
+		l.mu.Lock()
+		_ = l.journal.write(journalLine{ID: h.ID, Done: true})
+		l.mu.Unlock()
+	}
+	l.mu.Lock()
+	l.orphans = rejected
+	l.mu.Unlock()
+	return rec, first
+}
+
+// DropRejectedInFlight ends the holds RecoverInFlight would not charge: the
+// owner has seen them and accepted that they charge nothing.
+func (l *Ledger) DropRejectedInFlight() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	done := make([]journalLine, 0, len(l.orphans))
+	for _, h := range l.orphans {
+		done = append(done, journalLine{ID: h.ID, Done: true})
+	}
+	l.orphans = nil
+	return l.journal.write(done...)
+}
+
+// recordIDs returns the ids of the records in the ledger files.
+func (l *Ledger) recordIDs() (map[string]bool, error) {
+	l.w.mu.Lock()
+	defer l.w.mu.Unlock()
+	names, err := ledgerFiles(l.dir)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, name := range names {
+		ents, _, err := readFile(filepath.Join(l.dir, name))
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range ents {
+			seen[e.rec.ID] = true
+		}
+	}
+	return seen, nil
 }
 
 // ExpireInFlight settles every reservation with no sign of life (Touch, or being

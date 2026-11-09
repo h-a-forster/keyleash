@@ -280,7 +280,11 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   (default) members are terminated when the daemon exits. With it off, members
   survive the daemon and are no longer confined once it restarts (their job
   died with it, and nothing identifies them); to keep such a tree from getting
-  a new pass by asking, every run pass then needs a step-up. Run passes left by
+  a new pass by asking, every run pass then needs a step-up. That closes only
+  this path: a surviving tree can still use what the admin guard leaves open to
+  unconfined callers, such as `POST /v1/shutdown`, and turning the setting back
+  on removes the step-up while survivors of the earlier setting may still run.
+  Run passes left by
   an earlier daemon are revoked at start (their jobs died with it). Other
   systems have no equivalent: once binding is implemented there it will use
   the parent chain only.
@@ -463,12 +467,17 @@ worst case until they settle.
   can leave, and marked done when released or once their charge is durable. On
   shutdown, requests still in flight after the grace period are charged at
   their reserved amount before the ledger and checkpoint are written. A daemon
-  that dies leaves them in the journal: they count towards limits again at the
-  next start and are charged at their reserved amount at the next unlock
-  (audit `inflight_recovered`), and so are records settled in the last second
-  that had not reached the disk. The journal is written without an fsync, so
-  it survives a killed process but not a power cut, and it is not
-  authenticated: removing it loses only what is in flight.
+  that dies leaves them in the journal: they are charged at their reserved
+  amount at the next unlock (audit `inflight_recovered`, with the count, total
+  and lines rejected), once, and so are records settled in the last second that
+  had not reached the disk; a hold whose record is already in the ledger is not
+  charged again. Holds carry a MAC under the ledger key: a line that fails it
+  charges nothing and trips (integrity) until the owner resumes. The journal is
+  written without an fsync, so it survives a killed process but not a power
+  cut. Removing it, or adding a done line, loses only the charges of what was
+  in flight; removing a done line can charge a released reservation at the
+  amount the daemon reserved. It is rewritten to the open holds when it passes
+  1 MiB, whatever is in flight.
 - A reservation is settled at its reserved amount after 30 minutes without a
   sign of life from its request (a client that stopped reading); a stream that
   keeps delivering keeps its reservation and concurrency slot however long it
@@ -503,8 +512,9 @@ accepted one.
 
 - **Locked**: DEK wiped. All proxied requests get `423 Locked` with a clear
   JSON error. Entering Locked also ends every request authenticated before it:
-  one waiting for its body, an approval or upstream's answer gets the 423, and
-  a running stream is cancelled upstream and its client connection aborted, so
+  one waiting for an approval or upstream's answer gets the 423 at once, one
+  waiting for its body when the body arrives or the read times out (2 minutes),
+  and a running stream is cancelled upstream and its client connection aborted, so
   a truncated body cannot pass as complete. It is charged its reserved amount;
   the provider may still bill for work it had started. Admin API works (status,
   unlock).
@@ -698,8 +708,9 @@ table, so the audit log answers "which program spent this".
 - The daemon-state entry records the log's newest durable record (sequence
   number and hash) on every save: on lock, on shutdown and at least every 5
   minutes. The log must still contain that record, so deleting the log or
-  cutting it back trips the next unlock. Records after the last save can still
-  be cut unnoticed if the daemon dies before saving again.
+  cutting it back trips every unlock until the owner resumes: a log that failed
+  this check never becomes the recorded one. Records after the last save can
+  still be cut unnoticed if the daemon dies before saving again.
 - After every unlock the daemon verifies the chain **and** the anchors with
   the anchor key; a failure trips the daemon (`audit_integrity`) until the
   owner resumes (§8).

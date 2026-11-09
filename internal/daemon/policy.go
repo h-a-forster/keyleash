@@ -218,6 +218,9 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 		d.auditRequest(a, nil, proxy.Outcome{Status: dn.Status}, 0, false, dn.Reason)
 		return nil, dn
 	}
+	if dn := proxy.StopDenial(a.Principal.Stop); dn != nil {
+		return deny(dn) // ended while the body arrived: on the record like any refusal
+	}
 	// The pass was checked at Authenticate, before the body arrived (minutes
 	// ago, for a slow client), and again after any approval wait below.
 	p, dn := d.livePass(a)
@@ -295,6 +298,9 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 			d.auditEvent("approval", map[string]any{"kind": "unknown_model", "approved": err == nil && dec.Approved,
 				"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "unbounded": unbounded})
 			if dn := approvalDenial(ctx, dec, err); dn != nil {
+				if sd := proxy.StopDenial(a.Principal.Stop); sd != nil {
+					return deny(sd)
+				}
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
@@ -353,6 +359,9 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 					"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "scope": ex.Scope,
 					"window": string(ex.Window), "id": dec.ID})
 				if adn := approvalDenial(ctx, dec, aerr); adn != nil {
+					if sd := proxy.StopDenial(a.Principal.Stop); sd != nil {
+						return deny(sd)
+					}
 					if ctx.Err() != nil {
 						return nil, ctx.Err()
 					}

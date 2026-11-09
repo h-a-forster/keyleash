@@ -39,8 +39,8 @@ func (s *Server) logf(format string, args ...any) { s.cfg.ErrorLog.Printf(format
 
 func deny(status int, reason string) *Denial { return &Denial{Status: status, Reason: reason} }
 
-// stopDenial returns the refusal for a request whose Stop has ended, else nil.
-func stopDenial(stop context.Context) *Denial {
+// StopDenial returns the refusal for a request whose Stop has ended, else nil.
+func StopDenial(stop context.Context) *Denial {
 	if stop == nil || stop.Err() == nil {
 		return nil
 	}
@@ -148,10 +148,6 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 9. Admission (may block for approval, which Stop also ends).
-	if d := stopDenial(principal.Stop); d != nil {
-		writeError(w, p, d)
-		return
-	}
 	admitCtx, endAdmit := context.WithCancel(r.Context())
 	defer endAdmit()
 	if principal.Stop != nil {
@@ -166,10 +162,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if r.Context().Err() != nil {
 				return // client went away while waiting
 			}
-			if d = stopDenial(principal.Stop); d == nil {
-				s.logf("keyleash proxy %s: gate error (%T)", reqID, err)
-				d = deny(http.StatusInternalServerError, ReasonInternal)
-			}
+			s.logf("keyleash proxy %s: gate error (%T)", reqID, err)
+			d = deny(http.StatusInternalServerError, ReasonInternal)
 		}
 		writeError(w, p, d)
 		return
@@ -268,7 +262,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 		writeError(w, p, deny(http.StatusInternalServerError, ReasonInternal))
 		return
 	}
-	if d := stopDenial(principal.Stop); d != nil {
+	if d := StopDenial(principal.Stop); d != nil {
 		out.Status = d.status()
 		writeError(w, p, d)
 		return
@@ -342,7 +336,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 		}
 		if fe := wd.err(); errors.Is(fe, ErrStopped) {
 			out.UpstreamErr = fe
-			d := stopDenial(principal.Stop)
+			d := StopDenial(principal.Stop)
 			out.Status = d.status()
 			writeError(w, p, d)
 			return
@@ -398,7 +392,14 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 			}
 		}
 		if rerr == io.EOF {
-			complete = true
+			// Cancelling can look like a clean end (TLS close_notify, or an
+			// upstream that finishes when its client goes): we ended this
+			// body, so it is not complete, and the client must not think so.
+			if fe := wd.err(); fe != nil {
+				out.UpstreamErr = fe
+			} else {
+				complete = true
+			}
 			break
 		}
 		if rerr != nil {

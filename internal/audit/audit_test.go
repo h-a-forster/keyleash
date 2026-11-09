@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -211,10 +212,18 @@ func TestForgedChainCaughtByAnchors(t *testing.T) {
 	path := filepath.Join(dir, "audit-2026-10.jsonl")
 	ls := readLines(t, path)
 	prev := ""
+	var head Head
 	for i, line := range ls {
 		m, _, err := parseLine([]byte(strings.TrimSuffix(line, "\n")))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if i == len(ls)-1 {
+			seq, err := strconv.ParseUint(m["seq"].(json.Number).String(), 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			head = Head{Seq: seq, Hash: m["hash"].(string)}
 		}
 		if i == 1 {
 			m["cost_micros"] = json.Number("1")
@@ -233,6 +242,10 @@ func TestForgedChainCaughtByAnchors(t *testing.T) {
 	writeLines(t, path, ls)
 	if _, err := Verify(dir, nil); err != nil {
 		t.Fatalf("forged chain should pass without key: %v", err)
+	}
+	// A chain rebuilt to the same length differs from the recorded head.
+	if rep, err := Verify(dir, nil, VerifyOptions{Head: &head}); !errors.Is(err, ErrTampered) {
+		t.Fatalf("recorded head not compared: %+v %v", rep, err)
 	}
 	rep, err := Verify(dir, anchorKey)
 	if !errors.Is(err, ErrTampered) || !strings.Contains(rep.FirstBad.Reason, "anchor") {

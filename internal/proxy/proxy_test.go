@@ -49,14 +49,17 @@ func allSecrets() []string {
 
 // ---- fakes ----
 
-type fakeAuth struct{ calls atomic.Int64 }
+type fakeAuth struct {
+	calls atomic.Int64
+	stop  context.Context
+}
 
 func (a *fakeAuth) Authenticate(_ context.Context, prov, token string, _ ClientInfo) (Principal, error) {
 	a.calls.Add(1)
 	if token != passTok {
 		return Principal{}, &Denial{Status: 401, Reason: ReasonPassInvalid}
 	}
-	return Principal{PassID: "p1", PassName: "test", EntryID: "e-" + prov}, nil
+	return Principal{PassID: "p1", PassName: "test", EntryID: "e-" + prov, Stop: a.stop}, nil
 }
 
 type fakeTicket struct {
@@ -96,12 +99,16 @@ type fakeGate struct {
 	deny    error
 	tickets []*fakeTicket
 	adms    []Admission
+	onAdmit func()
 }
 
 func (g *fakeGate) Admit(_ context.Context, a Admission) (Ticket, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.adms = append(g.adms, a)
+	if g.onAdmit != nil {
+		g.onAdmit()
+	}
 	if g.deny != nil {
 		return nil, g.deny
 	}
@@ -126,9 +133,13 @@ func (g *fakeGate) admitted() int {
 	return len(g.adms)
 }
 
-type fakeKeys struct{ err error }
+type fakeKeys struct {
+	err   error
+	calls atomic.Int64
+}
 
 func (k *fakeKeys) WithKey(entryID string, fn func([]byte) error) error {
+	k.calls.Add(1)
 	if k.err != nil {
 		return k.err
 	}
@@ -785,6 +796,80 @@ func TestClientAbortFinishesOnce(t *testing.T) {
 	case <-upDone:
 	case <-time.After(3 * time.Second):
 		t.Error("upstream request not cancelled after client abort")
+	}
+}
+
+// eofOnCancel is an upstream body that ends cleanly when its request is
+// cancelled, as a TLS close_notify or an obliging server can.
+type eofOnCancel struct {
+	ctx  context.Context
+	sent bool
+}
+
+func (b *eofOnCancel) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, "data: {}\n\n"), nil
+	}
+	<-b.ctx.Done()
+	return 0, io.EOF
+}
+
+func (b *eofOnCancel) Close() error { return nil }
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A stop that looks like a clean end of the upstream body is still a stop: the
+// client must not take the cut stream for a whole one.
+func TestStopEndingInEOFIsNotComplete(t *testing.T) {
+	e := newEnv(t, nil, func(c *Config) {
+		c.Transport = rtFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}},
+				Body: &eofOnCancel{ctx: r.Context()}, Request: r}, nil
+		})
+	})
+	stop, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.auth.stop = stop
+	req := e.newReq("POST", "/anthropic/v1/messages", `{"model":"m","stream":true}`)
+	req.Header.Set("x-api-key", passTok)
+	resp, err := e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadFull(resp.Body, make([]byte, 10)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Error("the client saw a clean end of a stopped stream")
+	}
+	if out := e.gate.ticket(t).wait(t); out.UpstreamErr == nil {
+		t.Errorf("outcome %+v", out)
+	}
+}
+
+// A stop that lands during admission ends the request before it can fetch a key.
+func TestStopDuringAdmissionNeverForwards(t *testing.T) {
+	e := newEnv(t, nil, nil)
+	stop, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.auth.stop = stop
+	e.gate.onAdmit = cancel
+	req := e.newReq("POST", "/anthropic/v1/messages", `{"model":"m"}`)
+	req.Header.Set("x-api-key", passTok)
+	resp, _ := e.do(req)
+	if resp.StatusCode != http.StatusLocked {
+		t.Errorf("status %d", resp.StatusCode)
+	}
+	if n := e.keys.calls.Load(); n != 0 {
+		t.Errorf("the key was fetched %d times", n)
+	}
+	if reqs := e.upstreamReqs(); len(reqs) != 0 {
+		t.Errorf("forwarded %d requests", len(reqs))
 	}
 }
 

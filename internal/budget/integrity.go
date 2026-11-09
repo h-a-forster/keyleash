@@ -82,6 +82,9 @@ type Integrity struct {
 	// ledger itself last wrote, is no longer a prefix of the files (records
 	// were truncated, deleted or rewritten).
 	CheckpointMismatch bool
+	// CheckpointSettled is the stored checkpoint's total, CheckpointFound the
+	// same records' total in the files as they are now.
+	CheckpointSettled, CheckpointFound money.Micros
 	// Problems describes the first few failures.
 	Problems []string
 }
@@ -245,6 +248,12 @@ func (l *Ledger) VerifyIntegrity(key []byte, opts ...VerifyOptions) (Integrity, 
 	for _, o := range opts {
 		if o.Checkpoint != nil {
 			checkCP(*o.Checkpoint, "stored checkpoint")
+			in.CheckpointSettled = o.Checkpoint.Settled
+			if mf := files[o.Checkpoint.Month]; mf != nil {
+				for _, a := range mf.amounts[:min(o.Checkpoint.Records, uint64(len(mf.amounts)))] {
+					in.CheckpointFound = addSat(in.CheckpointFound, a)
+				}
+			}
 		}
 	}
 	slices.Sort(in.MissingMonths)
@@ -332,7 +341,7 @@ func (l *Ledger) AcceptCurrent(archive string) error {
 func writeSynced(p string, data []byte) error {
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("budget: accept ledger: %w", err)
+		return fmt.Errorf("budget: write %s: %w", filepath.Base(p), err)
 	}
 	_, err = f.Write(data)
 	if err == nil {
@@ -342,7 +351,7 @@ func writeSynced(p string, data []byte) error {
 		err = cerr
 	}
 	if err != nil {
-		return fmt.Errorf("budget: accept ledger: %w", err)
+		return fmt.Errorf("budget: write %s: %w", filepath.Base(p), err)
 	}
 	return nil
 }

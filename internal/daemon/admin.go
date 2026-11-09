@@ -175,6 +175,12 @@ func (d *Daemon) status() client.Status {
 	if s.Integrity == "failed" && d.vaultStateSnapshot() == nil {
 		s.Warnings = append(s.Warnings, "the daemon state in the vault cannot be read; `keyleash resume` replaces it, accepts the current config and forgets `keyleash keys use` choices")
 	}
+	d.mu.RLock()
+	ledgerFail := d.st.ledgerFail
+	d.mu.RUnlock()
+	if w := ledgerFail.summary(); w != "" {
+		s.Warnings = append(s.Warnings, "the ledger check failed ("+w+"); `keyleash resume` accepts the ledger as it stands, a copy stays in ledger/rejected-<time>/")
+	}
 	if s.Vault.RecoveredFromPrev {
 		s.Warnings = append(s.Warnings, "the vault was recovered from vault.prev after the main file was missing or corrupt")
 	}
