@@ -1,4 +1,4 @@
-# keyleash v0.1.1 (unreleased)
+# keyleash v0.1.1
 
 Fixes from a state-machine audit of v0.1.0.
 

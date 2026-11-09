@@ -5,6 +5,10 @@ All notable changes are listed here. The format follows
 
 ## Unreleased
 
+## v0.1.1 - 2026-11-09
+
+Fixes from a state-machine audit of v0.1.0: [release notes](docs/release-notes-v0.1.1.md).
+
 ## v0.1.0 - 2026-10-30
 
 First release. Pre-alpha: unaudited; use keys you can rotate.

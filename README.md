@@ -33,7 +33,7 @@ Ledger.
 ## Quick start
 
 ```sh
-go install github.com/h-a-forster/keyleash/cmd/keyleash@latest  # no release tagged yet: newest master commit
+go install github.com/h-a-forster/keyleash/cmd/keyleash@latest
 keyleash init                 # vault + recovery code (Windows Hello or a passphrase)
 keyleash daemon --background  # start the daemon, then:
 keyleash unlock

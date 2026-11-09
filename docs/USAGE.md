@@ -25,9 +25,8 @@ keyleash is a single Go binary (Go 1.27.3 or later, no cgo):
 go install github.com/h-a-forster/keyleash/cmd/keyleash@latest
 ```
 
-No release is tagged yet, so `@latest` installs the newest commit on `master`
-as an untagged pre-release (`v0.0.0-<date>-<commit>`); use `@<commit>` to pin
-one. Or from a checkout, with the version embedded:
+`@latest` installs the newest release; use `@v0.1.1` to pin one. Or from a
+checkout, with the version embedded:
 
 ```sh
 go build -ldflags "-X main.version=$(git describe --tags --always)" -o keyleash ./cmd/keyleash
