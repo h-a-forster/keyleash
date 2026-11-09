@@ -178,8 +178,9 @@ that its processes cannot leave: a process the agent starts stays confined
 (and can use the run pass) even if its parent exits or it detaches, and it
 stays confined after the run ends until it exits. When the daemon exits,
 the run's processes are ended too (`[run] kill_on_daemon_exit = true`; set
-it to `false` to let them keep running without keyleash). Restarting the
-daemon ends earlier `keyleash run` passes. On Linux, macOS and the BSDs
+it to `false` to let them keep running without keyleash: they are then
+unconfined once the daemon restarts, so with that setting every `keyleash run`
+asks for a step-up). Restarting the daemon ends earlier `keyleash run` passes. On Linux, macOS and the BSDs
 keyleash cannot identify processes yet: passes there are not bound to a
 process, `keyleash run` passes cannot be created, and no caller is treated
 as confined.

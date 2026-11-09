@@ -21,6 +21,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
+	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/proxy"
 )
 
@@ -844,5 +845,27 @@ func TestLockWaitsForResumeToFinish(t *testing.T) {
 	e.d.withAudit(func(l *audit.Log) { aerr = l.Anchor() })
 	if s := e.status(); s.State != client.StateLocked || !errors.Is(aerr, audit.ErrNoAnchorKey) {
 		t.Fatalf("state %s, anchor: %v", s.State, aerr)
+	}
+}
+
+// D12: with kill_on_daemon_exit off, a run tree can outlive the daemon and is
+// unconfined after a restart, so a self-bound run pass always needs a step-up.
+func TestRunPassStepUpWhenTreesCanOutliveTheDaemon(t *testing.T) {
+	for _, tc := range []struct {
+		kill   bool
+		stepUp bool
+	}{{true, false}, {false, true}} {
+		e := newEnv(t, func(c *config.Config) { c.Run.KillOnDaemonExit = tc.kill })
+		e.unlock()
+		e.addKeys()
+		e.appr.strictSetup.Store(true)
+		_, err := e.c.CreatePass(e.ctx(), client.PassCreateRequest{Name: "agent", Kind: pass.KindRun,
+			Providers: []string{"anthropic"}, BindPID: outsiderPID})
+		if tc.stepUp && !isAPI(err, 403, client.CodeStepUpDenied) {
+			t.Fatalf("kill_on_daemon_exit=%v: %v, want a step-up", tc.kill, err)
+		}
+		if !tc.stepUp && err != nil {
+			t.Fatalf("kill_on_daemon_exit=%v: %v", tc.kill, err)
+		}
 	}
 }

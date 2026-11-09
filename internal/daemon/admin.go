@@ -564,7 +564,10 @@ func (d *Daemon) passFromRequest(req client.PassCreateRequest) (pass.Pass, error
 // have a key ("*" only when every provider has one), with a TTL within
 // limits.pass.run_ttl, every spend limit within limits.pass.max_run_budget
 // (and a month limit, added at that amount if missing), and concurrency
-// within limits.pass.concurrency. Otherwise it says why a step-up is needed.
+// within limits.pass.concurrency. With run.kill_on_daemon_exit off there is no
+// such exemption: a run tree that outlived a daemon is unconfined in the next
+// one, and must not get a new pass and budget by asking. Otherwise it says why
+// a step-up is needed.
 func (d *Daemon) passNeedsStepUp(p *pass.Pass, req client.PassCreateRequest, callerPID int) string {
 	pd := d.cfg.Limits.Pass
 	switch {
@@ -572,6 +575,8 @@ func (d *Daemon) passNeedsStepUp(p *pass.Pass, req client.PassCreateRequest, cal
 		return "it is a named pass"
 	case p.Bind == nil || p.Bind.PID != callerPID:
 		return "it is bound to a process other than the caller"
+	case !d.cfg.Run.KillOnDaemonExit:
+		return "run.kill_on_daemon_exit is off"
 	case pd.MaxRunBudget == nil:
 		return "limits.pass.max_run_budget is not set"
 	case p.Expires.Sub(d.clk.Now()) > pd.RunTTL.Duration:

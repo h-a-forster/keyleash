@@ -274,7 +274,10 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   process's tree). If the process cannot be placed in a job the pass is not
   issued. Jobs are kept while any member lives, even after the pass ends
   (members stay confined, §12), and with `[run] kill_on_daemon_exit = true`
-  (default) members are terminated when the daemon exits. Run passes left by
+  (default) members are terminated when the daemon exits. With it off, members
+  survive the daemon and are no longer confined once it restarts (their job
+  died with it, and nothing identifies them); to keep such a tree from getting
+  a new pass by asking, every run pass then needs a step-up. Run passes left by
   an earlier daemon are revoked at start (their jobs died with it). Other
   systems have no equivalent: once binding is implemented there it will use
   the parent chain only.
@@ -307,7 +310,8 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   and a pass whose mapped key was removed is refused (`no_key`) rather than
   redirected. A provider without a key at issue time resolves to its active
   key at request time.
-- **Creation needs a step-up** (§9), with one exception: a `run` pass bound to
+- **Creation needs a step-up** (§9), with one exception (none with
+  `kill_on_daemon_exit = false`, see above): a `run` pass bound to
   the calling process itself (the admin channel's verified client PID, §12)
   that stays within the defaults — providers that all have a key (`*` only
   when every provider has one), lifetime ≤ `limits.pass.run_ttl`, every spend
