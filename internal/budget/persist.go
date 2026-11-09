@@ -124,6 +124,7 @@ func macBody(ln []byte, mac string) ([]byte, bool) {
 }
 
 type line struct {
+	id     string // the reservation's id
 	file   string
 	data   []byte // complete line including the trailing newline
 	amount money.Micros
@@ -168,7 +169,7 @@ func (w *writer) enqueue(rec record, local time.Time) error {
 	}
 	h := lineHash(data)
 	w.head = h
-	w.pending = append(w.pending, line{file: fileName(local), data: append(data, '\n'), amount: rec.Amount, hash: h})
+	w.pending = append(w.pending, line{id: rec.ID, file: fileName(local), data: append(data, '\n'), amount: rec.Amount, hash: h})
 	return nil
 }
 

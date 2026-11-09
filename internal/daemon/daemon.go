@@ -68,9 +68,10 @@ var ShutdownGrace = 30 * time.Second
 
 // Tunables of the daemon's background work.
 const (
-	// InFlightMaxAge is how old a reservation may get before it is settled
-	// at its reserved amount (fail closed). It exceeds the proxy's response
-	// header timeout plus its stream idle timeout.
+	// InFlightMaxAge is how long a reservation may go without a sign of life
+	// from its request before it is settled at its reserved amount (fail
+	// closed). It exceeds the proxy's response header and stream idle timeouts,
+	// so it only catches a request stuck on a client that stopped reading.
 	InFlightMaxAge = 30 * time.Minute
 	// StateSaveEvery is how often the ledger checkpoint (vault) and state.json are saved while
 	// unlocked (it is also saved on lock and shutdown).

@@ -184,7 +184,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var finishOnce sync.Once
 	defer finishOnce.Do(func() { ticket.Finish(out) })
 
-	s.forward(w, r, reqID, p, ep, principal, path, fwdQuery, outBody, info.Stream, &out)
+	s.forward(w, r, reqID, p, ep, principal, path, fwdQuery, outBody, info.Stream, ticket, &out)
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
@@ -259,7 +259,7 @@ func (w *watchdog) err() error {
 // forward sends the request upstream with the real key and relays the
 // response, filling out. out is read by the deferred Finish.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p *provider.Provider,
-	ep provider.Endpoint, principal Principal, path, fwdQuery string, body []byte, stream bool, out *Outcome) {
+	ep provider.Endpoint, principal Principal, path, fwdQuery string, body []byte, stream bool, ticket Ticket, out *Outcome) {
 
 	base := s.cfg.Upstream(p)
 	if base == nil || base.Host == "" || (base.Scheme != "https" && base.Scheme != "http") {
@@ -376,12 +376,16 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 		_ = rc.Flush()
 	}
 
+	at, _ := ticket.(activeTicket)
 	buf := make([]byte, 32<<10)
 	complete := false
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			wd.rearm(s.cfg.StreamIdleTimeout, ErrStreamIdleTimeout)
+			if at != nil {
+				at.Active()
+			}
 			parser.Write(buf[:n])
 			wn, werr := w.Write(buf[:n])
 			out.BytesOut += int64(wn)

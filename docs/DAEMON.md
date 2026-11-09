@@ -12,7 +12,7 @@ specified in [SPEC.md](SPEC.md).
   config.toml               optional; missing = recommended profile
   vault.json, vault.prev    vault + crash-recovery copy (+ anti-rollback sidecar)
   passes.json               pass store (hashes only)
-  ledger/                   budget ledger (ledger-YYYY-MM.jsonl)
+  ledger/                   budget ledger (ledger-YYYY-MM.jsonl), in-flight journal (inflight.jsonl)
   audit/                    audit log (audit-YYYY-MM.jsonl)
   state.json                non-security bookkeeping (models seen without a
                             price), MAC'd with a vault-derived key; deleting
@@ -139,7 +139,8 @@ limits, and `away_max` is extended to `until`.
    - `ErrTripped` → state Tripped, 423 `tripped`.
    - `ErrPersist`/`ErrClosed` → 503 `internal`.
 6. Ticket.Finish(outcome):
-   - `!Sent` → `Release()`.
+   - `!Sent` → `Release()`; if a lock had already charged it, the audit record
+     shows that charge (`estimated = true`).
    - else, when `UsageOK`: priced model → `meter.Cost`; unpriced model →
      `meter.WorstCaseCost` (maximum rates, `estimated = true`); otherwise the
      reserved amount, `estimated = true`.

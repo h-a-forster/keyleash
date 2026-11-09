@@ -18,10 +18,12 @@ import (
 
 	"github.com/h-a-forster/keyleash/internal/approval"
 	"github.com/h-a-forster/keyleash/internal/audit"
+	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
 	"github.com/h-a-forster/keyleash/internal/pass"
+	"github.com/h-a-forster/keyleash/internal/provider"
 	"github.com/h-a-forster/keyleash/internal/proxy"
 )
 
@@ -1029,4 +1031,100 @@ func TestUnlockUnderLockedScreenStaysLocked(t *testing.T) {
 	e.pres.set(0, false)
 	e.d.stepPresence()
 	e.unlock()
+}
+
+// D8: a reservation left by a daemon that died is charged at the next unlock
+// (the unlock is the first moment a record can be authenticated).
+func TestInFlightOfDeadDaemonChargedAtUnlock(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.stop()
+	l, err := budget.Open(budget.Options{Dir: filepath.Join(e.dir, LedgerDir), Clock: e.clk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Reserve(nil, 777, budget.Meta{RequestID: "req_dead", Model: "claude-sonnet-4-5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	e.unlock() // fatals unless Unlocked: the charge verifies
+	if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled != 777 {
+		t.Fatalf("settled %d, want 777", settled)
+	}
+	e.restart()
+	e.unlock()
+	if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled != 777 {
+		t.Fatalf("after a restart: settled %d, want 777", settled)
+	}
+}
+
+// D9: a stream that keeps delivering past InFlightMaxAge keeps its reservation
+// and concurrency slot and is charged what it cost.
+func TestLongStreamKeepsItsReservation(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	resp := e.stream(t, tok, 2)
+	defer resp.Body.Close()
+	buf := make([]byte, 1<<16)
+	waitChunk := func() {
+		t.Helper()
+		select {
+		case <-e.up.held:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no chunk from upstream")
+		}
+		if _, err := resp.Body.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitChunk()
+	e.clk.Advance(InFlightMaxAge * 2 / 3)
+	e.up.step <- struct{}{}
+	waitChunk()
+	e.clk.Advance(InFlightMaxAge * 2 / 3)
+	e.d.housekeep()
+	if s := e.status(); len(s.InFlight) != 1 {
+		t.Fatalf("in flight %d: the running stream's reservation was settled", len(s.InFlight))
+	}
+	e.up.step <- struct{}{}
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("rest of the stream (%d bytes): %v", len(rest), err)
+	}
+	want := e.expectedCost("anthropic", "/v1/messages", anthropicStreamReq, anthropicSSE)
+	for range 200 {
+		if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay)
+	t.Fatalf("settled %d, want the metered %d", settled, want)
+}
+
+// D10: a request the lock already charged and that then never left records that
+// charge in its audit record, not cost 0.
+func TestAuditAgreesWithLockChargeOnUnsentRequest(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	res, err := e.d.ledger.Reserve(nil, 500, budget.Meta{RequestID: "req_unsent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.d.ledger.ExpireInFlight(-1); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := provider.Get("anthropic")
+	tk := &ticket{d: e.d, a: proxy.Admission{RequestID: "req_unsent", Provider: p}, res: res}
+	tk.Finish(proxy.Outcome{Status: 423})
+	if !auditHas(t, e, "request", func(f map[string]any) bool {
+		return f["request_id"] == "req_unsent" && f["cost_micros"] == float64(500) && f["estimated"] == true
+	}) {
+		t.Fatal("the audit record does not show the 500 the ledger charged")
+	}
 }

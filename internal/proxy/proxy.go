@@ -118,6 +118,12 @@ type Ticket interface {
 	Finish(o Outcome)
 }
 
+// activeTicket is optionally implemented by tickets that want to know the
+// response is still arriving: Active is called for each chunk from upstream.
+type activeTicket interface {
+	Active()
+}
+
 // Gate admits or refuses a request (budget, policy, approval). Admit may
 // block, e.g. waiting for step-up approval. Policy refusals are *Denial.
 type Gate interface {

@@ -715,11 +715,9 @@ func stress(t *testing.T, maxConc int64) {
 func TestPersistFailureFailsClosed(t *testing.T) {
 	l, _, dir := newTest(t)
 	settle(t, reserve(t, l, nil, 1, Meta{}), 1)
-	// Make the ledger directory unwritable by replacing it with a file.
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dir, []byte("x"), 0o600); err != nil {
+	// Make the month's file unwritable by putting a directory in its place.
+	month := filepath.Join(dir, "ledger-2026-06.jsonl")
+	if err := os.Mkdir(month, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Flush(); err == nil {
@@ -728,10 +726,9 @@ func TestPersistFailureFailsClosed(t *testing.T) {
 	if _, err := l.Reserve(nil, 1, Meta{}); !errors.Is(err, ErrPersist) {
 		t.Fatalf("want ErrPersist, got %v", err)
 	}
-	// Recovery: once the directory is back, the next flush writes the
+	// Recovery: once the file can be written, the next flush writes the
 	// held-back record and reservations resume.
-	_ = os.Remove(dir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.Remove(month); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Flush(); err != nil {
@@ -808,4 +805,103 @@ func TestReserveWithSkipAdmitsOnlyThatReservation(t *testing.T) {
 		t.Fatalf("concurrency with skip: %v", err)
 	}
 	r1.Release()
+}
+
+func copyDir(t *testing.T, from string) string {
+	t.Helper()
+	to := t.TempDir()
+	ents, err := os.ReadDir(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		b, err := os.ReadFile(filepath.Join(from, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(to, e.Name()), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return to
+}
+
+// A process that dies with requests in flight, or with a settled record not yet
+// written, loses no spend: the next process holds the reservation until it is
+// charged, once. A released one or a durable record is not charged again.
+func TestInFlightSurvivesCrash(t *testing.T) {
+	clk := &fakeClock{t: time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)}
+	dir := t.TempDir()
+	l, err := Open(Options{Dir: dir, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	reserve(t, l, nil, 100, Meta{RequestID: "inflight"})
+	settle(t, reserve(t, l, nil, 20, Meta{RequestID: "unwritten"}), 3)
+	reserve(t, l, nil, 7000, Meta{RequestID: "released"}).Release()
+	flushed := reserve(t, l, nil, 400, Meta{RequestID: "durable"})
+	// The "unwritten" record reaches the disk only if flushed; copy before and after.
+	crashed := copyDir(t, dir)
+	settle(t, flushed, 40)
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	flushedDir := copyDir(t, dir)
+
+	reopen := func(d string) *Ledger {
+		t.Helper()
+		l2, err := Open(Options{Dir: d, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l2.Close() })
+		return l2
+	}
+	l2 := reopen(crashed)
+	if n := len(l2.InFlight()); n != 3 {
+		t.Fatalf("in flight after the crash: %d, want 3 (inflight, unwritten, durable)", n)
+	}
+	if n, err := l2.ExpireInFlight(-1); n != 3 || err != nil {
+		t.Fatalf("expire: %d %v", n, err)
+	}
+	checkSpent(t, l2, "global", WindowDay, 100+20+400, 0)
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Charged once: the next process finds nothing to charge.
+	l3 := reopen(crashed)
+	if n := len(l3.InFlight()); n != 0 {
+		t.Fatalf("in flight after the charge: %d", n)
+	}
+	checkSpent(t, l3, "global", WindowDay, 100+20+400, 0)
+
+	l4 := reopen(flushedDir)
+	if n := len(l4.InFlight()); n != 1 || l4.InFlight()[0].ID != "inflight" {
+		t.Fatalf("in flight after a flush: %+v", l4.InFlight())
+	}
+	checkSpent(t, l4, "global", WindowDay, 3+40, 100)
+}
+
+// ExpireInFlight measures from the request's last sign of life, so a stream
+// that keeps delivering keeps its reservation; a lock's -1 takes everything,
+// even when the clock has stepped back.
+func TestExpireMeasuresFromLastActivity(t *testing.T) {
+	l, clk, _ := newTest(t)
+	r := reserve(t, l, nil, 10, Meta{})
+	clk.Add(20 * time.Minute)
+	r.Touch()
+	clk.Add(20 * time.Minute)
+	if n, err := l.ExpireInFlight(30 * time.Minute); n != 0 || err != nil {
+		t.Fatalf("a live request expired: %d %v", n, err)
+	}
+	clk.Add(11 * time.Minute)
+	if n, err := l.ExpireInFlight(30 * time.Minute); n != 1 || err != nil {
+		t.Fatalf("a silent request did not expire: %d %v", n, err)
+	}
+	reserve(t, l, nil, 10, Meta{})
+	clk.Add(-time.Hour)
+	if n, err := l.ExpireInFlight(-1); n != 1 || err != nil {
+		t.Fatalf("lock after a clock step left a reservation: %d %v", n, err)
+	}
 }

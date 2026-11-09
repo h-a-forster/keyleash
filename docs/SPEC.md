@@ -449,9 +449,20 @@ worst case until they settle.
   the pass store baseline (§6) and whether the vault ever held an `api_key`
   (§9). `state.json` holds only non-security bookkeeping (models seen without
   a price); deleting it changes nothing.
-- Reservations live in memory only. On shutdown, requests still in flight
-  after the grace period are charged at their reserved amount before the
-  ledger and checkpoint are written, so their spend survives the restart.
+- Reservations are also journaled in `ledger/inflight.jsonl` before a request
+  can leave, and marked done when released or once their charge is durable. On
+  shutdown, requests still in flight after the grace period are charged at
+  their reserved amount before the ledger and checkpoint are written. A daemon
+  that dies leaves them in the journal: they count towards limits again at the
+  next start and are charged at their reserved amount at the next unlock
+  (audit `inflight_recovered`), and so are records settled in the last second
+  that had not reached the disk. The journal is written without an fsync, so
+  it survives a killed process but not a power cut, and it is not
+  authenticated: removing it loses only what is in flight.
+- A reservation is settled at its reserved amount after 30 minutes without a
+  sign of life from its request (a client that stopped reading); a stream that
+  keeps delivering keeps its reservation and concurrency slot however long it
+  runs, and is charged its metered cost.
 
 ## 8. Presence and state machine
 

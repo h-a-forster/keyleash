@@ -567,6 +567,13 @@ type ticket struct {
 	unpriced, unbounded bool
 }
 
+// Active implements the proxy's activeTicket: the request is delivering.
+func (t *ticket) Active() {
+	if t.res != nil {
+		t.res.Touch()
+	}
+}
+
 // Finish implements proxy.Ticket: release when the request never left,
 // otherwise settle at the metered cost; an unpriced model at the provider's
 // most expensive rates for the reported tokens (marked estimated); the
@@ -577,7 +584,10 @@ func (t *ticket) Finish(o proxy.Outcome) {
 	estimated := false
 	if t.res != nil {
 		if !o.Sent {
-			t.res.Release()
+			if !t.res.Release() {
+				// Never left, but already charged (a lock settled it first).
+				cost, estimated = t.res.Amount(), true
+			}
 		} else {
 			u := o.Usage
 			if u.Model == "" {

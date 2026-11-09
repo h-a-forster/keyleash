@@ -302,6 +302,14 @@ func (d *Daemon) afterUnlock(method string) error {
 	}
 	d.withAudit(func(l *audit.Log) { l.SetAnchorKey(keys.anchor.Bytes()) })
 	d.ledger.SetMACKey(keys.ledger.Bytes())
+	// Nothing runs while locked, so what is in flight now was left by a daemon
+	// that died (spec §7.7): charge it, now that the record can carry a MAC.
+	if n, err := d.ledger.ExpireInFlight(-1); err != nil {
+		d.log.Warn("charging requests a previous daemon left in flight", "err", err)
+	} else if n > 0 {
+		d.log.Warn("requests a previous daemon left in flight charged at their reserved amount", "count", n)
+		d.auditEvent("inflight_recovered", map[string]any{"count": n})
+	}
 
 	var problems []string
 	vs, vsExists, vserr := d.loadVaultState()

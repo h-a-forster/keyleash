@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/money"
@@ -64,6 +65,7 @@ type Ledger struct {
 	closed     bool
 	persistErr error
 	w          *writer
+	journal    *journal
 	tornAtOpen int // torn final lines cut by Open; read-only afterwards
 
 	stop     chan struct{}
@@ -79,8 +81,9 @@ type Reservation struct {
 	scopes  []string
 	meta    Meta
 	amount  money.Micros
-	created time.Time // set under l.mu when the reservation is taken
-	done    bool      // guarded by l.mu
+	created time.Time    // set under l.mu when the reservation is taken
+	done    bool         // guarded by l.mu
+	touched atomic.Int64 // UnixNano of the request's last sign of life
 }
 
 // ID is the reservation's record id (Meta.RequestID or a random id).
@@ -89,11 +92,18 @@ func (r *Reservation) ID() string { return r.id }
 // Amount is the reserved amount.
 func (r *Reservation) Amount() money.Micros { return r.amount }
 
+// Touch notes that the request is still making progress: ExpireInFlight with a
+// maximum age measures from here.
+func (r *Reservation) Touch() { r.touched.Store(r.l.clock.Now().UnixNano()) }
+
 // Open loads the ledger in opts.Dir, replaying the current month's file (and
 // the last day of the previous month's) to rebuild windows. A truncated final
 // line (crash mid-write) is discarded and cut from the file (and counted by
-// VerifyIntegrity); any other corruption is an error. Open does not verify
-// the hash chain: call VerifyIntegrity once the MAC key is available.
+// VerifyIntegrity). A corrupt line is skipped: its amount is unknown, so the
+// caller must not spend until VerifyIntegrity has reported it. Open does not
+// verify the hash chain: call VerifyIntegrity once the MAC key is available.
+// Reservations a previous process left in flight (see journal.go) are in flight
+// again; they count towards limits until settled with ExpireInFlight.
 func Open(opts Options) (*Ledger, error) {
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: ledger dir is required", ErrInvalid)
@@ -128,6 +138,19 @@ func Open(opts Options) (*Ledger, error) {
 	if err != nil {
 		return nil, err
 	}
+	j, holds, err := openJournal(opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range holds {
+		r := &Reservation{l: l, id: h.ID, scopes: h.Scopes, amount: h.Amount, created: h.Created}
+		if h.Meta != nil {
+			r.meta = *h.Meta
+		}
+		r.touched.Store(h.Created.UnixNano())
+		l.active[r] = struct{}{}
+	}
+	l.journal = j
 	l.hist = hist
 	l.tornAtOpen = torn + torn2
 	l.w = newWriter(opts.Dir, head)
@@ -318,6 +341,11 @@ func (l *Ledger) ReserveWith(scopes []string, amount money.Micros, meta Meta, op
 			}
 		}
 		r.created = now
+		r.touched.Store(now.UnixNano())
+		// On disk before the request can leave (journal.go).
+		if err := l.journal.write(journalLine{ID: r.id, Scopes: r.scopes, Amount: amount, Meta: &r.meta, Created: now}); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersist, err)
+		}
 		l.active[r] = struct{}{}
 		return nil
 	}()
@@ -414,17 +442,20 @@ func (r *Reservation) Settle(actual money.Micros, estimated bool) error {
 }
 
 // Release drops the reservation without charging (the request never reached
-// upstream) and frees its concurrency slots. It is a no-op after Settle or a
-// previous Release.
-func (r *Reservation) Release() {
+// upstream) and frees its concurrency slots. After Settle or a previous Release
+// it does nothing and returns false: whatever was charged stays charged.
+func (r *Reservation) Release() bool {
 	l := r.l
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if r.done {
-		return
+		return false
 	}
 	r.done = true
 	delete(l.active, r)
+	// A failed write only means a later process charges this reservation.
+	_ = l.journal.write(journalLine{ID: r.id, Done: true})
+	return true
 }
 
 // pruneHistLocked drops charges older than both the current calendar month
@@ -543,6 +574,11 @@ func (l *Ledger) flushWLocked() error {
 	batch := l.w.take()
 	l.mu.Unlock()
 	if len(batch) == 0 && !l.w.unsynced {
+		l.mu.Lock()
+		if len(l.active) == 0 && len(l.w.pending) == 0 {
+			l.journal.compact()
+		}
+		l.mu.Unlock()
 		return nil
 	}
 	n, err := l.w.writeLocked(batch)
@@ -557,8 +593,14 @@ func (l *Ledger) flushWLocked() error {
 	}
 	// Everything that failed earlier was put back (or re-synced) and is now
 	// on disk.
+	done := make([]journalLine, 0, len(batch))
+	for _, ln := range batch {
+		done = append(done, journalLine{ID: ln.id, Done: true})
+	}
 	l.mu.Lock()
 	l.persistErr = nil
+	// A failed write only means a later process charges these once more.
+	_ = l.journal.write(done...)
 	l.mu.Unlock()
 	return nil
 }
@@ -606,17 +648,18 @@ func (l *Ledger) InFlight() []InFlightInfo {
 	return out
 }
 
-// ExpireInFlight settles every reservation older than maxAge at its reserved
-// amount, marked estimated (fail closed: the request may have reached
-// upstream). The holder's later Settle returns ErrAlreadySettled and its
-// actual cost is not recorded. It returns how many were expired; the error
-// is the first non-ErrAlreadySettled settle error (e.g. ErrClosed).
+// ExpireInFlight settles every reservation with no sign of life (Touch, or being
+// taken) for longer than maxAge at its reserved amount, marked estimated (fail
+// closed: the request may have reached upstream). A negative maxAge takes them
+// all. The holder's later Settle returns ErrAlreadySettled and its actual cost
+// is not recorded. It returns how many were expired; the error is the first
+// non-ErrAlreadySettled settle error (e.g. ErrClosed).
 func (l *Ledger) ExpireInFlight(maxAge time.Duration) (int, error) {
 	l.mu.Lock()
 	now := l.clock.Now()
 	var stale []*Reservation
 	for r := range l.active {
-		if now.Sub(r.created) > maxAge {
+		if maxAge < 0 || now.Sub(time.Unix(0, r.touched.Load())) > maxAge {
 			stale = append(stale, r)
 		}
 	}
@@ -654,8 +697,9 @@ func (l *Ledger) Close() error {
 	l.mu.Lock()
 	clear(l.w.macKey)
 	l.w.macKey = nil
+	jerr := l.journal.close()
 	l.mu.Unlock()
-	return errors.Join(err, cerr)
+	return errors.Join(err, cerr, jerr)
 }
 
 func newID() string {
