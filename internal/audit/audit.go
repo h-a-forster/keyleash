@@ -54,7 +54,7 @@ const (
 // immediateSync lists record types that are fsync'd as soon as they are
 // written; everything else is fsync'd on Flush/Close.
 var immediateSync = map[string]bool{
-	"panic": true, "unlock": true, "lock": true, "slot_change": true, "trip": true,
+	"panic": true, "unlock": true, "lock": true, "slot_change": true, "trip": true, "rekey_start": true,
 	TypeAnchor: true, TypeRecover: true,
 }
 

@@ -325,6 +325,8 @@ func (c *Client) RotateRecovery(ctx context.Context) (RotateRecoveryResponse, er
 }
 
 // RemoveSlot removes a key slot (step-up, re-keys the vault).
-func (c *Client) RemoveSlot(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/v1/vault/slots/"+url.PathEscape(id), nil, nil, nil)
+func (c *Client) RemoveSlot(ctx context.Context, id string) (RemoveSlotResponse, error) {
+	var r RemoveSlotResponse
+	err := c.do(ctx, http.MethodDelete, "/v1/vault/slots/"+url.PathEscape(id), nil, nil, &r)
+	return r, err
 }

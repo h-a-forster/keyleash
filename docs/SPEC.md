@@ -177,6 +177,9 @@ Rules:
 - A vault must always keep at least one slot; removing the last
   non-convenience slot requires creating another first.
 - Adding/removing slots requires the vault to be unlocked **and** a fresh step-up.
+  Provider key and slot changes need only that, so the owner can still remove a
+  leaked key while Tripped or Away; creating passes and grants needs the daemon
+  to be serving (Unlocked or Away).
 - KDF parameters are stored per slot so they can be raised later (`rekey`).
 
 ### 5.3 Entries
@@ -450,7 +453,11 @@ worst case until they settle.
   entry holds the accepted config (§14) and each provider's active key (§6).
   The entry also holds the approval method of the accepted config (§9, §14),
   the pass store baseline (§6) and whether the vault ever held an `api_key`
-  (§9). `state.json` holds only non-security bookkeeping (models seen without
+  (§9). If the entry cannot be read (malformed, or from a newer version) the
+  daemon trips (`integrity`) and leaves it untouched; `keyleash resume` then
+  replaces it, accepts the current config, keeps the first-key exemption closed
+  if the vault holds a key, and forgets the active key mappings.
+  `state.json` holds only non-security bookkeeping (models seen without
   a price); deleting it changes nothing.
 - Reservations are also journaled in `ledger/inflight.jsonl` before a request
   can leave, and marked done when released or once their charge is durable. On
@@ -684,7 +691,7 @@ table, so the audit log answers "which program spent this".
   `approval`, `approval_secret`, `pass_issue`, `pass_revoke`, `request`
   (provider, model, pass, client process, status, tokens, cost, estimated
   flag, latency, deny reason), `limit_change`, `limit_override`, `key_add`,
-  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey`
+  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey_start` (fsync'd before a re-key commits, so a crash leaves evidence it may have happened), `rekey`
   (op, ok, requester PID; `ok: false, reason: caller_gone` when the
   requester disconnected before the commit), `prev_scrub`, `panic`, `shutdown` (a stop request: requester PID and image),
   `daemon_stop`, `anchor`.

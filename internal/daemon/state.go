@@ -100,6 +100,9 @@ type stateData struct {
 	passDiff *pass.Diff
 	// acceptedMethod is approval.method of the last accepted config.
 	acceptedMethod string
+	// vaultStateBad: the daemon-state entry could not be read. It is left as it
+	// is (d.vs stays nil, so nothing can write it) until a resume replaces it.
+	vaultStateBad bool
 	// rollbackFileSeq/RecordedSeq describe the last rollback detected or
 	// accepted at unlock; rollbackAccepted marks an accepted one.
 	rollbackFileSeq, rollbackRecordedSeq uint64
@@ -317,7 +320,7 @@ func (d *Daemon) afterUnlock(method string) error {
 		problems = append(problems, "the daemon state in the vault cannot be read")
 		vs = &vaultState{Version: 1, ActiveKeys: map[string]string{}}
 		d.vsMu.Lock()
-		d.vs = vs.clone()
+		d.vs = nil
 		d.vsMu.Unlock()
 	} else if !vsExists {
 		// A vault from before the daemon-state entry: start the entry.
@@ -457,6 +460,7 @@ func (d *Daemon) afterUnlock(method string) error {
 	d.st.configChanges, d.st.configPending = changes, pending
 	d.st.passDiff = passDiff
 	d.st.acceptedMethod = accMethod
+	d.st.vaultStateBad = vserr != nil
 	if d.st.heldTrip == nil && vserr == nil {
 		d.st.heldTrip = vs.Trip
 	}
@@ -508,7 +512,7 @@ func (d *Daemon) afterUnlock(method string) error {
 
 	d.auditEvent("unlock", map[string]any{
 		"ok": true, "method": method, "session": sid, "state": string(state),
-		"recovered_from_prev": d.vault.RecoveredFromPrev(), "integrity_ok": len(problems) == 0,
+		"recovered_from_prev": d.recoveredFromPrev, "integrity_ok": len(problems) == 0,
 		"audit_ok": auditProblem == "", "config_changed": pending != nil, "pass_store_ok": passDiff == nil,
 	})
 	if passDiff != nil {
@@ -676,11 +680,15 @@ func (d *Daemon) resume(ctx context.Context) error {
 	changes := append([]string(nil), d.st.configChanges...)
 	passDiff, accMethod := d.st.passDiff, d.st.acceptedMethod
 	owner := ownerTrip(reason) || passDiff != nil || d.st.configPending != nil || !d.st.integrityOK || d.st.auditBad
+	vsBad := d.st.vaultStateBad
 	d.mu.RUnlock()
 	if state != StateTripped {
 		return statusErr(409, client.CodeConflict, "not tripped")
 	}
 	det, note := resumeSummary(reason, changes, passDiff)
+	if vsBad {
+		det = "Daemon state unreadable, will be replaced; " + det
+	}
 	req := approval.Request{Kind: "resume", Title: "Resume keyleash", Detail: det, Note: note}
 	var dec approval.Decision
 	var err error
@@ -704,7 +712,7 @@ func (d *Daemon) resume(ctx context.Context) error {
 	same := d.st.state == StateTripped && d.st.session == session
 	d.mu.RUnlock()
 	if !same {
-		return statusErr(409, client.CodeConflict, "keyleash locked during the approval; check `keyleash status` and run `keyleash resume` again if it is tripped")
+		return statusErr(409, client.CodeConflict, "keyleash locked during the approval, so it does not apply; check `keyleash status`")
 	}
 	if d.testResumeApproved != nil {
 		d.testResumeApproved()
@@ -712,6 +720,12 @@ func (d *Daemon) resume(ctx context.Context) error {
 	if d.isAuditBroken() {
 		if err := d.reopenAudit(); err != nil {
 			return statusErr(503, client.CodeInternal, "the audit log still cannot be written; fix the disk and retry")
+		}
+	}
+	if vsBad {
+		if err := d.replaceVaultState(); err != nil {
+			d.log.Error("replacing the daemon state failed", "err", err)
+			return statusErr(503, client.CodeInternal, "the unreadable daemon state could not be replaced; check the data directory and retry")
 		}
 	}
 	d.mu.RLock()
@@ -764,9 +778,10 @@ func (d *Daemon) resume(ctx context.Context) error {
 	d.st.auditBad = false
 	d.st.configChanges, d.st.configPending = nil, nil
 	d.st.passDiff = nil
-	if pending != nil {
+	if pending != nil || vsBad {
 		d.st.acceptedMethod = d.cfg.Approval.Method
 	}
+	d.st.vaultStateBad = false
 	d.st.state, d.st.tripReason, d.st.tripDetail = StateUnlocked, "", ""
 	d.st.heldTrip, d.st.tripReset = nil, now
 	if d.st.idle || d.st.screenLocked {
@@ -1252,6 +1267,11 @@ func (d *Daemon) rekey(ctx context.Context, op string, fn func() error) error {
 		return err
 	}
 	d.anchor()
+	// On disk before the commit: a crash after it leaves this record with no
+	// outcome, which says the old secret may be gone (spec §11).
+	if err := d.auditEventErr("rekey_start", map[string]any{"op": op, "requester_pid": callerFrom(ctx).pid}); err != nil {
+		return statusErr(503, client.CodeInternal, "the audit log cannot be written; nothing was changed")
+	}
 	err := fn()
 	if errors.Is(err, vault.ErrPrevNotScrubbed) {
 		d.mu.Lock()

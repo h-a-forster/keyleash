@@ -183,6 +183,10 @@ type Daemon struct {
 	consoleMu  sync.Mutex
 	console    approval.Approver
 
+	// recoveredFromPrev: the vault was loaded from vault.prev at start. It holds
+	// for this process, while the vault's own flag ends at its first write.
+	recoveredFromPrev bool
+
 	// overrideSHA is the hex SHA-256 of the pricing override file's bytes
 	// as loaded ("" without an override); overridePath its resolved path.
 	overridePath, overrideSHA string
@@ -360,6 +364,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 		return nil, fmt.Errorf("keyleash: open vault: %w", err)
 	}
 	cleanup = append(cleanup, d.vault.Lock)
+	d.recoveredFromPrev = d.vault.RecoveredFromPrev()
 	if d.passes, err = pass.OpenStore(filepath.Join(d.dataDir, PassesFile), d.clk); err != nil {
 		return nil, fmt.Errorf("keyleash: open pass store: %w", err)
 	}
@@ -490,7 +495,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	// 7. Audit daemon_start; state Locked. Everything below only starts
 	// goroutines.
 	d.auditEvent("daemon_start", map[string]any{
-		"vault_id": d.vault.ID(), "recovered_from_prev": d.vault.RecoveredFromPrev(),
+		"vault_id": d.vault.ID(), "recovered_from_prev": d.recoveredFromPrev,
 		"proxy": d.proxyLn.Addr().String(), "profile": d.cfg.Profile,
 	})
 	// Run passes from an earlier daemon have no job here, so their processes
@@ -498,7 +503,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if d.jobs != nil {
 		d.revokeOrphanedRunPasses()
 	}
-	if d.vault.RecoveredFromPrev() {
+	if d.recoveredFromPrev {
 		d.log.Warn("vault was recovered from vault.prev (main file missing or corrupt)")
 	}
 

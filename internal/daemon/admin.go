@@ -109,12 +109,12 @@ func readBody(r *http.Request, v any) error {
 func (d *Daemon) requireServing() (State, error) {
 	st := d.State()
 	switch st {
-	case StateLocked:
-		return st, statusErr(423, client.CodeLocked, "keyleash is locked")
+	case StateUnlocked, StateAway:
+		return st, nil
 	case StateTripped:
 		return st, statusErr(409, client.CodeConflict, "keyleash is tripped; run `keyleash resume`")
 	}
-	return st, nil
+	return st, statusErr(423, client.CodeLocked, "keyleash is locked")
 }
 
 // ---- status / unlock / lock / panic ----------------------------------------
@@ -163,7 +163,7 @@ func (d *Daemon) status() client.Status {
 	}
 	s.Vault.ID, s.Vault.Seq, s.Vault.Unlocked = d.vault.ID(), d.vault.Seq(), d.vault.IsUnlocked()
 	s.DataDir = d.dataDir
-	s.Vault.RecoveredFromPrev = d.vault.RecoveredFromPrev()
+	s.Vault.RecoveredFromPrev = d.recoveredFromPrev
 	s.Vault.Slots = []client.Slot{}
 	for _, sl := range d.vault.Slots() {
 		s.Vault.Slots = append(s.Vault.Slots, client.Slot{ID: sl.ID, Type: sl.Type, Label: sl.Label,
@@ -172,6 +172,9 @@ func (d *Daemon) status() client.Status {
 	s.PendingApprovals = len(d.queue.Pending())
 	s.ApprovalMethod = d.queue.Method()
 	s.AuditHealthy = !d.isAuditBroken()
+	if s.Integrity == "failed" && d.vaultStateSnapshot() == nil {
+		s.Warnings = append(s.Warnings, "the daemon state in the vault cannot be read; `keyleash resume` replaces it, accepts the current config and forgets `keyleash keys use` choices")
+	}
 	if s.Vault.RecoveredFromPrev {
 		s.Warnings = append(s.Warnings, "the vault was recovered from vault.prev after the main file was missing or corrupt")
 	}
@@ -310,10 +313,14 @@ func (d *Daemon) hAway(w http.ResponseWriter, r *http.Request) {
 	}
 	now := d.clk.Now()
 	g := &grantInfo{id: newID("g_"), amount: req.Budget, until: now.Add(req.For), pass: req.Pass}
+	if _, err := d.requireServing(); err != nil {
+		d.writeErr(w, err)
+		return
+	}
 	d.mu.Lock()
 	if d.st.state != StateUnlocked && d.st.state != StateAway {
 		d.mu.Unlock()
-		d.writeErr(w, statusErr(409, client.CodeConflict, "keyleash locked or tripped during approval"))
+		d.writeErr(w, statusErr(423, client.CodeLocked, "keyleash is locked"))
 		return
 	}
 	d.st.grant = g
@@ -1294,8 +1301,10 @@ func (d *Daemon) hRemoveSlot(w http.ResponseWriter, r *http.Request) {
 	}
 	err := d.rekey(r.Context(), "remove_slot", func() error { return d.vault.RemoveSlot(id) })
 	switch {
-	case err == nil, errors.Is(err, vault.ErrPrevNotScrubbed):
-		writeJSON(w, 200, struct{}{})
+	case err == nil:
+		writeJSON(w, 200, client.RemoveSlotResponse{})
+	case errors.Is(err, vault.ErrPrevNotScrubbed):
+		writeJSON(w, 200, client.RemoveSlotResponse{Warning: "vault.prev still holds the old vault key; delete it"})
 	case errors.Is(err, vault.ErrLastSlot):
 		d.writeErr(w, statusErr(409, client.CodeConflict, "cannot remove the last non-convenience slot"))
 	case errors.Is(err, vault.ErrNotFound):

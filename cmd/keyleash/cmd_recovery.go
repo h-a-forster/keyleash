@@ -134,6 +134,7 @@ func rotationLost(ctx context.Context, c *client.Client, err error, since uint64
 	bg := context.WithoutCancel(ctx)
 	self := float64(os.Getpid())
 	deadline := time.Now().Add(rotationSettle)
+	started := uint64(0)
 	for sinceOK {
 		qctx, cancel := withTimeout(bg)
 		recs, aerr := c.AuditTail(qctx, 500)
@@ -148,6 +149,8 @@ func rotationLost(ctx context.Context, c *client.Client, err error, since uint64
 				continue
 			}
 			switch {
+			case rec.Type == "rekey_start" && rec.Fields["op"] == "rotate_recovery":
+				started = rec.Seq
 			case rec.Type == "rekey" && rec.Fields["op"] == "rotate_recovery" && rec.Fields["ok"] == true:
 				return fmt.Errorf("%v\nThe recovery code WAS rotated (audit record %d), but the new code never reached this terminal and cannot be recovered. Your old recovery code no longer works. %s", friendly(err), rec.Seq, again)
 			case rec.Type == "rekey" && rec.Fields["op"] == "rotate_recovery":
@@ -161,5 +164,8 @@ func rotationLost(ctx context.Context, c *client.Client, err error, since uint64
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("%v\nCould not tell whether the recovery code was rotated. Check `keyleash audit tail` for a \"rekey\" record with op rotate_recovery and ok true: if there is one, your old recovery code no longer works and the new one was lost. %s", friendly(err), again)
+	if started != 0 {
+		return fmt.Errorf("%v\nThe rotation started (audit record %d) and its outcome was not recorded, so it MAY have happened: your old recovery code may no longer work, and the new one was lost. %s", friendly(err), started, again)
+	}
+	return fmt.Errorf("%v\nCould not tell whether the recovery code was rotated. Check `keyleash audit tail` for a \"rekey_start\" record with op rotate_recovery: with one there and no \"rekey\" record with ok false after it, treat your old recovery code as gone. %s", friendly(err), again)
 }

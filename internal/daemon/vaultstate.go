@@ -167,6 +167,31 @@ func (d *Daemon) updateVaultState(fn func(*vaultState)) error {
 	return nil
 }
 
+// replaceVaultState starts a new daemon-state entry in place of an unreadable
+// one, after the owner approved that. The current config becomes the accepted
+// one (otherwise the next unlock would take any config as a first acceptance),
+// the first-key exemption stays closed if the vault holds a key, and the active
+// key mappings are gone: providers use their oldest key until `keys use`.
+func (d *Daemon) replaceVaultState() error {
+	text, err := d.acceptedConfigText()
+	if err != nil {
+		return err
+	}
+	method, hasKey := d.cfg.Approval.Method, d.vaultHasAPIKey()
+	d.vsMu.Lock()
+	d.vs = &vaultState{Version: 1, ActiveKeys: map[string]string{}}
+	d.vsMu.Unlock()
+	err = d.updateVaultState(func(s *vaultState) {
+		s.ConfigHash, s.ConfigTOML, s.ApprovalMethod, s.KeysEverAdded = hashText(text), text, method, hasKey
+	})
+	if err != nil {
+		d.vsMu.Lock()
+		d.vs = nil
+		d.vsMu.Unlock()
+	}
+	return err
+}
+
 // vaultStateSnapshot returns a copy of the cached state (nil before the
 // first unlock).
 func (d *Daemon) vaultStateSnapshot() *vaultState {

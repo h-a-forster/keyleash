@@ -42,10 +42,11 @@ func (a authenticator) Authenticate(_ context.Context, prov, token string, ci pr
 	state, awaySince, requests := d.st.state, d.st.awaySince, d.st.requests
 	d.mu.RUnlock()
 	switch state {
-	case StateLocked:
-		return proxy.Principal{}, denial(http.StatusLocked, proxy.ReasonLocked, "")
+	case StateUnlocked, StateAway:
 	case StateTripped:
 		return proxy.Principal{}, denial(http.StatusLocked, proxy.ReasonTripped, "")
+	default:
+		return proxy.Principal{}, denial(http.StatusLocked, proxy.ReasonLocked, "")
 	}
 
 	p, err := d.passes.Verify(token)
@@ -472,10 +473,11 @@ func (d *Daemon) reserve(a proxy.Admission, p pass.Pass, amount money.Micros, sk
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	switch d.st.state {
-	case StateLocked:
-		return nil, denial(http.StatusLocked, proxy.ReasonLocked, "")
+	case StateUnlocked, StateAway:
 	case StateTripped:
 		return nil, denial(http.StatusLocked, proxy.ReasonTripped, "")
+	default:
+		return nil, denial(http.StatusLocked, proxy.ReasonLocked, "")
 	}
 	now := d.clk.Now()
 	scopes := []string{

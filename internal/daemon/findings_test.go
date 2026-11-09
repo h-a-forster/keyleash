@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/provider"
 	"github.com/h-a-forster/keyleash/internal/proxy"
+	"github.com/h-a-forster/keyleash/internal/vault"
 )
 
 // Regression tests for security findings A–K (each replays the attack).
@@ -768,6 +770,7 @@ func TestStopEndsRunningRequests(t *testing.T) {
 // resumeGate holds resume prompts until the test opens gate; other prompts
 // are approved.
 type resumeGate struct {
+	kind string // the prompts it holds ("" means resume)
 	gate chan struct{}
 	seen chan approval.Request
 }
@@ -775,7 +778,7 @@ type resumeGate struct {
 func (a *resumeGate) Method() string { return "test" }
 
 func (a *resumeGate) Approve(ctx context.Context, req approval.Request) (bool, error) {
-	if req.Kind != "resume" {
+	if kind := cmp.Or(a.kind, "resume"); req.Kind != kind {
 		return true, nil
 	}
 	a.seen <- req
@@ -1243,4 +1246,171 @@ func TestCorruptLedgerLineTripsInsteadOfStoppingStart(t *testing.T) {
 	}
 	e.start()
 	acceptLedger(t, e, tok)
+}
+
+// D18: an unreadable daemon-state entry is left alone until the owner accepts
+// replacing it, and what replaces it keeps the first-key exemption closed and
+// a config check in force.
+func TestUnreadableDaemonStateIsNotOverwritten(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	e.stop()
+	garbage := []byte(`{"version":99}`)
+	v, err := vault.Open(filepath.Join(e.dir, VaultFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.UnlockPassphrase(testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+	id, ok := stateEntryID(v)
+	if !ok {
+		t.Fatal("no daemon-state entry")
+	}
+	if err := v.ReplaceEntrySecret(id, garbage); err != nil {
+		t.Fatal(err)
+	}
+	v.Lock()
+	e.start()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.TripReason != TripIntegrity {
+		t.Fatalf("unlock: %v %s (%s)", err, st.State, st.TripReason)
+	}
+	if err := e.withOwner(func(ctx context.Context) error {
+		_, err := e.c.AddKey(ctx, "gemini", "main", []byte("AIza"+strings.Repeat("x", 35)))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	if err := e.d.vault.WithSecret(id, func(b []byte) error { raw = append(raw, b...); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(garbage) {
+		t.Fatalf("a key change overwrote the unreadable entry with %d bytes", len(raw))
+	}
+	e.appr.approve.Store(true)
+	if st, err = e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked {
+		t.Fatalf("resume: %v %s", err, st.State)
+	}
+	if vs := e.d.vaultStateSnapshot(); vs == nil || !vs.KeysEverAdded {
+		t.Fatalf("after resume: %+v", vs)
+	}
+	e.stop()
+	e.cfg.Limits.Pass.Concurrency++
+	e.start()
+	if st, err = e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil || st.TripReason != TripConfig {
+		t.Fatalf("a changed config after the replacement: %v %s (%s)", err, st.State, st.TripReason)
+	}
+}
+
+// D19: the start of a re-key is on disk before the vault commits, so a crash
+// between commit and outcome leaves evidence that it may have happened.
+func TestRekeyStartIsRecordedBeforeCommit(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	err := e.d.rekey(e.ctx(), "rotate_recovery", func() error {
+		files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
+		for _, f := range files {
+			if raw, err := os.ReadFile(f); err == nil && strings.Contains(string(raw), `"rekey_start"`) {
+				return nil
+			}
+		}
+		return errors.New("no rekey_start record on disk at commit time")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// D17: the recovered-from-.prev warning survives the first unlock's own writes.
+func TestRecoveredFromPrevOutlivesUnlock(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.stop()
+	if err := os.Rename(filepath.Join(e.dir, VaultFile), filepath.Join(e.dir, "vault.prev")); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Vault.RecoveredFromPrev || len(st.Warnings) == 0 {
+		t.Fatalf("after unlock: recovered=%v warnings=%v", st.Vault.RecoveredFromPrev, st.Warnings)
+	}
+	if !auditHas(t, e, "unlock", func(f map[string]any) bool { return f["recovered_from_prev"] == true }) {
+		t.Fatal("the unlock record does not say so")
+	}
+}
+
+// D13: a state nothing expects serves nothing.
+func TestUnknownStateServesNothing(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.d.mu.Lock()
+	e.d.st.state = "unknown"
+	e.d.mu.Unlock()
+	defer func() {
+		e.d.mu.Lock()
+		e.d.st.state = StateUnlocked
+		e.d.mu.Unlock()
+	}()
+	wantReason(t, e.anthropic(tok), 423, proxy.ReasonLocked)
+	if _, err := e.d.requireServing(); err == nil {
+		t.Fatal("requireServing let an unknown state through")
+	}
+	p, _ := provider.Get("anthropic")
+	if _, err := e.d.reserve(proxy.Admission{Provider: p}, pass.Pass{ID: "x"}, 1, nil); err == nil {
+		t.Fatal("reserve let an unknown state through")
+	}
+}
+
+// D13: a lock during an away approval is reported as locked, not as tripped.
+func TestAwayLockedDuringApprovalSaysLocked(t *testing.T) {
+	e := newEnv(t, nil)
+	ra := &resumeGate{kind: "away_grant", gate: make(chan struct{}), seen: make(chan approval.Request, 1)}
+	e.approver = ra
+	e.restart()
+	e.unlock()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := e.c.Away(e.ctx(), client.AwayRequest{Budget: money.Dollar, For: time.Hour})
+		errc <- err
+	}()
+	<-ra.seen
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	close(ra.gate)
+	if err := <-errc; !isAPI(err, 423, client.CodeLocked) {
+		t.Fatalf("away after a lock: %v", err)
+	}
+}
+
+// D13: removing a slot reports a vault.prev it could not scrub, like rotation.
+func TestRemoveSlotReportsPrevNotScrubbed(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.appr.approve.Store(true)
+	st := e.status()
+	if len(st.Vault.Slots) < 2 {
+		t.Fatalf("slots: %+v", st.Vault.Slots)
+	}
+	prev := filepath.Join(e.dir, "vault.prev")
+	os.Remove(prev)
+	if err := os.MkdirAll(filepath.Join(prev, "keep"), 0o700); err != nil { // cannot be replaced or removed
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(prev)
+	resp, err := e.c.RemoveSlot(e.ctx(), st.Vault.Slots[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Warning == "" {
+		t.Fatal("no warning about vault.prev")
+	}
 }

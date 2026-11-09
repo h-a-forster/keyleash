@@ -357,6 +357,11 @@ type ShutdownResponse struct {
 	Stopping bool `json:"stopping"`
 }
 
+// RemoveSlotResponse is the response of DELETE /v1/vault/slots/{id}.
+type RemoveSlotResponse struct {
+	Warning string `json:"warning,omitempty"`
+}
+
 // RotateRecoveryResponse is the response of POST /v1/vault/recovery. Code
 // is the new recovery code, shown once.
 type RotateRecoveryResponse struct {
