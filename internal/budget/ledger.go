@@ -705,6 +705,7 @@ func (l *Ledger) RecoverInFlight() (Recovered, error) {
 			continue
 		case seen[h.ID]:
 		default:
+			seen[h.ID] = true // a copied line charges nothing more
 			r := &Reservation{l: l, id: h.ID, scopes: h.Scopes, amount: h.Amount, created: h.Created, hold: h}
 			if h.Meta != nil {
 				r.meta = *h.Meta
@@ -729,17 +730,28 @@ func (l *Ledger) RecoverInFlight() (Recovered, error) {
 	return rec, first
 }
 
-// DropRejectedInFlight ends the holds RecoverInFlight would not charge: the
-// owner has seen them and accepted that they charge nothing.
+// DropRejectedInFlight ends the holds that do not authenticate: the owner has
+// seen them and accepted that they charge nothing. Genuine holds a failed
+// recovery left stay for the next one.
 func (l *Ledger) DropRejectedInFlight() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	done := make([]journalLine, 0, len(l.orphans))
-	for _, h := range l.orphans {
-		done = append(done, journalLine{ID: h.ID, Done: true})
+	if len(l.w.macKey) == 0 {
+		return errors.New("budget: judging in-flight reservations needs the MAC key")
 	}
-	l.orphans = nil
-	return l.journal.write(done...)
+	var keep, done []journalLine
+	for _, h := range l.orphans {
+		if h.verified(l.w.macKey) {
+			keep = append(keep, h)
+		} else {
+			done = append(done, journalLine{ID: h.ID, Done: true})
+		}
+	}
+	if err := l.journal.write(done...); err != nil {
+		return err
+	}
+	l.orphans = keep
+	return nil
 }
 
 // recordIDs returns the ids of the records in the ledger files.

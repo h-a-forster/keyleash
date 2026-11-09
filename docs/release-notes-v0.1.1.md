@@ -16,8 +16,8 @@ Fixes from a state-machine audit of v0.1.0.
 - A velocity or audit-failure trip ends only with `keyleash resume`, also across
   a restart; a trip derived from the files (a changed config, say) ends with a
   resume or once the files verify again. A resume approval applies only to the
-  trip its prompt showed, and with `approval.method = "deny"` a held trip is
-  resumed with the passphrase or recovery code. Accepting a failed
+  trip its prompt showed, and with `approval.method = "deny"`, or `"hello"` with
+  Hello unavailable, a held trip is resumed with the passphrase or recovery code. Accepting a failed
   ledger check shows the counts and totals in the prompt and the audit record
   and sticks (the original is kept in `ledger/rejected-<time>/`), and a
   damaged ledger line trips at unlock rather than stopping the daemon starting.

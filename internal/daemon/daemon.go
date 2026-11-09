@@ -210,6 +210,8 @@ type Daemon struct {
 	// testResumeApproved, set only by tests, runs in resume once the approval
 	// is in and checked.
 	testResumeApproved func()
+	// testResumeDone, set only by tests, runs as resume is about to return.
+	testResumeDone func()
 
 	// auditMu guards the audit health flag.
 	auditMu     sync.Mutex

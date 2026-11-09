@@ -324,11 +324,11 @@ pass. After a config change, an integrity failure or an edited
 config you last accepted, never with the one the changed file names: if
 that is `console` or `deny`, or Windows Hello is unavailable, `keyleash
 resume` asks for your passphrase or recovery code. Any other trip is approved
-with the configured method, except that `deny` asks for the same secret, so a
-trip always has a way out. Accepting a failed ledger check shows what it found:
-lines dropped, bad MACs, chain breaks, forged in-flight lines, and the total the
-vault recorded against the one the files hold; the audit `resume` record keeps
-them.
+with the configured method, except that `deny`, or `hello` with Hello
+unavailable, asks for the same secret, so a trip always has a way out. Accepting a failed ledger check shows what it found:
+the total the files hold against the one the vault recorded, then lines dropped,
+bad MACs, chain breaks and forged in-flight lines. A prompt has limited room, so
+it can cut the counts; `keyleash status` and the audit `resume` record keep them.
 
 **Step-up approvals prove you are there.** Every program running as you can
 reach keyleash's admin channel, including the agents it governs, so being
@@ -466,5 +466,5 @@ how old the pricing table is. Start there.
 | `pass_store` trip / `pass store change: …` | `passes.json` no longer matches what keyleash recorded in the vault (edited, replaced or rolled back). `keyleash resume` revokes the added and changed passes; create new ones. |
 | Restoring a backup of the whole data directory | Restoring vault, ledger, audit log and passes.json together to an earlier point cannot be told apart from a deliberate restore: spend recorded since the backup is forgotten and passes revoked since then come back. Keep backups where agents cannot write, and revoke passes after a restore (`keyleash panic`, then unlock). |
 | `presence detection is degraded` | Low-level input hooks could not be installed; idle time falls back to `GetLastInputInfo`, which also counts injected input. |
-| `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied. Set `approval.method = "passphrase"` in config. |
+| `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied, except that `keyleash resume` takes your passphrase or recovery code. Set `approval.method = "passphrase"` in config. |
 | Forgot the passphrase | `keyleash unlock --recovery` with the recovery code. |

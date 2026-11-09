@@ -2,6 +2,7 @@ package budget
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -928,6 +929,84 @@ func TestRecoverDoesNotChargeWrittenRecordAgain(t *testing.T) {
 	}
 	if n := len(readRecords(t, partial)); n != 2 {
 		t.Fatalf("records = %d, want 2", n)
+	}
+}
+
+// Copies of a genuine hold line charge it once, now and at the next start.
+func TestRecoverChargesCopiedHoldOnce(t *testing.T) {
+	key := []byte("journal test key")
+	l, clk, dir := newTest(t)
+	l.SetMACKey(key)
+	reserve(t, l, nil, 100, Meta{RequestID: "copied"})
+	crashed := copyDir(t, dir)
+	p := filepath.Join(crashed, journalName)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, bytes.Repeat(b, 4), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopen := func() *Ledger {
+		t.Helper()
+		l2, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l2.Close() })
+		l2.SetMACKey(key)
+		return l2
+	}
+	l2 := reopen()
+	if rec, err := l2.RecoverInFlight(); rec != (Recovered{Charged: 1, Amount: 100}) || err != nil {
+		t.Fatalf("recover: %+v %v", rec, err)
+	}
+	checkSpent(t, l2, "global", WindowDay, 100, 0)
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l3 := reopen()
+	if rec, err := l3.RecoverInFlight(); rec != (Recovered{}) || err != nil {
+		t.Fatalf("recover after the charge: %+v %v", rec, err)
+	}
+	checkSpent(t, l3, "global", WindowDay, 100, 0)
+}
+
+// Accepting the rejected lines ends only those: a recovery that could not read
+// the ledger leaves genuine holds for the next one.
+func TestDropRejectedKeepsGenuineHolds(t *testing.T) {
+	key := []byte("journal test key")
+	l, clk, dir := newTest(t)
+	l.SetMACKey(key)
+	reserve(t, l, nil, 7000, Meta{RequestID: "genuine"})
+	crashed := copyDir(t, dir)
+	f, err := os.OpenFile(filepath.Join(crashed, journalName), os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(f, "{\"id\":\"forged\",\"amount_micros\":5}\n")
+	f.Close()
+	l2, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	l2.SetMACKey(key)
+	// A failed recovery leaves every hold as Open found it.
+	if err := l2.DropRejectedInFlight(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l3, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l3.Close()
+	l3.SetMACKey(key)
+	if rec, err := l3.RecoverInFlight(); rec != (Recovered{Charged: 1, Amount: 7000}) || err != nil {
+		t.Fatalf("recover: %+v %v, want the genuine hold and no forged line", rec, err)
 	}
 }
 

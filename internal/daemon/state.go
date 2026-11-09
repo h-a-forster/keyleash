@@ -142,8 +142,9 @@ func (f *ledgerFailure) summary() string {
 	if f == nil {
 		return ""
 	}
-	return fmt.Sprintf("ledger: %d lines dropped, %d bad MACs, %d chain breaks, %d forged in-flight lines; vault records %s, files hold %s",
-		f.Corrupt, f.MACFailures, f.ChainBreaks, f.JournalRejected, f.CheckpointSettled, f.CheckpointFound)
+	// Totals first: a prompt cuts its note to the room left.
+	return fmt.Sprintf("ledger %s, vault %s; %d dropped, %d bad MAC, %d breaks, %d forged",
+		f.CheckpointFound, f.CheckpointSettled, f.Corrupt, f.MACFailures, f.ChainBreaks, f.JournalRejected)
 }
 
 // heldTrip is the reason and detail of a trip awaiting a resume.
@@ -747,10 +748,11 @@ func (d *Daemon) resume(ctx context.Context) error {
 		// Approved with the accepted config's method (never the console,
 		// and never a method a changed config.toml names).
 		dec, err = d.stepUpWith(ctx, d.approverFor(accMethod, true), req)
-	case d.cfg.Approval.Method == "deny":
-		// A trip needs a way out: "deny" refuses spending more, and this is the
-		// vault secret proving the owner is there.
-		dec, err = d.stepUpWith(ctx, d.approverFor("deny", true), req)
+	case d.cfg.Approval.Method == "deny", d.cfg.Approval.Method == "hello":
+		// A trip needs a way out when the method cannot prompt: "deny" refuses
+		// spending more, and Hello can be unavailable. There this approver
+		// takes the vault secret, proving the owner is there.
+		dec, err = d.stepUpWith(ctx, d.approverFor(d.cfg.Approval.Method, true), req)
 	default:
 		dec, err = d.stepUp(ctx, req)
 	}
@@ -869,6 +871,9 @@ func (d *Daemon) resume(ctx context.Context) error {
 	}
 	d.auditEvent("resume", f)
 	d.saveState()
+	if d.testResumeDone != nil {
+		d.testResumeDone()
+	}
 	return nil
 }
 

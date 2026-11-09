@@ -884,8 +884,16 @@ func TestLockWaitsForResumeToFinish(t *testing.T) {
 	e.unlock()
 	e.d.trip(TripAudit, "test")
 	e.appr.approve.Store(true)
+	held := func(when string) {
+		if e.d.unlockMu.TryLock() {
+			e.d.unlockMu.Unlock()
+			t.Errorf("a lock could run %s a resume", when)
+		}
+	}
+	e.d.testResumeApproved = func() { held("at the start of") }
 	locked := make(chan struct{})
-	e.d.testResumeApproved = func() {
+	e.d.testResumeDone = func() {
+		held("at the end of")
 		go func() { e.d.lock("test"); close(locked) }()
 		select {
 		case <-locked:
@@ -1613,27 +1621,42 @@ func TestLedgerAcceptShowsWhatIsAccepted(t *testing.T) {
 	if !strings.Contains(note, "1") {
 		t.Fatalf("the prompt does not show the counts: %q", note)
 	}
+	// The note is cut to the room the prompt has left: with the longest detail
+	// and large amounts, the totals must still show.
+	fail := &ledgerFailure{Corrupt: 12, MACFailures: 340, CheckpointSettled: 1300_654321, CheckpointFound: 1200_123456}
+	prompt := approval.PromptText(approval.Request{Kind: "resume", Title: "Resume keyleash",
+		Detail: strings.Repeat("x", resumeDetailRunes), Note: fail.summary()})
+	for _, m := range []money.Micros{fail.CheckpointSettled, fail.CheckpointFound} {
+		if !strings.Contains(prompt, m.String()) {
+			t.Fatalf("%s missing from the prompt: %q", m, prompt)
+		}
+	}
 }
 
-// Review of PR 3, item 6: a held trip under approval.method = "deny" has an
-// exit, the vault passphrase over the admin API.
+// Review of PR 3, item 6: a held trip under a method that cannot prompt ("deny",
+// or "hello" with Hello unavailable, as in the harness) has an exit, the vault
+// passphrase over the admin API.
 func TestHeldTripCanBeResumedUnderDeny(t *testing.T) {
-	e := newEnv(t, func(c *config.Config) { c.Approval.Method = "deny" })
-	e.noApprover = true
-	e.restart()
-	e.unlock()
-	e.d.trip(TripAudit, "test")
-	errc := make(chan error, 1)
-	go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
-	id := e.waitPending("resume")
-	if err := e.c.Decide(e.ctx(), id, client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-errc; err != nil {
-		t.Fatal(err)
-	}
-	if s := e.status(); s.State != client.StateUnlocked {
-		t.Fatalf("state %s (%s)", s.State, s.TripReason)
+	for _, method := range []string{"deny", "hello"} {
+		t.Run(method, func(t *testing.T) {
+			e := newEnv(t, func(c *config.Config) { c.Approval.Method = method })
+			e.noApprover = true
+			e.restart()
+			e.unlock()
+			e.d.trip(TripAudit, "test")
+			errc := make(chan error, 1)
+			go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+			id := e.waitPending("resume")
+			if err := e.c.Decide(e.ctx(), id, client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-errc; err != nil {
+				t.Fatal(err)
+			}
+			if s := e.status(); s.State != client.StateUnlocked {
+				t.Fatalf("state %s (%s)", s.State, s.TripReason)
+			}
+		})
 	}
 }
 
