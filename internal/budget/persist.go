@@ -124,6 +124,7 @@ func macBody(ln []byte, mac string) ([]byte, bool) {
 }
 
 type line struct {
+	id     string // the reservation's id
 	file   string
 	data   []byte // complete line including the trailing newline
 	amount money.Micros
@@ -137,6 +138,7 @@ type writer struct {
 	dir     string
 	pending []line
 	head    string // chain hash of the last enqueued line
+	newest  string // newest file name so far: records never go to an earlier one
 	macKey  []byte
 
 	mu       sync.Mutex
@@ -149,27 +151,45 @@ type writer struct {
 }
 
 func newWriter(dir string, cp Checkpoint) *writer {
-	return &writer{dir: dir, head: cp.LastHash, work: cp, durable: cp}
+	w := &writer{dir: dir, head: cp.LastHash, work: cp, durable: cp}
+	if cp.Month != "" {
+		w.newest = "ledger-" + cp.Month + ".jsonl"
+	}
+	return w
 }
 
 func (w *writer) enqueue(rec record, local time.Time) error {
-	rec.Prev, rec.MAC = w.head, ""
+	data, h, err := w.encode(rec, w.head)
+	if err != nil {
+		return err
+	}
+	w.head = h
+	// A clock or timezone stepped back over a month end must not reorder the
+	// chain across files (windows go by each record's own time).
+	if name := fileName(local); name > w.newest {
+		w.newest = name
+	}
+	w.pending = append(w.pending, line{id: rec.ID, file: w.newest, data: append(data, '\n'), amount: rec.Amount, hash: h})
+	return nil
+}
+
+// encode returns rec's line (without the newline), chained to prev and with a
+// mac if there is a key, and the line's chain hash.
+func (w *writer) encode(rec record, prev string) ([]byte, string, error) {
+	rec.Prev, rec.MAC = prev, ""
 	body, err := json.Marshal(rec)
 	if err != nil {
-		return fmt.Errorf("budget: encode record: %w", err)
+		return nil, "", fmt.Errorf("budget: encode record: %w", err)
 	}
 	if len(body) == 0 || body[len(body)-1] != '}' {
-		return errors.New("budget: encode record: unexpected encoding")
+		return nil, "", errors.New("budget: encode record: unexpected encoding")
 	}
 	data := body
 	if len(w.macKey) > 0 {
 		mac := hex.EncodeToString(recordMAC(w.macKey, body))
 		data = slices.Concat(body[:len(body)-1], []byte(`,"mac":"`+mac+`"}`))
 	}
-	h := lineHash(data)
-	w.head = h
-	w.pending = append(w.pending, line{file: fileName(local), data: append(data, '\n'), amount: rec.Amount, hash: h})
-	return nil
+	return data, lineHash(data), nil
 }
 
 func (w *writer) take() []line {
@@ -306,8 +326,9 @@ func chainHead(dir string) (Checkpoint, int, error) {
 }
 
 // replay loads the charges needed to rebuild windows as of now: everything in
-// the current calendar month and the last histTail before now. It also
-// reports how many torn final lines it cut.
+// the current calendar month and the last histTail before now, from the file
+// of the previous month onward (a record can sit in a later file than its time
+// says, after a clock step). It also reports how many torn final lines it cut.
 func replay(dir string, now time.Time, loc *time.Location) ([]*charge, int, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, 0, fmt.Errorf("budget: create ledger dir: %w", err)
@@ -318,10 +339,17 @@ func replay(dir string, now time.Time, loc *time.Location) ([]*charge, int, erro
 		cutoff = t
 	}
 	prev := time.Date(monthStart.Year(), monthStart.Month()-1, 1, 0, 0, 0, 0, loc)
+	names, err := ledgerFiles(dir)
+	if err != nil {
+		return nil, 0, err
+	}
 	var hist []*charge
 	torn := 0
-	for _, m := range []time.Time{prev, monthStart} {
-		ents, t, err := readFile(filepath.Join(dir, fileName(m)))
+	for _, name := range names {
+		if name < fileName(prev) {
+			continue
+		}
+		ents, t, err := readFile(filepath.Join(dir, name))
 		torn += t
 		if err != nil {
 			return nil, torn, err
@@ -342,7 +370,7 @@ func replay(dir string, now time.Time, loc *time.Location) ([]*charge, int, erro
 // line without a trailing newline is a torn write: it is dropped, the file is
 // truncated to the last complete line, and it is counted in the second
 // result. A complete final line missing only its newline gets one appended.
-// Anything else malformed is an error.
+// Anything else malformed is skipped; VerifyIntegrity reports it (Corrupt).
 func readFile(p string) ([]entry, int, error) {
 	data, err := os.ReadFile(p)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -355,7 +383,7 @@ func readFile(p string) ([]entry, int, error) {
 	torn := 0
 	rest := data
 	off := 0
-	for n := 1; len(rest) > 0; n++ {
+	for len(rest) > 0 {
 		i := bytes.IndexByte(rest, '\n')
 		last := i < 0
 		ln := rest
@@ -379,8 +407,6 @@ func readFile(p string) ([]entry, int, error) {
 			if err := fixFile(p, int64(off)); err != nil {
 				return nil, torn, err
 			}
-		default:
-			return nil, torn, fmt.Errorf("budget: %s line %d is corrupt: %v", filepath.Base(p), n, perr)
 		}
 		if last {
 			break

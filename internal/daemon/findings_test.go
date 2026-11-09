@@ -1,22 +1,36 @@
 package daemon
 
 import (
+	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/approval"
+	"github.com/h-a-forster/keyleash/internal/audit"
+	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
+	"github.com/h-a-forster/keyleash/internal/pass"
+	"github.com/h-a-forster/keyleash/internal/provider"
 	"github.com/h-a-forster/keyleash/internal/proxy"
+	"github.com/h-a-forster/keyleash/internal/vault"
 )
 
 // Regression tests for security findings A–K (each replays the attack).
@@ -506,6 +520,13 @@ func TestFindingJ_AcceptRollbackOnUnlock(t *testing.T) {
 	if !auditHas(t, e, "accept_rollback", func(f map[string]any) bool { return f["recorded_seq"] != nil && f["file_seq"] != nil }) {
 		t.Fatal("accepted rollback not audited")
 	}
+	// The warning belongs to that unlock, not to the rest of the process.
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil || st.Vault.RollbackAccepted {
+		t.Fatalf("a later unlock: %v, accepted reported: %v", err, st.Vault.RollbackAccepted)
+	}
 }
 
 // K: away grants are capped by limits.away.max_grant; the first-key
@@ -536,5 +557,1222 @@ func TestFindingK_Residuals(t *testing.T) {
 	e.unlock()
 	if _, err := e.c.AddKey(e.ctx(), "anthropic", "again", []byte(anthropicKey)); !isAPI(err, 403, client.CodeStepUpDenied) {
 		t.Fatalf("after restart: %v", err)
+	}
+}
+
+// Regression tests for the state-machine audit of 2026-11-09 (D1...).
+
+// slowBody sends a request's headers with a Content-Length and no body: the
+// proxy has authenticated it and waits for the body. send delivers the body
+// and returns the response.
+func slowBody(t *testing.T, e *env, tok string) (send func() *http.Response) {
+	t.Helper()
+	conn, err := net.Dial("tcp", e.d.ProxyAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	hdr := "POST /anthropic/v1/messages HTTP/1.1\r\nHost: " + e.d.ProxyAddr() + "\r\nX-Api-Key: " + tok +
+		"\r\nAnthropic-Version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: " + strconv.Itoa(len(anthropicReq)) + "\r\n\r\n"
+	if _, err := conn.Write([]byte(hdr)); err != nil {
+		t.Fatal(err)
+	}
+	// Authenticate's last step takes the pass's scope; the handler then waits
+	// for the body.
+	for i := 0; ; i++ {
+		e.d.mu.RLock()
+		scope := e.d.st.requests
+		e.d.mu.RUnlock()
+		scope.mu.Lock()
+		n := len(scope.passes)
+		scope.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if i > 1000 {
+			t.Fatal("the request was not authenticated")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return func() *http.Response {
+		t.Helper()
+		if _, err := conn.Write([]byte(anthropicReq)); err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+}
+
+// stream starts a streaming request that pauses after each of its first steps
+// events (see X-Test-Steps) and returns once the headers are back.
+func (e *env) stream(t *testing.T, tok string, steps int) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+e.d.ProxyAddr()+"/anthropic/v1/messages", strings.NewReader(anthropicStreamReq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", tok)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("X-Test-Steps", strconv.Itoa(steps))
+	resp, err := e.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// D1: a request authenticated while its pass was good is refused at admission
+// once the pass is revoked, expired or its bound process is gone.
+// A pass still live after a lock and unlock does not revive a request the lock
+// ended while its body arrived, and the refusal is on the record.
+func TestStoppedRequestRefusedOnTheRecord(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	hits := e.up.hits.Load()
+	send := slowBody(t, e, tok)
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.unlock()
+	resp := send()
+	if resp.StatusCode != 423 || resp.Header.Get(proxy.ReasonHeader) != proxy.ReasonLocked {
+		t.Fatalf("got %d %q", resp.StatusCode, resp.Header.Get(proxy.ReasonHeader))
+	}
+	if e.up.hits.Load() != hits {
+		t.Fatal("the request reached upstream")
+	}
+	if !auditHas(t, e, "request", func(f map[string]any) bool { return f["deny_reason"] == proxy.ReasonLocked }) {
+		t.Fatal("the refusal left no audit record")
+	}
+}
+
+func TestDeadPassCannotSpendOnHeldRequest(t *testing.T) {
+	cases := []struct {
+		name   string
+		req    client.PassCreateRequest
+		kill   func(t *testing.T, e *env)
+		reason string
+	}{
+		{"revoked", client.PassCreateRequest{}, func(t *testing.T, e *env) {
+			ps, err := e.c.Passes(e.ctx())
+			if err != nil || len(ps) != 1 {
+				t.Fatalf("passes %v %v", ps, err)
+			}
+			if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+				t.Fatal(err)
+			}
+		}, proxy.ReasonPassInvalid},
+		{"expired", client.PassCreateRequest{TTL: time.Hour}, func(t *testing.T, e *env) {
+			e.clk.Advance(2 * time.Hour)
+		}, proxy.ReasonPassExpired},
+		{"bound process gone", client.PassCreateRequest{BindPID: os.Getpid()}, func(t *testing.T, e *env) {
+			e.treeGone.Store(true)
+		}, proxy.ReasonPassInvalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.req.BindPID != 0 {
+				requireProcessBinding(t)
+			}
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(tc.req)
+			hits := e.up.hits.Load()
+			send := slowBody(t, e, tok)
+			tc.kill(t, e)
+			resp := send()
+			if resp.StatusCode != 401 || resp.Header.Get(proxy.ReasonHeader) != tc.reason {
+				t.Fatalf("got %d %q, want 401 %q", resp.StatusCode, resp.Header.Get(proxy.ReasonHeader), tc.reason)
+			}
+			if e.up.hits.Load() != hits {
+				t.Fatal("the request reached upstream")
+			}
+			if !auditHas(t, e, "request", func(f map[string]any) bool { return f["deny_reason"] == tc.reason }) {
+				t.Fatal("the refusal left no audit record")
+			}
+		})
+	}
+}
+
+// D1: a request waiting on an approval ends when its pass is revoked.
+func TestRevokeEndsRequestWaitingForApproval(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Limits.OnExceed = "approve" })
+	e.approver = blockingApprover{}
+	e.restart()
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{Limits: []client.PassLimit{{Window: "day", Amount: 1}}})
+	done := make(chan result, 1)
+	go func() { done <- e.anthropic(tok) }()
+	e.waitPending("over_limit")
+	ps, err := e.c.Passes(e.ctx())
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("passes %v %v", ps, err)
+	}
+	if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		wantReason(t, r, 401, proxy.ReasonPassInvalid)
+	case <-time.After(e.cfg.Approval.Timeout.Duration / 2):
+		t.Fatal("the request kept waiting after its pass was revoked")
+	}
+}
+
+// D2: lock, panic and revoke end running requests: one waiting for upstream's
+// answer gets the refusal, one mid-stream has its connection aborted so the
+// client cannot take the truncated body for a complete one.
+func TestStopEndsRunningRequests(t *testing.T) {
+	stops := []struct {
+		name   string
+		status int
+		reason string
+		stop   func(t *testing.T, e *env)
+	}{
+		{"lock", 423, proxy.ReasonLocked, func(t *testing.T, e *env) {
+			if _, err := e.c.Lock(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"panic", 423, proxy.ReasonLocked, func(t *testing.T, e *env) {
+			if _, err := e.c.Panic(e.ctx(), false); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"revoke", 401, proxy.ReasonPassInvalid, func(t *testing.T, e *env) {
+			ps, err := e.c.Passes(e.ctx())
+			if err != nil || len(ps) != 1 {
+				t.Fatalf("passes %v %v", ps, err)
+			}
+			if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	waitHeld := func(t *testing.T, e *env) {
+		t.Helper()
+		select {
+		case <-e.up.held:
+		case <-time.After(10 * time.Second):
+			t.Fatal("upstream did not get the request")
+		}
+	}
+	for _, tc := range stops {
+		t.Run(tc.name+" before the response", func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{})
+			done := make(chan result, 1)
+			go func() { done <- e.anthropic(tok, "X-Test-Hold", "1") }()
+			waitHeld(t, e)
+			tc.stop(t, e)
+			select {
+			case r := <-done:
+				wantReason(t, r, tc.status, tc.reason)
+			case <-time.After(3 * time.Second):
+				t.Fatal("the request kept running")
+			}
+		})
+		t.Run(tc.name+" mid-stream", func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{})
+			resp := e.stream(t, tok, 1)
+			defer resp.Body.Close()
+			waitHeld(t, e)
+			if _, err := resp.Body.Read(make([]byte, 1)); err != nil { // the proxy is relaying
+				t.Fatal(err)
+			}
+			errc := make(chan error, 1)
+			go func() {
+				_, err := io.ReadAll(resp.Body)
+				errc <- err
+			}()
+			tc.stop(t, e)
+			select {
+			case err := <-errc:
+				if err == nil {
+					t.Fatal("the stream ended cleanly; a client would take the truncated body as complete")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the stream kept running")
+			}
+		})
+	}
+}
+
+// resumeGate holds resume prompts until the test opens gate; other prompts
+// are approved.
+type resumeGate struct {
+	kind string // the prompts it holds ("" means resume)
+	gate chan struct{}
+	seen chan approval.Request
+}
+
+func (a *resumeGate) Method() string { return "test" }
+
+func (a *resumeGate) Approve(ctx context.Context, req approval.Request) (bool, error) {
+	if kind := cmp.Or(a.kind, "resume"); req.Kind != kind {
+		return true, nil
+	}
+	a.seen <- req
+	select {
+	case <-a.gate:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// D3: a resume prompt opened for a velocity trip and answered after lock and
+// unlock does not clear the audit_integrity trip it never showed.
+func TestStaleResumeApprovalChangesNothing(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	ra := &resumeGate{gate: make(chan struct{}), seen: make(chan approval.Request, 1)}
+	e.approver = ra
+	e.restart()
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.tripBySpend(tok)
+	errc := make(chan error, 1)
+	go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+	<-ra.seen
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files[0], []byte(strings.Replace(string(raw), "daemon_start", "daemon_stXrt", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.TripReason != TripAuditIntegrity {
+		t.Fatalf("second unlock: %v %s %s", err, st.State, st.TripReason)
+	}
+	close(ra.gate)
+	if err := <-errc; err == nil {
+		t.Fatal("the stale resume succeeded")
+	}
+	s := e.status()
+	arch, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "rejected-*"))
+	if s.State != client.StateTripped || s.TripReason != TripAuditIntegrity || len(arch) != 0 {
+		t.Fatalf("state %s (%s), %d archived logs", s.State, s.TripReason, len(arch))
+	}
+}
+
+// D16: a lock cannot run between a resume's approval and the end of its work,
+// which installs derived keys read before the lock wiped them.
+func TestLockWaitsForResumeToFinish(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.d.trip(TripAudit, "test")
+	e.appr.approve.Store(true)
+	held := func(when string) {
+		if e.d.unlockMu.TryLock() {
+			e.d.unlockMu.Unlock()
+			t.Errorf("a lock could run %s a resume", when)
+		}
+	}
+	e.d.testResumeApproved = func() { held("at the start of") }
+	locked := make(chan struct{})
+	e.d.testResumeDone = func() {
+		held("at the end of")
+		go func() { e.d.lock("test"); close(locked) }()
+		select {
+		case <-locked:
+			t.Error("lock ran in the middle of a resume")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if _, err := e.c.Resume(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("lock did not run after the resume")
+	}
+	var aerr error
+	e.d.withAudit(func(l *audit.Log) { aerr = l.Anchor() })
+	if s := e.status(); s.State != client.StateLocked || !errors.Is(aerr, audit.ErrNoAnchorKey) {
+		t.Fatalf("state %s, anchor: %v", s.State, aerr)
+	}
+}
+
+// D12: with kill_on_daemon_exit off, a run tree can outlive the daemon and is
+// unconfined after a restart, so a self-bound run pass always needs a step-up.
+func TestRunPassStepUpWhenTreesCanOutliveTheDaemon(t *testing.T) {
+	for _, tc := range []struct {
+		kill   bool
+		stepUp bool
+	}{{true, false}, {false, true}} {
+		e := newEnv(t, func(c *config.Config) { c.Run.KillOnDaemonExit = tc.kill })
+		e.unlock()
+		e.addKeys()
+		e.appr.strictSetup.Store(true)
+		_, err := e.c.CreatePass(e.ctx(), client.PassCreateRequest{Name: "agent", Kind: pass.KindRun,
+			Providers: []string{"anthropic"}, BindPID: outsiderPID})
+		if tc.stepUp && !isAPI(err, 403, client.CodeStepUpDenied) {
+			t.Fatalf("kill_on_daemon_exit=%v: %v, want a step-up", tc.kill, err)
+		}
+		if !tc.stepUp && err != nil {
+			t.Fatalf("kill_on_daemon_exit=%v: %v", tc.kill, err)
+		}
+	}
+}
+
+// D6: a trip with nothing left to re-derive it from does not end with a lock
+// and unlock or a restart: only a resume ends it, and then it stays ended.
+func TestTripSurvivesLockAndRestartUntilResume(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.d.trip(TripAudit, "a security audit record (x) was rejected")
+	calls := e.appr.calls.Load()
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	unlockState := func(what string) client.Status {
+		t.Helper()
+		st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		return st
+	}
+	if st := unlockState("lock"); st.State != client.StateTripped || st.TripReason != TripAudit {
+		t.Fatalf("after lock and unlock: %s (%s)", st.State, st.TripReason)
+	}
+	e.restart()
+	if st := unlockState("restart"); st.State != client.StateTripped || st.TripReason != TripAudit {
+		t.Fatalf("after restart and unlock: %s (%s)", st.State, st.TripReason)
+	}
+	if e.appr.calls.Load() != calls {
+		t.Fatal("an approval was asked for without a resume")
+	}
+	e.appr.approve.Store(true)
+	if st, err := e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked || st.TripReason != "" {
+		t.Fatalf("resume: %v %s (%s)", err, st.State, st.TripReason)
+	}
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if st := unlockState("after resume"); st.State != client.StateUnlocked || st.TripReason != "" {
+		t.Fatalf("after resume, lock and unlock: %s (%s)", st.State, st.TripReason)
+	}
+	e.restart()
+	e.unlock()
+}
+
+// D13: an approved tripwire trip stays approved across a restart inside the
+// tripwire window.
+func TestResumedTripwireStaysResumedAfterRestart(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.tripBySpend(tok)
+	e.appr.approve.Store(true)
+	if _, err := e.c.Resume(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(time.Second)
+	e.restart()
+	e.unlock()
+	wantReason(t, e.anthropic(tok), 200, "")
+}
+
+// D11: a revocation that could not be saved is reported as a failure, and
+// retrying it saves it, so the pass does not come back after a restart.
+func TestRevokeReportsFailedSaveAndRetrySticks(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	ps, err := e.c.Passes(e.ctx())
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("passes %v %v", ps, err)
+	}
+	store := filepath.Join(e.dir, PassesFile)
+	if err := os.Remove(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(store, 0o700); err != nil { // the rename onto it fails
+		t.Fatal(err)
+	}
+	if err := e.c.RevokePass(e.ctx(), ps[0].ID); err == nil {
+		t.Fatal("a revocation that was not saved was reported as done")
+	}
+	wantReason(t, e.anthropic(tok), 401, proxy.ReasonPassInvalid) // effective in memory all the same
+	if err := os.Remove(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.c.RevokePass(e.ctx(), ps[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	e.restart()
+	e.unlock()
+	wantReason(t, e.anthropic(tok), 401, proxy.ReasonPassInvalid)
+}
+
+// D14: the vault records the audit log's head, so a log deleted or cut back
+// while the daemon is down trips the next unlock, like the ledger.
+func TestAuditLogCutBackTrips(t *testing.T) {
+	for name, cut := range map[string]func(t *testing.T, files []string){
+		"all files removed": func(t *testing.T, files []string) {
+			for _, f := range files {
+				if err := os.Remove(f); err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+		"tail cut": func(t *testing.T, files []string) {
+			last := files[len(files)-1]
+			raw, err := os.ReadFile(last)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ls := strings.SplitAfter(strings.TrimSuffix(string(raw), "\n"), "\n")
+			if err := os.WriteFile(last, []byte(strings.Join(ls[:len(ls)-3], "")), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"chain rebuilt longer": func(t *testing.T, files []string) {
+			for _, f := range files {
+				if err := os.Remove(f); err != nil {
+					t.Fatal(err)
+				}
+			}
+			l, err := audit.Open(filepath.Dir(files[0]), newFakeClock())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 200 {
+				if err := l.Append("note", nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.stop()
+			files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
+			cut(t, files)
+			e.start()
+			wantTrip := func(what string) {
+				t.Helper()
+				st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+				if err != nil || st.State != client.StateTripped || st.TripReason != TripAuditIntegrity {
+					t.Fatalf("%s: %v: %s (%s)", what, err, st.State, st.TripReason)
+				}
+				if v, err := e.c.AuditVerify(e.ctx()); err != nil || v.OK {
+					t.Fatalf("%s: audit verify: %v %+v", what, err, v)
+				}
+			}
+			wantTrip("first unlock")
+			// Nothing but a resume ends it: not a lock, not a restart.
+			if _, err := e.c.Lock(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+			wantTrip("after lock")
+			e.restart()
+			wantTrip("after restart")
+			e.appr.approve.Store(true)
+			if _, err := e.c.Resume(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+			e.restart()
+			e.unlock() // the new chain's head is recorded
+		})
+	}
+}
+
+// D15: with screen_lock = "lock", unlocking under a locked screen ends Locked,
+// not Away, and says so.
+func TestUnlockUnderLockedScreenStaysLocked(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Presence.ScreenLock = "lock" })
+	e.pres.set(0, true)
+	e.d.stepPresence()
+	if _, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); !isAPI(err, 409, client.CodeConflict) {
+		t.Fatalf("unlock: %v", err)
+	}
+	if s := e.status(); s.State != client.StateLocked || s.Vault.Unlocked {
+		t.Fatalf("state %s, vault unlocked %v", s.State, s.Vault.Unlocked)
+	}
+	// It never served in between.
+	if auditHas(t, e, "unlock", func(f map[string]any) bool { return f["state"] == "away" || f["state"] == "unlocked" }) {
+		t.Fatal("the unlock passed through a serving state")
+	}
+	// The screen is unlocked but the monitor has not polled yet: no false refusal.
+	e.pres.set(0, false)
+	e.unlock()
+}
+
+// copyDataDir is what a daemon killed now leaves on disk.
+func copyDataDir(t *testing.T, dir string) string {
+	t.Helper()
+	kept := t.TempDir()
+	root := os.DirFS(dir)
+	err := fs.WalkDir(root, ".", func(p string, ent fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case ent.IsDir():
+			return os.MkdirAll(filepath.Join(kept, p), 0o700)
+		case p == InstanceLock:
+			return nil // held open by the daemon, and of no use to the next one
+		}
+		b, err := fs.ReadFile(root, p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(kept, p), b, 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kept
+}
+
+// D8: a reservation left by a daemon that died is charged at the next unlock
+// (the unlock is the first moment a record can be authenticated).
+func TestInFlightOfDeadDaemonChargedAtUnlock(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	if _, err := e.d.ledger.Reserve(nil, 777, budget.Meta{RequestID: "req_dead", Model: "claude-sonnet-4-5"}); err != nil {
+		t.Fatal(err)
+	}
+	kept := copyDataDir(t, e.dir)
+	e.stop()
+	e.dir = kept
+	e.start()
+	e.unlock() // fatals unless Unlocked: the charge verifies
+	if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled != 777 {
+		t.Fatalf("settled %d, want 777", settled)
+	}
+	e.restart()
+	e.unlock()
+	if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled != 777 {
+		t.Fatalf("after a restart: settled %d, want 777", settled)
+	}
+}
+
+// D9: a stream that keeps delivering past InFlightMaxAge keeps its reservation
+// and concurrency slot and is charged what it cost.
+func TestLongStreamKeepsItsReservation(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	resp := e.stream(t, tok, 2)
+	defer resp.Body.Close()
+	buf := make([]byte, 1<<16)
+	waitChunk := func() {
+		t.Helper()
+		select {
+		case <-e.up.held:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no chunk from upstream")
+		}
+		if _, err := resp.Body.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitChunk()
+	e.clk.Advance(InFlightMaxAge * 2 / 3)
+	e.up.step <- struct{}{}
+	waitChunk()
+	e.clk.Advance(InFlightMaxAge * 2 / 3)
+	e.d.housekeep()
+	if s := e.status(); len(s.InFlight) != 1 {
+		t.Fatalf("in flight %d: the running stream's reservation was settled", len(s.InFlight))
+	}
+	e.up.step <- struct{}{}
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("rest of the stream (%d bytes): %v", len(rest), err)
+	}
+	want := e.expectedCost("anthropic", "/v1/messages", anthropicStreamReq, anthropicSSE)
+	for range 200 {
+		if settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); settled == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay)
+	t.Fatalf("settled %d, want the metered %d", settled, want)
+}
+
+// D10: a request the lock already charged and that then never left records that
+// charge in its audit record, not cost 0.
+func TestAuditAgreesWithLockChargeOnUnsentRequest(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	res, err := e.d.ledger.Reserve(nil, 500, budget.Meta{RequestID: "req_unsent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.d.ledger.ExpireInFlight(-1); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := provider.Get("anthropic")
+	tk := &ticket{d: e.d, a: proxy.Admission{RequestID: "req_unsent", Provider: p}, res: res}
+	tk.Finish(proxy.Outcome{Status: 423})
+	if !auditHas(t, e, "request", func(f map[string]any) bool {
+		return f["request_id"] == "req_unsent" && f["cost_micros"] == float64(500) && f["estimated"] == true
+	}) {
+		t.Fatal("the audit record does not show the 500 the ledger charged")
+	}
+}
+
+func tamperFirstAmount(t *testing.T, dir string) {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(dir, LedgerDir, "ledger-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`"amount_micros":(\d+)`)
+	loc := re.FindSubmatchIndex(raw)
+	n, _ := strconv.Atoi(string(raw[loc[2]:loc[3]]))
+	out := append(append(append([]byte{}, raw[:loc[2]]...), strconv.Itoa(n-1)...), raw[loc[3]:]...)
+	if err := os.WriteFile(files[0], out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// acceptLedger unlocks into an integrity trip, resumes it, and checks the
+// acceptance sticks: lock and unlock, restart and unlock, and a request.
+func acceptLedger(t *testing.T, e *env, tok string) {
+	t.Helper()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.State != client.StateTripped || st.TripReason != TripIntegrity {
+		t.Fatalf("unlock: %v %s (%s)", err, st.State, st.TripReason)
+	}
+	e.appr.approve.Store(true)
+	if st, err = e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked {
+		t.Fatalf("resume: %v %s", err, st.State)
+	}
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.unlock() // fatals unless Unlocked
+	e.restart()
+	e.unlock()
+	wantReason(t, e.anthropic(tok), 200, "")
+	e.restart()
+	e.unlock()
+}
+
+// D4: accepting a failed ledger check sticks, keeps the spend, keeps the
+// original where the owner can read it, and a new change is still caught.
+func TestAcceptedLedgerStaysAccepted(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	for range 2 {
+		wantReason(t, e.anthropic(tok), 200, "")
+	}
+	e.stop()
+	tamperFirstAmount(t, e.dir)
+	e.start()
+	before, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay)
+	acceptLedger(t, e, tok)
+	if after, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); after <= before {
+		t.Fatalf("spend %d, had %d before accepting and one more request", after, before)
+	}
+	arch, _ := filepath.Glob(filepath.Join(e.dir, LedgerDir, "rejected-*", "ledger-*.jsonl"))
+	if len(arch) != 1 {
+		t.Fatalf("rejected copies: %v", arch)
+	}
+	e.stop()
+	tamperFirstAmount(t, e.dir)
+	e.start()
+	if st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil || st.TripReason != TripIntegrity {
+		t.Fatalf("a new change after accepting: %v %s (%s)", err, st.State, st.TripReason)
+	}
+}
+
+// D5: a clock stepped back over a month end does not break the chain, and the
+// spend written meanwhile still counts after a restart.
+func TestClockBackOverMonthEndKeepsChain(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 200, "")
+	if err := e.d.ledger.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(-15 * 24 * time.Hour) // 11 October to 26 September
+	wantReason(t, e.anthropic(tok), 200, "")
+	settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowMonth)
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.unlock() // fatals unless Unlocked
+	e.restart()
+	e.unlock()
+	if got, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowMonth); got != settled {
+		t.Fatalf("after a restart the month shows %d, it was %d", got, settled)
+	}
+}
+
+// D7: a damaged line does not stop the daemon starting: it trips at unlock and
+// the owner has the documented way out.
+func TestCorruptLedgerLineTripsInsteadOfStoppingStart(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 200, "")
+	e.stop()
+	files, _ := filepath.Glob(filepath.Join(e.dir, LedgerDir, "ledger-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files[0], append([]byte("garbage\n"), raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	acceptLedger(t, e, tok)
+}
+
+// D18: an unreadable daemon-state entry is left alone until the owner accepts
+// replacing it, and what replaces it keeps the first-key exemption closed and
+// a config check in force.
+func TestUnreadableDaemonStateIsNotOverwritten(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	e.stop()
+	garbage := []byte(`{"version":99}`)
+	v, err := vault.Open(filepath.Join(e.dir, VaultFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.UnlockPassphrase(testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+	id, ok := stateEntryID(v)
+	if !ok {
+		t.Fatal("no daemon-state entry")
+	}
+	if err := v.ReplaceEntrySecret(id, garbage); err != nil {
+		t.Fatal(err)
+	}
+	v.Lock()
+	e.start()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.TripReason != TripIntegrity {
+		t.Fatalf("unlock: %v %s (%s)", err, st.State, st.TripReason)
+	}
+	if err := e.withOwner(func(ctx context.Context) error {
+		_, err := e.c.AddKey(ctx, "gemini", "main", []byte("AIza"+strings.Repeat("x", 35)))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	if err := e.d.vault.WithSecret(id, func(b []byte) error { raw = append(raw, b...); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(garbage) {
+		t.Fatalf("a key change overwrote the unreadable entry with %d bytes", len(raw))
+	}
+	e.appr.approve.Store(true)
+	if st, err = e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked {
+		t.Fatalf("resume: %v %s", err, st.State)
+	}
+	if vs := e.d.vaultStateSnapshot(); vs == nil || !vs.KeysEverAdded {
+		t.Fatalf("after resume: %+v", vs)
+	}
+	e.stop()
+	e.cfg.Limits.Pass.Concurrency++
+	e.start()
+	if st, err = e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil || st.TripReason != TripConfig {
+		t.Fatalf("a changed config after the replacement: %v %s (%s)", err, st.State, st.TripReason)
+	}
+}
+
+// D19: the start of a re-key is on disk before the vault commits, so a crash
+// between commit and outcome leaves evidence that it may have happened.
+func TestRekeyStartIsRecordedBeforeCommit(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	err := e.d.rekey(e.ctx(), "rotate_recovery", func() error {
+		files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
+		for _, f := range files {
+			if raw, err := os.ReadFile(f); err == nil && strings.Contains(string(raw), `"rekey_start"`) {
+				return nil
+			}
+		}
+		return errors.New("no rekey_start record on disk at commit time")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// D17: the recovered-from-.prev warning survives the first unlock's own writes.
+func TestRecoveredFromPrevOutlivesUnlock(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.stop()
+	if err := os.Rename(filepath.Join(e.dir, VaultFile), filepath.Join(e.dir, "vault.prev")); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Vault.RecoveredFromPrev || len(st.Warnings) == 0 {
+		t.Fatalf("after unlock: recovered=%v warnings=%v", st.Vault.RecoveredFromPrev, st.Warnings)
+	}
+	if !auditHas(t, e, "unlock", func(f map[string]any) bool { return f["recovered_from_prev"] == true }) {
+		t.Fatal("the unlock record does not say so")
+	}
+}
+
+// D13: a state nothing expects serves nothing.
+func TestUnknownStateServesNothing(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.d.mu.Lock()
+	e.d.st.state = "unknown"
+	e.d.mu.Unlock()
+	defer func() {
+		e.d.mu.Lock()
+		e.d.st.state = StateUnlocked
+		e.d.mu.Unlock()
+	}()
+	wantReason(t, e.anthropic(tok), 423, proxy.ReasonLocked)
+	if _, err := e.d.requireServing(); err == nil {
+		t.Fatal("requireServing let an unknown state through")
+	}
+	p, _ := provider.Get("anthropic")
+	if _, err := e.d.reserve(proxy.Admission{Provider: p}, pass.Pass{ID: "x"}, 1, nil); err == nil {
+		t.Fatal("reserve let an unknown state through")
+	}
+}
+
+// D13: a lock during an away approval is reported as locked, not as tripped.
+func TestAwayLockedDuringApprovalSaysLocked(t *testing.T) {
+	e := newEnv(t, nil)
+	ra := &resumeGate{kind: "away_grant", gate: make(chan struct{}), seen: make(chan approval.Request, 1)}
+	e.approver = ra
+	e.restart()
+	e.unlock()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := e.c.Away(e.ctx(), client.AwayRequest{Budget: money.Dollar, For: time.Hour})
+		errc <- err
+	}()
+	<-ra.seen
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	close(ra.gate)
+	if err := <-errc; !isAPI(err, 423, client.CodeLocked) {
+		t.Fatalf("away after a lock: %v", err)
+	}
+}
+
+// D13: removing a slot reports a vault.prev it could not scrub, like rotation.
+func TestRemoveSlotReportsPrevNotScrubbed(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.appr.approve.Store(true)
+	st := e.status()
+	if len(st.Vault.Slots) < 2 {
+		t.Fatalf("slots: %+v", st.Vault.Slots)
+	}
+	prev := filepath.Join(e.dir, "vault.prev")
+	os.Remove(prev)
+	if err := os.MkdirAll(filepath.Join(prev, "keep"), 0o700); err != nil { // cannot be replaced or removed
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(prev)
+	resp, err := e.c.RemoveSlot(e.ctx(), st.Vault.Slots[1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Warning == "" {
+		t.Fatal("no warning about vault.prev")
+	}
+}
+
+// Review of PR 3, item 3: a forged journal line charges nothing and is noticed.
+func TestForgedJournalLineChargesNothing(t *testing.T) {
+	for name, amount := range map[string]int64{"negative": -5_000_000, "positive": 123_456_789} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, nil)
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{})
+			wantReason(t, e.anthropic(tok), 200, "")
+			settled, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay)
+			e.stop()
+			line := fmt.Sprintf(`{"id":"forged","scopes":["global"],"amount_micros":%d,"meta":{"PassID":"p_x"},"created":"2026-10-11T12:00:00Z","mac":"%s"}`+"\n",
+				amount, strings.Repeat("ab", 32))
+			f, err := os.OpenFile(filepath.Join(e.dir, LedgerDir, "inflight.jsonl"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.WriteString(line)
+			f.Close()
+			e.start()
+			st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+			if err != nil || st.State != client.StateTripped || st.TripReason != TripIntegrity {
+				t.Fatalf("unlock: %v %s (%s)", err, st.State, st.TripReason)
+			}
+			if got, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); got != settled {
+				t.Fatalf("spend %d after the forged line, was %d", got, settled)
+			}
+			// Noticed once is not accepted: only a resume ends it.
+			if _, err := e.c.Lock(e.ctx()); err != nil {
+				t.Fatal(err)
+			}
+			st, err = e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+			if err != nil || st.State != client.StateTripped || st.TripReason != TripIntegrity {
+				t.Fatalf("unlock again: %v %s (%s)", err, st.State, st.TripReason)
+			}
+			e.appr.approve.Store(true)
+			if st, err = e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked {
+				t.Fatalf("resume: %v %s", err, st.State)
+			}
+			e.restart()
+			e.unlock() // the line is gone: fatals unless Unlocked
+			if got, _ := e.d.ledger.Spent(budget.ScopeGlobal, budget.WindowDay); got != settled {
+				t.Fatalf("spend %d after the resume, was %d", got, settled)
+			}
+		})
+	}
+}
+
+// Review of PR 3, item 5: accepting a failed ledger check says what is accepted,
+// in the prompt and in the resume record.
+func TestLedgerAcceptShowsWhatIsAccepted(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	wantReason(t, e.anthropic(tok), 200, "")
+	wantReason(t, e.anthropic(tok), 200, "")
+	e.stop()
+	tamperFirstAmount(t, e.dir)
+	files, _ := filepath.Glob(filepath.Join(e.dir, LedgerDir, "ledger-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files[0], append([]byte("garbage\n"), raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.start()
+	if _, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+	if s := e.status(); len(s.Warnings) == 0 {
+		t.Fatal("status does not describe the failed check")
+	}
+	e.appr.approve.Store(true)
+	if _, err := e.c.Resume(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if !auditHas(t, e, "resume", func(f map[string]any) bool {
+		return f["ledger_dropped"] == float64(1) && f["ledger_mac_failures"] == float64(1) &&
+			f["ledger_found_micros"].(float64) < f["ledger_recorded_micros"].(float64)
+	}) {
+		t.Fatal("the resume record does not say what was accepted")
+	}
+	var note string
+	for _, r := range e.appr.requests() {
+		if r.Kind == "resume" {
+			note = r.Note
+		}
+	}
+	if !strings.Contains(note, "1") {
+		t.Fatalf("the prompt does not show the counts: %q", note)
+	}
+	// The note is cut to the room the prompt has left: with the longest detail
+	// and large amounts, the totals must still show.
+	fail := &ledgerFailure{Corrupt: 12, MACFailures: 340, CheckpointSettled: 1300_654321, CheckpointFound: 1200_123456}
+	prompt := approval.PromptText(approval.Request{Kind: "resume", Title: "Resume keyleash",
+		Detail: strings.Repeat("x", resumeDetailRunes), Note: fail.summary()})
+	for _, m := range []money.Micros{fail.CheckpointSettled, fail.CheckpointFound} {
+		if !strings.Contains(prompt, m.String()) {
+			t.Fatalf("%s missing from the prompt: %q", m, prompt)
+		}
+	}
+}
+
+// Review of PR 3, item 6: a held trip under a method that cannot prompt ("deny",
+// or "hello" with Hello unavailable, as in the harness) has an exit, the vault
+// passphrase over the admin API.
+func TestHeldTripCanBeResumedUnderDeny(t *testing.T) {
+	for _, method := range []string{"deny", "hello"} {
+		t.Run(method, func(t *testing.T) {
+			e := newEnv(t, func(c *config.Config) { c.Approval.Method = method })
+			e.noApprover = true
+			e.restart()
+			e.unlock()
+			e.d.trip(TripAudit, "test")
+			errc := make(chan error, 1)
+			go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+			id := e.waitPending("resume")
+			if err := e.c.Decide(e.ctx(), id, client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-errc; err != nil {
+				t.Fatal(err)
+			}
+			if s := e.status(); s.State != client.StateUnlocked {
+				t.Fatalf("state %s (%s)", s.State, s.TripReason)
+			}
+		})
+	}
+}
+
+// Review of PR 3, item 7: an approval covers the trip its prompt showed, also
+// within one session.
+func TestSecondResumePromptDoesNotClearNewerTrip(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	e.approver = blockingApprover{}
+	e.restart()
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.tripBySpend(tok)
+	errc := make(chan error, 2)
+	var ids []string
+	for i := range 2 {
+		go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+		for j := 0; len(ids) <= i; j++ {
+			list, _ := e.c.Approvals(e.ctx())
+			for _, ap := range list {
+				if ap.Kind == "resume" && !slices.Contains(ids, ap.ID) {
+					ids = append(ids, ap.ID)
+				}
+			}
+			if j > 500 {
+				t.Fatal("no prompt")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := e.c.Decide(e.ctx(), ids[0], client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("first resume: %v", err)
+	}
+	e.d.trip(TripAudit, "newer")
+	if err := e.c.Decide(e.ctx(), ids[1], client.DecideRequest{Approved: true, Secret: ownerSecret()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errc; !isAPI(err, 409, client.CodeConflict) {
+		t.Fatalf("second resume: %v", err)
+	}
+	if s := e.status(); s.State != client.StateTripped || s.TripReason != TripAudit {
+		t.Fatalf("state %s (%s)", s.State, s.TripReason)
+	}
+}
+
+// Mutation gap: the pass is checked again after each kind of approval wait.
+func TestPassExpiringDuringApprovalSpendsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		kind, body string
+		limits     []client.PassLimit
+	}{
+		{"unknown_model", `{"model":"claude-from-the-future","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, nil},
+		{"over_limit", anthropicReq, []client.PassLimit{{Window: "day", Amount: 1}}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			e := newEnv(t, func(c *config.Config) { c.Limits.OnExceed = "approve" })
+			ra := &resumeGate{kind: tc.kind, gate: make(chan struct{}), seen: make(chan approval.Request, 1)}
+			e.approver = ra
+			e.restart()
+			e.unlock()
+			e.addKeys()
+			tok := e.newPass(client.PassCreateRequest{TTL: time.Hour, Limits: tc.limits})
+			hits := e.up.hits.Load()
+			done := make(chan result, 1)
+			go func() { done <- e.post("anthropic", "/v1/messages", tok, tc.body) }()
+			<-ra.seen
+			e.clk.Advance(2 * time.Hour)
+			close(ra.gate)
+			wantReason(t, <-done, 401, proxy.ReasonPassExpired)
+			if e.up.hits.Load() != hits {
+				t.Fatal("the request reached upstream")
+			}
+		})
+	}
+}
+
+// Mutation gap: a trip is on disk at once, so a killed daemon does not forget it.
+func TestTripSurvivesKilledDaemon(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.d.trip(TripAudit, "test")
+	// What a kill leaves: the files as they are now, no shutdown save.
+	kept := copyDataDir(t, e.dir)
+	e.stop()
+	e.dir = kept
+	e.start()
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.State != client.StateTripped || st.TripReason != TripAudit {
+		t.Fatalf("after a kill: %v %s (%s)", err, st.State, st.TripReason)
+	}
+}
+
+// Mutation gap: when the sweep revokes the pass of an exited process it also
+// ends that pass's running requests.
+func TestSweepEndsRequestsOfExitedProcess(t *testing.T) {
+	requireProcessBinding(t)
+	e := newEnv(t, nil)
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{BindPID: os.Getpid()})
+	done := make(chan result, 1)
+	go func() { done <- e.anthropic(tok, "X-Test-Hold", "1") }()
+	select {
+	case <-e.up.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("upstream did not get the request")
+	}
+	e.treeGone.Store(true)
+	e.d.sweepRunPasses()
+	select {
+	case r := <-done:
+		wantReason(t, r, 401, proxy.ReasonPassInvalid)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the request kept running")
 	}
 }

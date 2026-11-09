@@ -178,8 +178,9 @@ that its processes cannot leave: a process the agent starts stays confined
 (and can use the run pass) even if its parent exits or it detaches, and it
 stays confined after the run ends until it exits. When the daemon exits,
 the run's processes are ended too (`[run] kill_on_daemon_exit = true`; set
-it to `false` to let them keep running without keyleash). Restarting the
-daemon ends earlier `keyleash run` passes. On Linux, macOS and the BSDs
+it to `false` to let them keep running without keyleash: they are then
+unconfined once the daemon restarts, so with that setting every `keyleash run`
+asks for a step-up). Restarting the daemon ends earlier `keyleash run` passes. On Linux, macOS and the BSDs
 keyleash cannot identify processes yet: passes there are not bound to a
 process, `keyleash run` passes cannot be created, and no caller is treated
 as confined.
@@ -313,14 +314,21 @@ override file it names) changed, or a security record could not be written
 to the audit log, keyleash is **tripped**: new requests get `423 tripped`
 and in-flight ones finish. Check `keyleash status` and `keyleash audit
 verify`, then leave it with `keyleash resume` (step-up). Resuming after a
-failed audit check moves the rejected log to `audit/rejected-<time>/` and
-starts a new chain. Resuming after `passes.json` changed (`keyleash status`
+failed ledger check accepts the ledger as it stands (a copy stays in
+`ledger/rejected-<time>/`, and a line too damaged to read no longer counts).
+Resuming after a failed audit check moves the rejected log to
+`audit/rejected-<time>/` and starts a new chain. Resuming after `passes.json` changed (`keyleash status`
 lists the added, removed and changed passes) revokes every added or changed
 pass. After a config change, an integrity failure or an edited
 `passes.json`, the resume is approved with the approval method of the
 config you last accepted, never with the one the changed file names: if
 that is `console` or `deny`, or Windows Hello is unavailable, `keyleash
-resume` asks for your passphrase or recovery code.
+resume` asks for your passphrase or recovery code. Any other trip is approved
+with the configured method, except that `deny`, or `hello` with Hello
+unavailable, asks for the same secret, so a trip always has a way out. Accepting a failed ledger check shows what it found:
+the total the files hold against the one the vault recorded, then lines dropped,
+bad MACs, chain breaks and forged in-flight lines. A prompt has limited room, so
+it can cut the counts; `keyleash status` and the audit `resume` record keep them.
 
 **Step-up approvals prove you are there.** Every program running as you can
 reach keyleash's admin channel, including the agents it governs, so being
@@ -348,7 +356,8 @@ and presence keys first; `keyleash status` lists them all.
   same.
 - `"console"`: the daemon's terminal asks `Approve? [y/N]`; the passphrase
   route works too.
-- `"deny"`: every step-up is refused (servers, CI).
+- `"deny"`: every step-up is refused (servers, CI), except that `keyleash
+  resume` can be approved with your passphrase or recovery code.
 
 With every method except `deny`, `keyleash approvals approve <id>` approves
 with your passphrase or recovery code (`--stdin` reads it from standard
@@ -365,7 +374,10 @@ grant for later requests; grants are capped at `approval.grant_max_multiple`
 `keyleash approvals --json`.
 
 **Panic.** `keyleash panic` locks immediately and revokes every pass. Any
-program may lock or panic, including one inside `keyleash run`. Rotate
+program may lock or panic, including one inside `keyleash run`. A lock of any
+kind stops requests already running: their streams are cut off, and each is
+charged its reserved amount. `keyleash pass revoke` does the same for that
+pass's requests. The provider may still bill for work it had started. Rotate
 the keys at the provider if you think one leaked; automatic upstream
 revocation is not implemented yet.
 
@@ -391,9 +403,10 @@ before the rotation still open with the old code and show the keys as they
 were then; rotate provider keys if the old code may have leaked.
 Interrupting the command while it waits for approval cancels the rotation.
 If the connection is lost while the rotation is being committed, the
-command checks the audit log and tells you whether it happened; if it did,
-the old code no longer works and the new one is lost, so run `keyleash
-recovery rotate` again.
+command checks the audit log and tells you whether it happened; if it did, or
+if only its start was recorded (`rekey_start` with no `rekey` after it, as when
+the daemon died), treat the old code as gone and the new one as lost, and run
+`keyleash recovery rotate` again.
 
 **Audit.** Every decision is in a hash-chained log. `keyleash audit tail`
 shows recent records (passes by id, keys by fingerprint, never secrets);
@@ -453,5 +466,5 @@ how old the pricing table is. Start there.
 | `pass_store` trip / `pass store change: …` | `passes.json` no longer matches what keyleash recorded in the vault (edited, replaced or rolled back). `keyleash resume` revokes the added and changed passes; create new ones. |
 | Restoring a backup of the whole data directory | Restoring vault, ledger, audit log and passes.json together to an earlier point cannot be told apart from a deliberate restore: spend recorded since the backup is forgotten and passes revoked since then come back. Keep backups where agents cannot write, and revoke passes after a restore (`keyleash panic`, then unlock). |
 | `presence detection is degraded` | Low-level input hooks could not be installed; idle time falls back to `GetLastInputInfo`, which also counts injected input. |
-| `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied. Set `approval.method = "passphrase"` in config. |
+| `approval.method is hello but Windows Hello is unavailable` | Every step-up is denied, except that `keyleash resume` takes your passphrase or recovery code. Set `approval.method = "passphrase"` in config. |
 | Forgot the passphrase | `keyleash unlock --recovery` with the recovery code. |

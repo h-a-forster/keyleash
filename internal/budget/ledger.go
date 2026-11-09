@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/money"
@@ -59,11 +61,14 @@ type Ledger struct {
 	onTrip        func(money.Micros)
 	trip          *agg
 	tripped       bool
+	tripFloor     time.Time // charges up to here do not count towards the tripwire
 
 	closed     bool
 	persistErr error
 	w          *writer
-	tornAtOpen int // torn final lines cut by Open; read-only afterwards
+	journal    *journal
+	orphans    []journalLine // holds of an earlier process, until RecoverInFlight
+	tornAtOpen int           // torn final lines cut by Open; read-only afterwards
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -78,8 +83,10 @@ type Reservation struct {
 	scopes  []string
 	meta    Meta
 	amount  money.Micros
-	created time.Time // set under l.mu when the reservation is taken
-	done    bool      // guarded by l.mu
+	created time.Time    // set under l.mu when the reservation is taken
+	done    bool         // guarded by l.mu
+	touched atomic.Int64 // UnixNano of the request's last sign of life
+	hold    journalLine  // its journal line, kept for compaction
 }
 
 // ID is the reservation's record id (Meta.RequestID or a random id).
@@ -88,11 +95,18 @@ func (r *Reservation) ID() string { return r.id }
 // Amount is the reserved amount.
 func (r *Reservation) Amount() money.Micros { return r.amount }
 
+// Touch notes that the request is still making progress: ExpireInFlight with a
+// maximum age measures from here.
+func (r *Reservation) Touch() { r.touched.Store(r.l.clock.Now().UnixNano()) }
+
 // Open loads the ledger in opts.Dir, replaying the current month's file (and
 // the last day of the previous month's) to rebuild windows. A truncated final
 // line (crash mid-write) is discarded and cut from the file (and counted by
-// VerifyIntegrity); any other corruption is an error. Open does not verify
-// the hash chain: call VerifyIntegrity once the MAC key is available.
+// VerifyIntegrity). A corrupt line is skipped: its amount is unknown, so the
+// caller must not spend until VerifyIntegrity has reported it. Open does not
+// verify the hash chain: call VerifyIntegrity once the MAC key is available.
+// Reservations a previous process left in flight (see journal.go) wait for
+// RecoverInFlight.
 func Open(opts Options) (*Ledger, error) {
 	if opts.Dir == "" {
 		return nil, fmt.Errorf("%w: ledger dir is required", ErrInvalid)
@@ -127,6 +141,11 @@ func Open(opts Options) (*Ledger, error) {
 	if err != nil {
 		return nil, err
 	}
+	j, holds, err := openJournal(opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	l.journal, l.orphans = j, holds
 	l.hist = hist
 	l.tornAtOpen = torn + torn2
 	l.w = newWriter(opts.Dir, head)
@@ -208,6 +227,9 @@ func (l *Ledger) SetTripwire(window time.Duration, threshold money.Micros, onTri
 func (l *Ledger) newTripAgg(now time.Time) *agg {
 	a := &agg{matchAll: true, dur: l.tripDur}
 	for _, c := range l.hist[l.histHead:] {
+		if !c.t.After(l.tripFloor) {
+			continue
+		}
 		a.evs = append(a.evs, event{t: c.t, amount: c.amount})
 		a.sum = addSat(a.sum, c.amount)
 	}
@@ -314,6 +336,15 @@ func (l *Ledger) ReserveWith(scopes []string, amount money.Micros, meta Meta, op
 			}
 		}
 		r.created = now
+		r.touched.Store(now.UnixNano())
+		// On disk before the request can leave (journal.go).
+		r.hold = journalLine{ID: r.id, Scopes: r.scopes, Amount: amount, Meta: &r.meta, Created: now.UTC()}
+		if len(l.w.macKey) > 0 {
+			r.hold.MAC = journalMAC(l.w.macKey, r.hold)
+		}
+		if err := l.journal.write(r.hold); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersist, err)
+		}
 		l.active[r] = struct{}{}
 		return nil
 	}()
@@ -410,17 +441,20 @@ func (r *Reservation) Settle(actual money.Micros, estimated bool) error {
 }
 
 // Release drops the reservation without charging (the request never reached
-// upstream) and frees its concurrency slots. It is a no-op after Settle or a
-// previous Release.
-func (r *Reservation) Release() {
+// upstream) and frees its concurrency slots. After Settle or a previous Release
+// it does nothing and returns false: whatever was charged stays charged.
+func (r *Reservation) Release() bool {
 	l := r.l
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if r.done {
-		return
+		return false
 	}
 	r.done = true
 	delete(l.active, r)
+	// A failed write only means a later process charges this reservation.
+	_ = l.journal.write(journalLine{ID: r.id, Done: true})
+	return true
 }
 
 // pruneHistLocked drops charges older than both the current calendar month
@@ -514,6 +548,18 @@ func (l *Ledger) ResetTrip() {
 	}
 }
 
+// RestoreTripReset applies a ResetTrip made at time t by an earlier process:
+// the history replayed at Open counts towards the tripwire only after t. It
+// does not leave a tripped state.
+func (l *Ledger) RestoreTripReset(t time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.tripFloor = t
+	if l.trip != nil {
+		l.trip = l.newTripAgg(l.clock.Now())
+	}
+}
+
 // Flush writes and fsyncs all pending records.
 func (l *Ledger) Flush() error {
 	l.w.mu.Lock()
@@ -527,6 +573,9 @@ func (l *Ledger) flushWLocked() error {
 	batch := l.w.take()
 	l.mu.Unlock()
 	if len(batch) == 0 && !l.w.unsynced {
+		l.mu.Lock()
+		l.compactJournalLocked()
+		l.mu.Unlock()
 		return nil
 	}
 	n, err := l.w.writeLocked(batch)
@@ -543,8 +592,33 @@ func (l *Ledger) flushWLocked() error {
 	// on disk.
 	l.mu.Lock()
 	l.persistErr = nil
+	l.journalDoneLocked(batch)
+	l.compactJournalLocked()
 	l.mu.Unlock()
 	return nil
+}
+
+// compactJournalLocked rewrites an oversized journal to the holds still open. A
+// charge waiting to be written needs its hold, so that waits for a later flush.
+func (l *Ledger) compactJournalLocked() {
+	if len(l.w.pending) > 0 || !l.journal.oversized() {
+		return
+	}
+	holds := slices.Clone(l.orphans)
+	for r := range l.active {
+		holds = append(holds, r.hold)
+	}
+	l.journal.rewrite(holds)
+}
+
+// journalDoneLocked ends the holds of records now on disk. A failed write only
+// means a later process charges them once more.
+func (l *Ledger) journalDoneLocked(batch []line) {
+	done := make([]journalLine, 0, len(batch))
+	for _, ln := range batch {
+		done = append(done, journalLine{ID: ln.id, Done: true})
+	}
+	_ = l.journal.write(done...)
 }
 
 // SetMACKey makes every record enqueued from now on carry
@@ -590,17 +664,129 @@ func (l *Ledger) InFlight() []InFlightInfo {
 	return out
 }
 
-// ExpireInFlight settles every reservation older than maxAge at its reserved
-// amount, marked estimated (fail closed: the request may have reached
-// upstream). The holder's later Settle returns ErrAlreadySettled and its
-// actual cost is not recorded. It returns how many were expired; the error
-// is the first non-ErrAlreadySettled settle error (e.g. ErrClosed).
+// Recovered is what RecoverInFlight did.
+type Recovered struct {
+	Charged  int          // holds charged at their reserved amount
+	Amount   money.Micros // their total
+	Rejected int          // holds whose MAC did not verify: not charged, still in the journal
+}
+
+// RecoverInFlight deals with the holds an earlier process left in the journal.
+// One whose record is already in the ledger (the process died, or a flush failed,
+// after the record was written and before its done line) is ended: it is charged.
+// The others that authenticate under the MAC key are charged at their reserved
+// amount, marked estimated. One that does not is counted and charges nothing; it
+// stays until DropRejectedInFlight, so a caller treating it as tampering sees it
+// again until that is accepted. It needs the MAC key, and leaves every hold in
+// place if it cannot read the ledger.
+func (l *Ledger) RecoverInFlight() (Recovered, error) {
+	l.mu.Lock()
+	holds := l.orphans
+	key := slices.Clone(l.w.macKey)
+	l.mu.Unlock()
+	var rec Recovered
+	if len(holds) == 0 {
+		return rec, nil
+	}
+	if len(key) == 0 {
+		return rec, errors.New("budget: recovering in-flight reservations needs the MAC key")
+	}
+	seen, err := l.recordIDs()
+	if err != nil {
+		return rec, err
+	}
+	var first error
+	var rejected []journalLine
+	for _, h := range holds {
+		switch {
+		case !h.verified(key):
+			rec.Rejected++
+			rejected = append(rejected, h)
+			continue
+		case seen[h.ID]:
+		default:
+			seen[h.ID] = true // a copied line charges nothing more
+			r := &Reservation{l: l, id: h.ID, scopes: h.Scopes, amount: h.Amount, created: h.Created, hold: h}
+			if h.Meta != nil {
+				r.meta = *h.Meta
+			}
+			l.mu.Lock()
+			l.active[r] = struct{}{}
+			l.mu.Unlock()
+			if err := r.Settle(h.Amount, true); err != nil && first == nil {
+				first = err
+			}
+			rec.Charged++
+			rec.Amount = addSat(rec.Amount, h.Amount)
+			continue // its done line follows the record
+		}
+		l.mu.Lock()
+		_ = l.journal.write(journalLine{ID: h.ID, Done: true})
+		l.mu.Unlock()
+	}
+	l.mu.Lock()
+	l.orphans = rejected
+	l.mu.Unlock()
+	return rec, first
+}
+
+// DropRejectedInFlight ends the holds that do not authenticate: the owner has
+// seen them and accepted that they charge nothing. Genuine holds a failed
+// recovery left stay for the next one.
+func (l *Ledger) DropRejectedInFlight() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.w.macKey) == 0 {
+		return errors.New("budget: judging in-flight reservations needs the MAC key")
+	}
+	var keep, done []journalLine
+	for _, h := range l.orphans {
+		if h.verified(l.w.macKey) {
+			keep = append(keep, h)
+		} else {
+			done = append(done, journalLine{ID: h.ID, Done: true})
+		}
+	}
+	if err := l.journal.write(done...); err != nil {
+		return err
+	}
+	l.orphans = keep
+	return nil
+}
+
+// recordIDs returns the ids of the records in the ledger files.
+func (l *Ledger) recordIDs() (map[string]bool, error) {
+	l.w.mu.Lock()
+	defer l.w.mu.Unlock()
+	names, err := ledgerFiles(l.dir)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, name := range names {
+		ents, _, err := readFile(filepath.Join(l.dir, name))
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range ents {
+			seen[e.rec.ID] = true
+		}
+	}
+	return seen, nil
+}
+
+// ExpireInFlight settles every reservation with no sign of life (Touch, or being
+// taken) for longer than maxAge at its reserved amount, marked estimated (fail
+// closed: the request may have reached upstream). A negative maxAge takes them
+// all. The holder's later Settle returns ErrAlreadySettled and its actual cost
+// is not recorded. It returns how many were expired; the error is the first
+// non-ErrAlreadySettled settle error (e.g. ErrClosed).
 func (l *Ledger) ExpireInFlight(maxAge time.Duration) (int, error) {
 	l.mu.Lock()
 	now := l.clock.Now()
 	var stale []*Reservation
 	for r := range l.active {
-		if now.Sub(r.created) > maxAge {
+		if maxAge < 0 || now.Sub(time.Unix(0, r.touched.Load())) > maxAge {
 			stale = append(stale, r)
 		}
 	}
@@ -638,8 +824,9 @@ func (l *Ledger) Close() error {
 	l.mu.Lock()
 	clear(l.w.macKey)
 	l.w.macKey = nil
+	jerr := l.journal.close()
 	l.mu.Unlock()
-	return errors.Join(err, cerr)
+	return errors.Join(err, cerr, jerr)
 }
 
 func newID() string {

@@ -23,6 +23,8 @@ import (
 var (
 	ErrResponseHeaderTimeout = errors.New("proxy: upstream response header timeout")
 	ErrStreamIdleTimeout     = errors.New("proxy: upstream stream idle timeout")
+	// ErrStopped reports a request ended by its Principal.Stop.
+	ErrStopped = errors.New("proxy: request stopped")
 )
 
 func newRequestID() string {
@@ -36,6 +38,18 @@ func newRequestID() string {
 func (s *Server) logf(format string, args ...any) { s.cfg.ErrorLog.Printf(format, args...) }
 
 func deny(status int, reason string) *Denial { return &Denial{Status: status, Reason: reason} }
+
+// StopDenial returns the refusal for a request whose Stop has ended, else nil.
+func StopDenial(stop context.Context) *Denial {
+	if stop == nil || stop.Err() == nil {
+		return nil
+	}
+	var d *Denial
+	if !errors.As(context.Cause(stop), &d) {
+		d = deny(http.StatusLocked, ReasonLocked)
+	}
+	return d
+}
 
 // serveHTTP is the request flow of spec §10.1–§10.4.
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -133,8 +147,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, p, deny(http.StatusBadRequest, ReasonBadRequest))
 		return
 	}
-	// 9. Admission (may block for approval).
-	ticket, err := s.gate.Admit(r.Context(), Admission{
+	// 9. Admission (may block for approval, which Stop also ends).
+	admitCtx, endAdmit := context.WithCancel(r.Context())
+	defer endAdmit()
+	if principal.Stop != nil {
+		defer context.AfterFunc(principal.Stop, endAdmit)()
+	}
+	ticket, err := s.gate.Admit(admitCtx, Admission{
 		Principal: principal, Provider: p, Endpoint: ep, Info: info, Client: client, RequestID: reqID,
 	})
 	if err != nil {
@@ -159,7 +178,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var finishOnce sync.Once
 	defer finishOnce.Do(func() { ticket.Finish(out) })
 
-	s.forward(w, r, reqID, p, ep, principal, path, fwdQuery, outBody, info.Stream, &out)
+	s.forward(w, r, reqID, p, ep, principal, path, fwdQuery, outBody, info.Stream, ticket, &out)
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
@@ -195,6 +214,17 @@ func (w *watchdog) fire() {
 	w.cancel()
 }
 
+// abort ends the request now, whatever the deadline.
+func (w *watchdog) abort() {
+	w.mu.Lock()
+	w.t.Stop()
+	if w.fired == nil {
+		w.fired = ErrStopped
+	}
+	w.mu.Unlock()
+	w.cancel()
+}
+
 // rearm resets the deadline with a (possibly new) cause; false if already fired.
 func (w *watchdog) rearm(d time.Duration, cause error) bool {
 	w.mu.Lock()
@@ -223,13 +253,18 @@ func (w *watchdog) err() error {
 // forward sends the request upstream with the real key and relays the
 // response, filling out. out is read by the deferred Finish.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p *provider.Provider,
-	ep provider.Endpoint, principal Principal, path, fwdQuery string, body []byte, stream bool, out *Outcome) {
+	ep provider.Endpoint, principal Principal, path, fwdQuery string, body []byte, stream bool, ticket Ticket, out *Outcome) {
 
 	base := s.cfg.Upstream(p)
 	if base == nil || base.Host == "" || (base.Scheme != "https" && base.Scheme != "http") {
 		s.logf("keyleash proxy %s: no upstream for provider %s", reqID, p.Name)
 		out.Status = http.StatusInternalServerError
 		writeError(w, p, deny(http.StatusInternalServerError, ReasonInternal))
+		return
+	}
+	if d := StopDenial(principal.Stop); d != nil {
+		out.Status = d.status()
+		writeError(w, p, d)
 		return
 	}
 	target := &url.URL{
@@ -285,6 +320,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 	start := s.cfg.Now()
 	wd := newWatchdog(s.cfg.ResponseHeaderTimeout, ErrResponseHeaderTimeout, cancel)
 	defer wd.stop()
+	if principal.Stop != nil {
+		defer context.AfterFunc(principal.Stop, wd.abort)()
+	}
 	resp, err := s.client.Do(outReq)
 	outReq = nil // drop the only reference to the header holding the key
 	out.Sent = sent.Load()
@@ -296,7 +334,13 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 			out.Status = 499
 			return
 		}
-		if fe := wd.err(); fe != nil {
+		if fe := wd.err(); errors.Is(fe, ErrStopped) {
+			out.UpstreamErr = fe
+			d := StopDenial(principal.Stop)
+			out.Status = d.status()
+			writeError(w, p, d)
+			return
+		} else if fe != nil {
 			out.UpstreamErr = fe
 		} else {
 			out.UpstreamErr = errors.New("proxy: upstream request failed")
@@ -326,12 +370,16 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 		_ = rc.Flush()
 	}
 
+	at, _ := ticket.(activeTicket)
 	buf := make([]byte, 32<<10)
 	complete := false
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			wd.rearm(s.cfg.StreamIdleTimeout, ErrStreamIdleTimeout)
+			if at != nil {
+				at.Active()
+			}
 			parser.Write(buf[:n])
 			wn, werr := w.Write(buf[:n])
 			out.BytesOut += int64(wn)
@@ -344,7 +392,14 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, reqID string, p
 			}
 		}
 		if rerr == io.EOF {
-			complete = true
+			// Cancelling can look like a clean end (TLS close_notify, or an
+			// upstream that finishes when its client goes): we ended this
+			// body, so it is not complete, and the client must not think so.
+			if fe := wd.err(); fe != nil {
+				out.UpstreamErr = fe
+			} else {
+				complete = true
+			}
 			break
 		}
 		if rerr != nil {

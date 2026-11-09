@@ -109,12 +109,12 @@ func readBody(r *http.Request, v any) error {
 func (d *Daemon) requireServing() (State, error) {
 	st := d.State()
 	switch st {
-	case StateLocked:
-		return st, statusErr(423, client.CodeLocked, "keyleash is locked")
+	case StateUnlocked, StateAway:
+		return st, nil
 	case StateTripped:
 		return st, statusErr(409, client.CodeConflict, "keyleash is tripped; run `keyleash resume`")
 	}
-	return st, nil
+	return st, statusErr(423, client.CodeLocked, "keyleash is locked")
 }
 
 // ---- status / unlock / lock / panic ----------------------------------------
@@ -163,7 +163,7 @@ func (d *Daemon) status() client.Status {
 	}
 	s.Vault.ID, s.Vault.Seq, s.Vault.Unlocked = d.vault.ID(), d.vault.Seq(), d.vault.IsUnlocked()
 	s.DataDir = d.dataDir
-	s.Vault.RecoveredFromPrev = d.vault.RecoveredFromPrev()
+	s.Vault.RecoveredFromPrev = d.recoveredFromPrev
 	s.Vault.Slots = []client.Slot{}
 	for _, sl := range d.vault.Slots() {
 		s.Vault.Slots = append(s.Vault.Slots, client.Slot{ID: sl.ID, Type: sl.Type, Label: sl.Label,
@@ -172,6 +172,15 @@ func (d *Daemon) status() client.Status {
 	s.PendingApprovals = len(d.queue.Pending())
 	s.ApprovalMethod = d.queue.Method()
 	s.AuditHealthy = !d.isAuditBroken()
+	if s.Integrity == "failed" && d.vaultStateSnapshot() == nil {
+		s.Warnings = append(s.Warnings, "the daemon state in the vault cannot be read; `keyleash resume` replaces it, accepts the current config and forgets `keyleash keys use` choices")
+	}
+	d.mu.RLock()
+	ledgerFail := d.st.ledgerFail
+	d.mu.RUnlock()
+	if w := ledgerFail.summary(); w != "" {
+		s.Warnings = append(s.Warnings, "the ledger check failed ("+w+"); `keyleash resume` accepts the ledger as it stands, a copy stays in ledger/rejected-<time>/")
+	}
 	if s.Vault.RecoveredFromPrev {
 		s.Warnings = append(s.Warnings, "the vault was recovered from vault.prev after the main file was missing or corrupt")
 	}
@@ -310,10 +319,14 @@ func (d *Daemon) hAway(w http.ResponseWriter, r *http.Request) {
 	}
 	now := d.clk.Now()
 	g := &grantInfo{id: newID("g_"), amount: req.Budget, until: now.Add(req.For), pass: req.Pass}
+	if _, err := d.requireServing(); err != nil {
+		d.writeErr(w, err)
+		return
+	}
 	d.mu.Lock()
 	if d.st.state != StateUnlocked && d.st.state != StateAway {
 		d.mu.Unlock()
-		d.writeErr(w, statusErr(409, client.CodeConflict, "keyleash locked or tripped during approval"))
+		d.writeErr(w, statusErr(423, client.CodeLocked, "keyleash is locked"))
 		return
 	}
 	d.st.grant = g
@@ -564,7 +577,10 @@ func (d *Daemon) passFromRequest(req client.PassCreateRequest) (pass.Pass, error
 // have a key ("*" only when every provider has one), with a TTL within
 // limits.pass.run_ttl, every spend limit within limits.pass.max_run_budget
 // (and a month limit, added at that amount if missing), and concurrency
-// within limits.pass.concurrency. Otherwise it says why a step-up is needed.
+// within limits.pass.concurrency. With run.kill_on_daemon_exit off there is no
+// such exemption: a run tree that outlived a daemon is unconfined in the next
+// one, and must not get a new pass and budget by asking. Otherwise it says why
+// a step-up is needed.
 func (d *Daemon) passNeedsStepUp(p *pass.Pass, req client.PassCreateRequest, callerPID int) string {
 	pd := d.cfg.Limits.Pass
 	switch {
@@ -572,6 +588,8 @@ func (d *Daemon) passNeedsStepUp(p *pass.Pass, req client.PassCreateRequest, cal
 		return "it is a named pass"
 	case p.Bind == nil || p.Bind.PID != callerPID:
 		return "it is bound to a process other than the caller"
+	case !d.cfg.Run.KillOnDaemonExit:
+		return "run.kill_on_daemon_exit is off"
 	case pd.MaxRunBudget == nil:
 		return "limits.pass.max_run_budget is not set"
 	case p.Expires.Sub(d.clk.Now()) > pd.RunTTL.Duration:
@@ -666,15 +684,19 @@ func (d *Daemon) hPassRevoke(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := d.passes.Revoke(req.ID); err != nil {
-		if errors.Is(err, pass.ErrNotFound) {
-			d.writeErr(w, statusErr(404, client.CodeNotFound, "no such pass"))
-			return
-		}
-		d.log.Error("pass revoke persistence failed (revoked in memory)", "err", err)
+	rerr := d.passes.Revoke(req.ID)
+	if errors.Is(rerr, pass.ErrNotFound) {
+		d.writeErr(w, statusErr(404, client.CodeNotFound, "no such pass"))
+		return
 	}
+	d.endPassRequests(req.ID)
 	d.applyLimits()
-	d.auditEvent("pass_revoke", map[string]any{"pass": req.ID, "reason": "admin"})
+	d.auditEvent("pass_revoke", map[string]any{"pass": req.ID, "reason": "admin", "saved": rerr == nil})
+	if rerr != nil {
+		d.log.Error("pass revoke persistence failed (revoked in memory)", "err", rerr)
+		d.writeErr(w, statusErr(503, client.CodeInternal, "the pass is revoked for now, but saving that failed, so it would come back after a restart; fix the disk problem and revoke it again"))
+		return
+	}
 	writeJSON(w, 200, struct{}{})
 }
 
@@ -693,6 +715,7 @@ func (d *Daemon) sweepRunPasses() {
 		if err := d.passes.Revoke(p.ID); err != nil && !errors.Is(err, pass.ErrNotFound) {
 			d.log.Warn("revoking pass of exited process", "pass", p.ID, "err", err)
 		}
+		d.endPassRequests(p.ID)
 		d.auditEvent("pass_revoke", map[string]any{"pass": p.ID, "reason": "process_exited"})
 	}
 	if d.jobs != nil {
@@ -1204,7 +1227,11 @@ func (d *Daemon) hAuditVerify(w http.ResponseWriter, _ *http.Request) {
 	}
 	d.mu.RUnlock()
 	defer secmem.Wipe(key)
-	rep, err := audit.Verify(filepath.Join(d.dataDir, AuditDir), key)
+	var head *audit.Head
+	if vs := d.vaultStateSnapshot(); key != nil && vs != nil {
+		head = vs.AuditHead
+	}
+	rep, err := audit.Verify(filepath.Join(d.dataDir, AuditDir), key, audit.VerifyOptions{Head: head})
 	out := client.AuditVerify{OK: err == nil, Records: rep.Records, Files: rep.Files, Anchors: rep.Anchors,
 		AnchorsVerified: rep.AnchorsVerified, KeyUsed: key != nil}
 	if rep.FirstBad != nil {
@@ -1280,8 +1307,10 @@ func (d *Daemon) hRemoveSlot(w http.ResponseWriter, r *http.Request) {
 	}
 	err := d.rekey(r.Context(), "remove_slot", func() error { return d.vault.RemoveSlot(id) })
 	switch {
-	case err == nil, errors.Is(err, vault.ErrPrevNotScrubbed):
-		writeJSON(w, 200, struct{}{})
+	case err == nil:
+		writeJSON(w, 200, client.RemoveSlotResponse{})
+	case errors.Is(err, vault.ErrPrevNotScrubbed):
+		writeJSON(w, 200, client.RemoveSlotResponse{Warning: "vault.prev still holds the old vault key; delete it"})
 	case errors.Is(err, vault.ErrLastSlot):
 		d.writeErr(w, statusErr(409, client.CodeConflict, "cannot remove the last non-convenience slot"))
 	case errors.Is(err, vault.ErrNotFound):

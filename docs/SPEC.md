@@ -177,6 +177,9 @@ Rules:
 - A vault must always keep at least one slot; removing the last
   non-convenience slot requires creating another first.
 - Adding/removing slots requires the vault to be unlocked **and** a fresh step-up.
+  Provider key and slot changes need only that, so the owner can still remove a
+  leaked key while Tripped or Away; creating passes and grants needs the daemon
+  to be serving (Unlocked or Away).
 - KDF parameters are stored per slot so they can be raised later (`rekey`).
 
 ### 5.3 Entries
@@ -261,6 +264,11 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
 - Kinds: `named` (created by the owner, e.g. for an editor), `run` (ephemeral,
   created by `keyleash run`, process-bound, revoked on exit), `admin` (none —
   the admin channel uses OS-level access control, not passes).
+- **A pass is checked when the request is admitted, not only when it arrives.**
+  A pass revoked or expired, or whose bound process is gone, after its request
+  was authenticated (a slow body, an approval wait) spends nothing. Revoking
+  also cancels the pass's running requests, like a lock; a pass that merely
+  expires lets a request already sent finish.
 - **Run pass jobs (Windows).** When a `run` pass is issued, the daemon places
   the bound process in a new unnamed job object that it alone holds, without
   breakaway rights; every process started from it later is a member and
@@ -269,7 +277,14 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   process's tree). If the process cannot be placed in a job the pass is not
   issued. Jobs are kept while any member lives, even after the pass ends
   (members stay confined, §12), and with `[run] kill_on_daemon_exit = true`
-  (default) members are terminated when the daemon exits. Run passes left by
+  (default) members are terminated when the daemon exits. With it off, members
+  survive the daemon and are no longer confined once it restarts (their job
+  died with it, and nothing identifies them); to keep such a tree from getting
+  a new pass by asking, every run pass then needs a step-up. That closes only
+  this path: a surviving tree can still use what the admin guard leaves open to
+  unconfined callers, such as `POST /v1/shutdown`, and turning the setting back
+  on removes the step-up while survivors of the earlier setting may still run.
+  Run passes left by
   an earlier daemon are revoked at start (their jobs died with it). Other
   systems have no equivalent: once binding is implemented there it will use
   the parent chain only.
@@ -302,7 +317,8 @@ klp_<id:10 base32>_<secret:43 base64url of 32 random bytes>
   and a pass whose mapped key was removed is refused (`no_key`) rather than
   redirected. A provider without a key at issue time resolves to its active
   key at request time.
-- **Creation needs a step-up** (§9), with one exception: a `run` pass bound to
+- **Creation needs a step-up** (§9), with one exception (none with
+  `kill_on_daemon_exit = false`, see above): a `run` pass bound to
   the calling process itself (the admin channel's verified client PID, §12)
   that stays within the defaults — providers that all have a key (`*` only
   when every provider has one), lifetime ≤ `limits.pass.run_ttl`, every spend
@@ -428,6 +444,9 @@ worst case until they settle.
   under a vault-derived key. After unlock the daemon verifies the chain and
   MACs against its last stored checkpoint; any break, MAC failure or missing
   month trips the daemon, so deleting the ledger cannot silently reset spend.
+  A damaged line does not stop the daemon starting: it trips at unlock. Records
+  stay in the newest month file when the clock or timezone steps back over a
+  month end, so the chain stays in order.
 - The checkpoint (current month, record count, last hash, settled total and a
   monotonic counter) lives in an authenticated **vault entry** (provider
   `keyleash`, label `daemon-state`; hidden from `keyleash keys`), sealed under
@@ -438,11 +457,31 @@ worst case until they settle.
   entry holds the accepted config (§14) and each provider's active key (§6).
   The entry also holds the approval method of the accepted config (§9, §14),
   the pass store baseline (§6) and whether the vault ever held an `api_key`
-  (§9). `state.json` holds only non-security bookkeeping (models seen without
+  (§9). If the entry cannot be read (malformed, or from a newer version) the
+  daemon trips (`integrity`) and leaves it untouched; `keyleash resume` then
+  replaces it, accepts the current config, keeps the first-key exemption closed
+  if the vault holds a key, and forgets the active key mappings.
+  `state.json` holds only non-security bookkeeping (models seen without
   a price); deleting it changes nothing.
-- Reservations live in memory only. On shutdown, requests still in flight
-  after the grace period are charged at their reserved amount before the
-  ledger and checkpoint are written, so their spend survives the restart.
+- Reservations are also journaled in `ledger/inflight.jsonl` before a request
+  can leave, and marked done when released or once their charge is durable. On
+  shutdown, requests still in flight after the grace period are charged at
+  their reserved amount before the ledger and checkpoint are written. A daemon
+  that dies leaves them in the journal: they are charged at their reserved
+  amount at the next unlock (audit `inflight_recovered`, with the count, total
+  and lines rejected), once, and so are records settled in the last second that
+  had not reached the disk; a hold whose record is already in the ledger is not
+  charged again. Holds carry a MAC under the ledger key: a line that fails it
+  charges nothing and trips (integrity) until the owner resumes. The journal is
+  written without an fsync, so it survives a killed process but not a power
+  cut. Removing it, or adding a done line, loses only the charges of what was
+  in flight; removing a done line can charge a released reservation at the
+  amount the daemon reserved. It is rewritten to the open holds when it passes
+  1 MiB, whatever is in flight.
+- A reservation is settled at its reserved amount after 30 minutes without a
+  sign of life from its request (a client that stopped reading); a stream that
+  keeps delivering keeps its reservation and concurrency slot however long it
+  runs, and is charged its metered cost.
 
 ## 8. Presence and state machine
 
@@ -460,17 +499,30 @@ Trip reasons: `velocity`, `integrity` (ledger or checkpoint verification),
 `audit_integrity` (audit chain or anchor verification after unlock),
 `config_changed` (config.toml differs from the last accepted config, §14),
 `audit` (the audit log cannot be written, or a security record was rejected,
-§11). `keyleash resume` (step-up) accepts what the trip reported: the current
-ledger becomes the checkpoint; a rejected audit log is moved to
+§11). A `velocity` or `audit` trip is kept in the daemon-state entry, so lock
+and unlock or a restart do not end it; a trip derived from the files at unlock
+ends once the files verify. A resumed tripwire stays resumed across a restart.
+`keyleash resume` (step-up) applies to the session it was asked in: an
+approval that arrives after a lock is refused. It accepts what the trip reported: the current
+ledger is copied to `ledger/rejected-<time>/` and authenticated again as it
+stands, so a damaged line is dropped (its amount cannot be known) and a later
+change is caught like any other; a rejected audit log is moved to
 `audit/rejected-<time>/` and a new chain starts; a changed config becomes the
 accepted one.
 
 - **Locked**: DEK wiped. All proxied requests get `423 Locked` with a clear
-  JSON error. Admin API works (status, unlock).
+  JSON error. Entering Locked also ends every request authenticated before it:
+  one waiting for an approval or upstream's answer gets the 423 at once, one
+  waiting for its body when the body arrives or the read times out (2 minutes),
+  and a running stream is cancelled upstream and its client connection aborted, so
+  a truncated body cannot pass as complete. It is charged its reserved amount;
+  the provider may still bill for work it had started. Admin API works (status,
+  unlock).
 - **Unlocked**: normal limits. Has a lease (`max_lease`, default 12 h).
 - **Away**: entered after `idle_after` (default 10 min) without keyboard/mouse
   input, or on screen lock (configurable: `screen_lock = "away" | "lock"`,
-  default `away`). Existing passes keep working under **away limits** (default
+  default `away`; with `lock`, an unlock under a locked screen fails and stays
+  Locked). Existing passes keep working under **away limits** (default
   $3 total, concurrency 2, no new passes — `run` passes only with
   `allow_new_run_passes` — no unknown models, no unbounded requests). After
   `away_max` (default 2 h) → Locked.
@@ -649,10 +701,16 @@ table, so the audit log answers "which program spent this".
   `approval`, `approval_secret`, `pass_issue`, `pass_revoke`, `request`
   (provider, model, pass, client process, status, tokens, cost, estimated
   flag, latency, deny reason), `limit_change`, `limit_override`, `key_add`,
-  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey`
+  `key_remove`, `key_use`, `config_change`, `resume`, `slot_change`, `rekey_start` (fsync'd before a re-key commits, so a crash leaves evidence it may have happened), `rekey`
   (op, ok, requester PID; `ok: false, reason: caller_gone` when the
   requester disconnected before the commit), `prev_scrub`, `panic`, `shutdown` (a stop request: requester PID and image),
   `daemon_stop`, `anchor`.
+- The daemon-state entry records the log's newest durable record (sequence
+  number and hash) on every save: on lock, on shutdown and at least every 5
+  minutes. The log must still contain that record, so deleting the log or
+  cutting it back trips every unlock until the owner resumes: a log that failed
+  this check never becomes the recorded one. Records after the last save can
+  still be cut unnoticed if the daemon dies before saving again.
 - After every unlock the daemon verifies the chain **and** the anchors with
   the anchor key; a failure trips the daemon (`audit_integrity`) until the
   owner resumes (§8).

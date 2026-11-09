@@ -672,6 +672,8 @@ func TestRotationLostOutcomes(t *testing.T) {
 		{"another caller's rotation", []client.AuditRecord{approval(11, other, true), rekey(12, other, true)}, true, "unknown"},
 		{"another caller's abort", []client.AuditRecord{rekey(12, other, false), approval(13, other, false)}, true, "unknown"},
 		{"own rotation before this call", []client.AuditRecord{rekey(9, self, true), rekey(10, self, true)}, true, "unknown"},
+		{"started, no outcome", []client.AuditRecord{approval(11, self, true),
+			{Seq: 12, Type: "rekey_start", Fields: map[string]any{"op": "rotate_recovery", "requester_pid": self}}}, true, "maybe"},
 		{"nothing recorded", nil, true, "unknown"},
 		{"audit unreadable", nil, false, "unknown"},
 	}
@@ -698,6 +700,8 @@ func TestRotationLostOutcomes(t *testing.T) {
 			switch {
 			case strings.Contains(msg, "WAS rotated"):
 				kind = "rotated"
+			case strings.Contains(msg, "MAY have happened"):
+				kind = "maybe"
 			case strings.Contains(msg, "Could not tell"):
 				kind = "unknown"
 			case got == error(lost):

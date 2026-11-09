@@ -54,7 +54,7 @@ const (
 // immediateSync lists record types that are fsync'd as soon as they are
 // written; everything else is fsync'd on Flush/Close.
 var immediateSync = map[string]bool{
-	"panic": true, "unlock": true, "lock": true, "slot_change": true, "trip": true,
+	"panic": true, "unlock": true, "lock": true, "slot_change": true, "trip": true, "rekey_start": true,
 	TypeAnchor: true, TypeRecover: true,
 }
 
@@ -477,6 +477,13 @@ func (l *Log) Flush() error {
 		return nil
 	}
 	return l.f.Sync()
+}
+
+// Head returns the newest record's sequence number and hash.
+func (l *Log) Head() Head {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return Head{Seq: l.seq, Hash: l.last}
 }
 
 // Close flushes and closes the log and forgets the anchor key.

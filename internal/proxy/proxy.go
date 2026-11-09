@@ -56,6 +56,10 @@ type Principal struct {
 	PassID, PassName string
 	// EntryID is the vault entry holding this provider's key.
 	EntryID string
+	// Stop, if set, ends when this request must not go on (the daemon locked,
+	// the pass was revoked). A request not yet sent is refused; one in flight
+	// is cancelled upstream. Its cause may be a *Denial to answer with.
+	Stop context.Context
 }
 
 // Authenticator verifies the pass a client presented for a provider. It
@@ -112,6 +116,12 @@ type Outcome struct {
 // Ticket is an admitted request. Finish is called exactly once.
 type Ticket interface {
 	Finish(o Outcome)
+}
+
+// activeTicket is optionally implemented by tickets that want to know the
+// response is still arriving: Active is called for each chunk from upstream.
+type activeTicket interface {
+	Active()
 }
 
 // Gate admits or refuses a request (budget, policy, approval). Admit may

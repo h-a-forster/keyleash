@@ -2,6 +2,7 @@ package budget
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -481,7 +482,9 @@ func TestCompleteLineMissingNewline(t *testing.T) {
 	}
 }
 
-func TestCorruptionRejected(t *testing.T) {
+// A damaged line does not stop the ledger opening (the daemon must start to
+// report it); verification reports it, so the daemon trips before any spend.
+func TestCorruptionReported(t *testing.T) {
 	ok := `{"ts":"2026-06-15T11:00:00Z","id":"a","scopes":["global"],"amount_micros":1,"reserved_micros":1}`
 	cases := map[string]string{
 		"garbage mid-file":   ok + "\nnot json\n" + ok + "\n",
@@ -499,9 +502,12 @@ func TestCorruptionRejected(t *testing.T) {
 			}
 			clk := &fakeClock{t: time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)}
 			l, err := Open(Options{Dir: dir, Clock: clk, Location: time.UTC})
-			if err == nil {
-				l.Close()
-				t.Fatal("corruption accepted")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			if in, err := l.VerifyIntegrity(nil); err != nil || in.OK() || in.Corrupt == 0 {
+				t.Fatalf("corruption not reported: %v %+v", err, in)
 			}
 		})
 	}
@@ -715,11 +721,9 @@ func stress(t *testing.T, maxConc int64) {
 func TestPersistFailureFailsClosed(t *testing.T) {
 	l, _, dir := newTest(t)
 	settle(t, reserve(t, l, nil, 1, Meta{}), 1)
-	// Make the ledger directory unwritable by replacing it with a file.
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dir, []byte("x"), 0o600); err != nil {
+	// Make the month's file unwritable by putting a directory in its place.
+	month := filepath.Join(dir, "ledger-2026-06.jsonl")
+	if err := os.Mkdir(month, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Flush(); err == nil {
@@ -728,10 +732,9 @@ func TestPersistFailureFailsClosed(t *testing.T) {
 	if _, err := l.Reserve(nil, 1, Meta{}); !errors.Is(err, ErrPersist) {
 		t.Fatalf("want ErrPersist, got %v", err)
 	}
-	// Recovery: once the directory is back, the next flush writes the
+	// Recovery: once the file can be written, the next flush writes the
 	// held-back record and reservations resume.
-	_ = os.Remove(dir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.Remove(month); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Flush(); err != nil {
@@ -808,4 +811,308 @@ func TestReserveWithSkipAdmitsOnlyThatReservation(t *testing.T) {
 		t.Fatalf("concurrency with skip: %v", err)
 	}
 	r1.Release()
+}
+
+func copyDir(t *testing.T, from string) string {
+	t.Helper()
+	to := t.TempDir()
+	ents, err := os.ReadDir(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		b, err := os.ReadFile(filepath.Join(from, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(to, e.Name()), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return to
+}
+
+// A process that dies with requests in flight, or with a settled record not yet
+// written, loses no spend: the next process holds the reservation until it is
+// charged, once. A released one or a durable record is not charged again.
+func TestInFlightSurvivesCrash(t *testing.T) {
+	clk := &fakeClock{t: time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)}
+	dir := t.TempDir()
+	l, err := Open(Options{Dir: dir, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	key := []byte("journal test key")
+	l.SetMACKey(key)
+	reserve(t, l, nil, 100, Meta{RequestID: "inflight"})
+	settle(t, reserve(t, l, nil, 20, Meta{RequestID: "unwritten"}), 3)
+	reserve(t, l, nil, 7000, Meta{RequestID: "released"}).Release()
+	flushed := reserve(t, l, nil, 400, Meta{RequestID: "durable"})
+	// The "unwritten" record reaches the disk only if flushed; copy before and after.
+	crashed := copyDir(t, dir)
+	settle(t, flushed, 40)
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	flushedDir := copyDir(t, dir)
+
+	reopen := func(d string) *Ledger {
+		t.Helper()
+		l2, err := Open(Options{Dir: d, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l2.Close() })
+		l2.SetMACKey(key)
+		return l2
+	}
+	l2 := reopen(crashed)
+	if rec, err := l2.RecoverInFlight(); rec != (Recovered{Charged: 3, Amount: 100 + 20 + 400}) || err != nil {
+		t.Fatalf("recover: %+v %v, want inflight, unwritten and durable", rec, err)
+	}
+	checkSpent(t, l2, "global", WindowDay, 100+20+400, 0)
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Charged once: the next process finds nothing to charge.
+	l3 := reopen(crashed)
+	if rec, err := l3.RecoverInFlight(); rec != (Recovered{}) || err != nil {
+		t.Fatalf("recover after the charge: %+v %v", rec, err)
+	}
+	checkSpent(t, l3, "global", WindowDay, 100+20+400, 0)
+
+	l4 := reopen(flushedDir)
+	if rec, err := l4.RecoverInFlight(); rec != (Recovered{Charged: 1, Amount: 100}) || err != nil {
+		t.Fatalf("recover after a flush: %+v %v, want inflight", rec, err)
+	}
+	checkSpent(t, l4, "global", WindowDay, 3+40+100, 0)
+}
+
+// A record on disk whose done line never was (a flush that failed part way, or a
+// process killed between the two) is charged once.
+func TestRecoverDoesNotChargeWrittenRecordAgain(t *testing.T) {
+	key := []byte("journal test key")
+	l, clk, dir := newTest(t)
+	l.SetMACKey(key)
+	settle(t, reserve(t, l, nil, 100, Meta{RequestID: "june"}), 30)
+	clk.Add(30 * 24 * time.Hour)
+	settle(t, reserve(t, l, nil, 200, Meta{RequestID: "july"}), 40)
+	// June's record can be written, July's cannot: the batch fails part way.
+	july := filepath.Join(dir, "ledger-2026-07.jsonl")
+	if err := os.Mkdir(july, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Flush(); err == nil {
+		t.Fatal("flush should fail")
+	}
+	if err := os.Remove(july); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	partial := copyDir(t, dir)
+
+	l2, err := Open(Options{Dir: partial, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	l2.SetMACKey(key)
+	if rec, err := l2.RecoverInFlight(); rec != (Recovered{}) || err != nil {
+		t.Fatalf("recover: %+v %v, want nothing to charge", rec, err)
+	}
+	checkSpent(t, l2, "global", WindowMonth, 40, 0)
+	if err := l2.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(readRecords(t, partial)); n != 2 {
+		t.Fatalf("records = %d, want 2", n)
+	}
+}
+
+// Copies of a genuine hold line charge it once, now and at the next start.
+func TestRecoverChargesCopiedHoldOnce(t *testing.T) {
+	key := []byte("journal test key")
+	l, clk, dir := newTest(t)
+	l.SetMACKey(key)
+	reserve(t, l, nil, 100, Meta{RequestID: "copied"})
+	crashed := copyDir(t, dir)
+	p := filepath.Join(crashed, journalName)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, bytes.Repeat(b, 4), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopen := func() *Ledger {
+		t.Helper()
+		l2, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l2.Close() })
+		l2.SetMACKey(key)
+		return l2
+	}
+	l2 := reopen()
+	if rec, err := l2.RecoverInFlight(); rec != (Recovered{Charged: 1, Amount: 100}) || err != nil {
+		t.Fatalf("recover: %+v %v", rec, err)
+	}
+	checkSpent(t, l2, "global", WindowDay, 100, 0)
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l3 := reopen()
+	if rec, err := l3.RecoverInFlight(); rec != (Recovered{}) || err != nil {
+		t.Fatalf("recover after the charge: %+v %v", rec, err)
+	}
+	checkSpent(t, l3, "global", WindowDay, 100, 0)
+}
+
+// Accepting the rejected lines ends only those: a recovery that could not read
+// the ledger leaves genuine holds for the next one.
+func TestDropRejectedKeepsGenuineHolds(t *testing.T) {
+	key := []byte("journal test key")
+	l, clk, dir := newTest(t)
+	l.SetMACKey(key)
+	reserve(t, l, nil, 7000, Meta{RequestID: "genuine"})
+	crashed := copyDir(t, dir)
+	f, err := os.OpenFile(filepath.Join(crashed, journalName), os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(f, "{\"id\":\"forged\",\"amount_micros\":5}\n")
+	f.Close()
+	l2, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	l2.SetMACKey(key)
+	// A failed recovery leaves every hold as Open found it.
+	if err := l2.DropRejectedInFlight(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l3, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l3.Close()
+	l3.SetMACKey(key)
+	if rec, err := l3.RecoverInFlight(); rec != (Recovered{Charged: 1, Amount: 7000}) || err != nil {
+		t.Fatalf("recover: %+v %v, want the genuine hold and no forged line", rec, err)
+	}
+}
+
+// A final line the process died writing cannot swallow the next one: whole, it
+// stands; torn, it goes.
+func TestJournalTornTailDoesNotSwallowNextLine(t *testing.T) {
+	key := []byte("journal test key")
+	for _, tc := range []struct {
+		name string
+		cut  int // bytes off the end of the hold line, its newline being the first
+		want Recovered
+	}{
+		{"whole", 1, Recovered{Charged: 2, Amount: 100 + 200}},
+		{"torn", 5, Recovered{Charged: 1, Amount: 200}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, clk, dir := newTest(t)
+			l.SetMACKey(key)
+			reserve(t, l, nil, 100, Meta{RequestID: "dying"})
+			crashed := copyDir(t, dir)
+			p := filepath.Join(crashed, journalName)
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, b[:len(b)-tc.cut], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			l2, err := Open(Options{Dir: crashed, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			l2.SetMACKey(key)
+			reserve(t, l2, nil, 200, Meta{RequestID: "next"})
+			kept := copyDir(t, crashed)
+			l2.Close()
+			l3, err := Open(Options{Dir: kept, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l3.Close()
+			l3.SetMACKey(key)
+			if rec, err := l3.RecoverInFlight(); rec != tc.want || err != nil {
+				t.Fatalf("recover: %+v %v, want %+v", rec, err, tc.want)
+			}
+		})
+	}
+}
+
+// The journal stays near its cap even if something is always in flight, and what
+// is in flight survives the rewrite.
+func TestJournalCompactsWithRequestsInFlight(t *testing.T) {
+	key := []byte("journal test key")
+	l, clk, dir := newTest(t)
+	l.SetMACKey(key)
+	reserve(t, l, nil, 100, Meta{RequestID: "long-running"})
+	journalSize := func() int64 {
+		t.Helper()
+		st, err := os.Stat(filepath.Join(dir, journalName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Size()
+	}
+	for journalSize() <= journalMax {
+		reserve(t, l, nil, 1, Meta{}).Release()
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if n := journalSize(); n >= journalMax {
+		t.Fatalf("journal is %d bytes after a flush", n)
+	}
+	// Still writable after the swap, and the hold from before it still counts.
+	reserve(t, l, nil, 200, Meta{RequestID: "after"})
+	kept := copyDir(t, dir)
+	l2, err := Open(Options{Dir: kept, Clock: clk, Location: time.UTC, FlushInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	l2.SetMACKey(key)
+	if rec, err := l2.RecoverInFlight(); rec != (Recovered{Charged: 2, Amount: 100 + 200}) || err != nil {
+		t.Fatalf("recover: %+v %v", rec, err)
+	}
+}
+
+// ExpireInFlight measures from the request's last sign of life, so a stream
+// that keeps delivering keeps its reservation; a lock's -1 takes everything,
+// even when the clock has stepped back.
+func TestExpireMeasuresFromLastActivity(t *testing.T) {
+	l, clk, _ := newTest(t)
+	r := reserve(t, l, nil, 10, Meta{})
+	clk.Add(20 * time.Minute)
+	r.Touch()
+	clk.Add(20 * time.Minute)
+	if n, err := l.ExpireInFlight(30 * time.Minute); n != 0 || err != nil {
+		t.Fatalf("a live request expired: %d %v", n, err)
+	}
+	clk.Add(11 * time.Minute)
+	if n, err := l.ExpireInFlight(30 * time.Minute); n != 1 || err != nil {
+		t.Fatalf("a silent request did not expire: %d %v", n, err)
+	}
+	reserve(t, l, nil, 10, Meta{})
+	clk.Add(-time.Hour)
+	if n, err := l.ExpireInFlight(-1); n != 1 || err != nil {
+		t.Fatalf("lock after a clock step left a reservation: %d %v", n, err)
+	}
 }

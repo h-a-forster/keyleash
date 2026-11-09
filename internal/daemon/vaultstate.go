@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/h-a-forster/keyleash/internal/audit"
 	"github.com/h-a-forster/keyleash/internal/budget"
 	"github.com/h-a-forster/keyleash/internal/pass"
 	"github.com/h-a-forster/keyleash/internal/secmem"
@@ -51,6 +52,14 @@ type vaultState struct {
 	// KeysEverAdded is set once the vault has held an api_key: only before
 	// that may a key be added without a step-up (spec §9).
 	KeysEverAdded bool `json:"keys_ever_added,omitempty"`
+	// AuditHead is the audit log's newest durable record at the last save: the
+	// log must still contain it (spec §11).
+	AuditHead *audit.Head `json:"audit_head,omitempty"`
+	// Trip is a trip awaiting a resume that the next unlock would not derive
+	// from the files (spec §8). TripReset is when the last resume reset the
+	// tripwire: earlier spend does not count towards it after a restart.
+	Trip      *heldTrip `json:"trip,omitempty"`
+	TripReset time.Time `json:"trip_reset,omitzero"`
 }
 
 func (s *vaultState) clone() *vaultState {
@@ -156,6 +165,31 @@ func (d *Daemon) updateVaultState(fn func(*vaultState)) error {
 	}
 	d.vs = next
 	return nil
+}
+
+// replaceVaultState starts a new daemon-state entry in place of an unreadable
+// one, after the owner approved that. The current config becomes the accepted
+// one (otherwise the next unlock would take any config as a first acceptance),
+// the first-key exemption stays closed if the vault holds a key, and the active
+// key mappings are gone: providers use their oldest key until `keys use`.
+func (d *Daemon) replaceVaultState() error {
+	text, err := d.acceptedConfigText()
+	if err != nil {
+		return err
+	}
+	method, hasKey := d.cfg.Approval.Method, d.vaultHasAPIKey()
+	d.vsMu.Lock()
+	d.vs = &vaultState{Version: 1, ActiveKeys: map[string]string{}}
+	d.vsMu.Unlock()
+	err = d.updateVaultState(func(s *vaultState) {
+		s.ConfigHash, s.ConfigTOML, s.ApprovalMethod, s.KeysEverAdded = hashText(text), text, method, hasKey
+	})
+	if err != nil {
+		d.vsMu.Lock()
+		d.vs = nil
+		d.vsMu.Unlock()
+	}
+	return err
 }
 
 // vaultStateSnapshot returns a copy of the cached state (nil before the

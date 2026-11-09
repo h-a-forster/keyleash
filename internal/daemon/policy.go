@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/h-a-forster/keyleash/internal/approval"
 	"github.com/h-a-forster/keyleash/internal/budget"
@@ -38,13 +39,14 @@ func (a authenticator) Authenticate(_ context.Context, prov, token string, ci pr
 	d := a.d
 	d.syncTrips()
 	d.mu.RLock()
-	state, awaySince := d.st.state, d.st.awaySince
+	state, awaySince, requests := d.st.state, d.st.awaySince, d.st.requests
 	d.mu.RUnlock()
 	switch state {
-	case StateLocked:
-		return proxy.Principal{}, denial(http.StatusLocked, proxy.ReasonLocked, "")
+	case StateUnlocked, StateAway:
 	case StateTripped:
 		return proxy.Principal{}, denial(http.StatusLocked, proxy.ReasonTripped, "")
+	default:
+		return proxy.Principal{}, denial(http.StatusLocked, proxy.ReasonLocked, "")
 	}
 
 	p, err := d.passes.Verify(token)
@@ -86,7 +88,68 @@ func (a authenticator) Authenticate(_ context.Context, prov, token string, ci pr
 	if !ok {
 		return deny(denial(http.StatusForbidden, ReasonNoKey, "keyleash has no key for "+prov+" — run `keyleash add "+prov+"`"))
 	}
-	return proxy.Principal{PassID: p.ID, PassName: p.Name, EntryID: entry}, nil
+	return proxy.Principal{PassID: p.ID, PassName: p.Name, EntryID: entry, Stop: requests.forPass(p.ID)}, nil
+}
+
+// requestScope ends the proxied requests of one unlocked period, or of one
+// pass within it. Authenticate takes the scope together with the state, and
+// lock ends it together with setting Locked, so a request either saw Locked or
+// is ended by that lock: nothing authenticated before a lock survives it, even
+// if the owner has unlocked again by the time it is admitted.
+type requestScope struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	mu     sync.Mutex
+	passes map[string]passScope
+}
+
+type passScope struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+}
+
+func newRequestScope() *requestScope {
+	s := &requestScope{passes: map[string]passScope{}}
+	s.ctx, s.cancel = context.WithCancelCause(context.Background())
+	return s
+}
+
+// forPass returns the context that ends pass id's requests.
+func (s *requestScope) forPass(id string) context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.passes[id]
+	if !ok {
+		p.ctx, p.cancel = context.WithCancelCause(s.ctx)
+		s.passes[id] = p
+	}
+	return p.ctx
+}
+
+// endPass ends pass id's requests. Admit refuses the dead pass for any request
+// that takes its context after this.
+func (s *requestScope) endPass(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.passes[id]; ok {
+		p.cancel(denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, ""))
+		delete(s.passes, id)
+	}
+}
+
+// end ends every request of the scope.
+func (s *requestScope) end() {
+	s.cancel(denial(http.StatusLocked, proxy.ReasonLocked, ""))
+}
+
+// endPassRequests ends the running requests of a pass that was just revoked.
+func (d *Daemon) endPassRequests(id string) {
+	d.mu.RLock()
+	requests := d.st.requests
+	d.mu.RUnlock()
+	if requests != nil {
+		requests.endPass(id)
+	}
 }
 
 // syncTrips moves to Tripped when the ledger tripped or the audit log broke
@@ -151,13 +214,18 @@ type gate struct{ d *Daemon }
 // Admit implements proxy.Gate (docs/DAEMON.md Gate.Admit).
 func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error) {
 	d := g.d
-	p, ok := d.passes.Get(a.Principal.PassID)
-	if !ok {
-		return nil, denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, "")
-	}
 	deny := func(dn *proxy.Denial) (proxy.Ticket, error) {
 		d.auditRequest(a, nil, proxy.Outcome{Status: dn.Status}, 0, false, dn.Reason)
 		return nil, dn
+	}
+	if dn := proxy.StopDenial(a.Principal.Stop); dn != nil {
+		return deny(dn) // ended while the body arrived: on the record like any refusal
+	}
+	// The pass was checked at Authenticate, before the body arrived (minutes
+	// ago, for a slow client), and again after any approval wait below.
+	p, dn := d.livePass(a)
+	if dn != nil {
+		return deny(dn)
 	}
 	model := a.Info.Model
 
@@ -230,9 +298,15 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 			d.auditEvent("approval", map[string]any{"kind": "unknown_model", "approved": err == nil && dec.Approved,
 				"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "unbounded": unbounded})
 			if dn := approvalDenial(ctx, dec, err); dn != nil {
+				if sd := proxy.StopDenial(a.Principal.Stop); sd != nil {
+					return deny(sd)
+				}
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
+				return deny(dn)
+			}
+			if _, dn := d.livePass(a); dn != nil {
 				return deny(dn)
 			}
 		}
@@ -285,10 +359,16 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 					"method": dec.Method, "pass": p.ID, "model": model, "amount_micros": int64(amount), "scope": ex.Scope,
 					"window": string(ex.Window), "id": dec.ID})
 				if adn := approvalDenial(ctx, dec, aerr); adn != nil {
+					if sd := proxy.StopDenial(a.Principal.Stop); sd != nil {
+						return deny(sd)
+					}
 					if ctx.Err() != nil {
 						return nil, ctx.Err()
 					}
 					return deny(adn)
+				}
+				if _, dn := d.livePass(a); dn != nil {
+					return deny(dn)
 				}
 				skip = append(skip, budget.LimitKey{Scope: ex.Scope, Window: ex.Window})
 				if g := dec.Grant; g != nil && g.Amount > 0 && g.For > 0 {
@@ -307,6 +387,21 @@ func (g gate) Admit(ctx context.Context, a proxy.Admission) (proxy.Ticket, error
 			return deny(denial(http.StatusServiceUnavailable, proxy.ReasonInternal, "keyleash cannot record spend right now"))
 		}
 	}
+}
+
+// livePass returns a request's pass if it may still spend: present, neither
+// revoked nor expired, and (when bound) still used by the bound process tree.
+func (d *Daemon) livePass(a proxy.Admission) (pass.Pass, *proxy.Denial) {
+	p, ok := d.passes.Get(a.Principal.PassID)
+	switch {
+	case !ok, p.Revoked:
+		return p, denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, "")
+	case p.Expired(d.clk.Now()):
+		return p, denial(http.StatusUnauthorized, proxy.ReasonPassExpired, "")
+	case p.Bind != nil && !d.inRunTree(p, a.Client.PID):
+		return p, denial(http.StatusUnauthorized, proxy.ReasonPassInvalid, "")
+	}
+	return p, nil
 }
 
 // maxOverLimitApprovals bounds the approvals one request may ask for (one
@@ -387,10 +482,11 @@ func (d *Daemon) reserve(a proxy.Admission, p pass.Pass, amount money.Micros, sk
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	switch d.st.state {
-	case StateLocked:
-		return nil, denial(http.StatusLocked, proxy.ReasonLocked, "")
+	case StateUnlocked, StateAway:
 	case StateTripped:
 		return nil, denial(http.StatusLocked, proxy.ReasonTripped, "")
+	default:
+		return nil, denial(http.StatusLocked, proxy.ReasonLocked, "")
 	}
 	now := d.clk.Now()
 	scopes := []string{
@@ -482,6 +578,13 @@ type ticket struct {
 	unpriced, unbounded bool
 }
 
+// Active implements the proxy's activeTicket: the request is delivering.
+func (t *ticket) Active() {
+	if t.res != nil {
+		t.res.Touch()
+	}
+}
+
 // Finish implements proxy.Ticket: release when the request never left,
 // otherwise settle at the metered cost; an unpriced model at the provider's
 // most expensive rates for the reported tokens (marked estimated); the
@@ -492,7 +595,10 @@ func (t *ticket) Finish(o proxy.Outcome) {
 	estimated := false
 	if t.res != nil {
 		if !o.Sent {
-			t.res.Release()
+			if !t.res.Release() {
+				// Never left, but already charged (a lock settled it first).
+				cost, estimated = t.res.Amount(), true
+			}
 		} else {
 			u := o.Usage
 			if u.Model == "" {
@@ -574,6 +680,8 @@ func (d *Daemon) auditRequest(a proxy.Admission, res *budget.Reservation, o prox
 
 func upstreamErrClass(err error) string {
 	switch {
+	case errors.Is(err, proxy.ErrStopped):
+		return "stopped"
 	case errors.Is(err, proxy.ErrResponseHeaderTimeout):
 		return "response_header_timeout"
 	case errors.Is(err, proxy.ErrStreamIdleTimeout):

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -175,6 +176,7 @@ type upstream struct {
 	hits   atomic.Int32
 	held   chan struct{} // signalled when a held request arrives
 	relea  chan struct{} // closed to release held requests
+	step   chan struct{} // sent to once per X-Test-Steps chunk to continue
 	mu     sync.Mutex
 	bodies []string
 }
@@ -195,7 +197,7 @@ const openaiSSE = `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","cr
 	"data: [DONE]\n\n"
 
 func newUpstream(t *testing.T) *upstream {
-	u := &upstream{held: make(chan struct{}, 16), relea: make(chan struct{})}
+	u := &upstream{held: make(chan struct{}, 16), relea: make(chan struct{}), step: make(chan struct{})}
 	u.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u.hits.Add(1)
 		body, _ := io.ReadAll(r.Body)
@@ -215,7 +217,25 @@ func newUpstream(t *testing.T) *upstream {
 			}
 			if bytes.Contains(body, []byte(`"stream":true`)) {
 				w.Header().Set("Content-Type", "text/event-stream")
-				io.WriteString(w, anthropicSSE)
+				// X-Test-Steps: n sends n events, each followed by a pause
+				// until the test sends on step, then the rest of the stream.
+				rest := anthropicSSE
+				n, _ := strconv.Atoi(r.Header.Get("X-Test-Steps"))
+				for range n {
+					ev, after, _ := strings.Cut(rest, "\n\n")
+					io.WriteString(w, ev+"\n\n")
+					w.(http.Flusher).Flush()
+					rest = after
+					u.held <- struct{}{}
+					select {
+					case <-u.step:
+					case <-r.Context().Done():
+						return
+					case <-u.relea:
+						return
+					}
+				}
+				io.WriteString(w, rest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -268,6 +288,9 @@ type env struct {
 	noApprover bool
 	consoleIn  io.Reader
 	consoleOut io.Writer
+	// treeGone makes every process-binding check fail, as when the bound
+	// process's tree has exited.
+	treeGone atomic.Bool
 	// jobs stands in for the Windows job objects (the in-process daemon
 	// binds run passes to the test process itself).
 	jobs    *fakeJobs
@@ -374,7 +397,7 @@ func (e *env) start() {
 			return proxy.ClientInfo{PID: int(e.peerPID.Load()), Image: testClientImage}
 		},
 		IsDescendant: func(pid int, ancestor procinfo.Process) (bool, error) {
-			if pid == outsiderPID {
+			if pid == outsiderPID || e.treeGone.Load() {
 				return false, nil
 			}
 			return procinfo.IsDescendant(pid, ancestor)
@@ -382,6 +405,9 @@ func (e *env) start() {
 		LookupProcess: func(pid int) (procinfo.Process, error) {
 			if pid == outsiderPID {
 				return procinfo.Process{PID: pid, ParentPID: 1, Image: testOutsiderImage, StartTime: 1}, nil
+			}
+			if e.treeGone.Load() {
+				return procinfo.Process{}, procinfo.ErrNotFound
 			}
 			return procinfo.Lookup(pid)
 		},

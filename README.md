@@ -44,7 +44,8 @@ keyleash run --budget 5 -- claude
 `keyleash run` starts the agent with its own pass and a $5 budget, points it
 at keyleash, and revokes the pass when the agent exits. The agent never sees
 the real key. `keyleash status` shows what is being spent; `keyleash lock` or
-`keyleash panic` stops everything at once.
+`keyleash panic` stops everything at once, including requests already running
+(the provider may still bill for work it had started).
 
 Editors and other long-lived tools use `keyleash env` instead. See
 [docs/USAGE.md](docs/USAGE.md) for agents, SDKs, editors, defaults, limits,

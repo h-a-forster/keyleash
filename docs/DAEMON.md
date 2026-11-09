@@ -12,7 +12,7 @@ specified in [SPEC.md](SPEC.md).
   config.toml               optional; missing = recommended profile
   vault.json, vault.prev    vault + crash-recovery copy (+ anti-rollback sidecar)
   passes.json               pass store (hashes only)
-  ledger/                   budget ledger (ledger-YYYY-MM.jsonl)
+  ledger/                   budget ledger (ledger-YYYY-MM.jsonl), in-flight journal (inflight.jsonl)
   audit/                    audit log (audit-YYYY-MM.jsonl)
   state.json                non-security bookkeeping (models seen without a
                             price), MAC'd with a vault-derived key; deleting
@@ -59,16 +59,16 @@ transitions are audited.
 
 | Event | From | To | Side effects |
 |---|---|---|---|
-| unlock (slot verified) | Locked | Unlocked | a `vault.prev` left under an older DEK by an interrupted re-key is replaced (audit `prev_scrub` {ok}, spec §5.4); new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit |
+| unlock (slot verified) | Locked | Unlocked | a `vault.prev` left under an older DEK by an interrupted re-key is replaced (audit `prev_scrub` {ok}, spec §5.4); new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key and the head recorded in the daemon-state entry (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit, then a trip still held from before (daemon-state `trip`) |
 | presence Idle ≥ idle_after | Unlocked | Away | `ResetSession("away")`; away timer starts |
-| presence ScreenLocked | Unlocked | Away or Locked | per `presence.screen_lock` |
+| presence ScreenLocked | Unlocked | Away or Locked | per `presence.screen_lock`; an unlock while the screen is locked gets the same treatment (with `lock`: 409, Locked) |
 | presence Active | Away | Unlocked | |
 | presence Resumed (sleep/clock gap) | any unlocked | Locked | |
 | away ≥ away_max | Away | Locked | |
 | lease expiry | Unlocked/Away | Locked | |
 | tripwire fired / integrity failure / security audit record rejected | Unlocked/Away | Tripped | in-flight requests finish; new ones get 423 `tripped` |
-| step-up approved "resume" | Tripped | Unlocked | approved with the accepted method for owner trips (integrity, audit_integrity, pass_store, config_changed; never console); `ledger.ResetTrip()`; `audit_integrity`: move `audit/*.jsonl` to `audit/rejected-<UTC time>/` and start a new chain; `pass_store`: revoke added and changed passes, `Commit()`; `config_changed`: record the config and its approval method as accepted; audit `resume` |
-| lock / panic | any | Locked | settle in-flight at their reserved amount; checkpoint to the vault; `passes.SetMACKey(nil)`, `vault.Lock()`, `audit.ClearAnchorKey()`, wipe derived keys; drop pass grants and pending config; panic also revokes all passes |
+| step-up approved "resume" | Tripped | Unlocked | refused (409) if the daemon locked since the prompt opened; runs under `unlockMu`, so no lock can interleave; approved with the accepted method for owner trips (integrity, audit_integrity, pass_store, config_changed; never console); `ledger.ResetTrip()`; `integrity`: `ledger.AcceptCurrent` copies the files to `ledger/rejected-<UTC time>/` and re-authenticates them; `audit_integrity`: move `audit/*.jsonl` to `audit/rejected-<UTC time>/` and start a new chain; `pass_store`: revoke added and changed passes, `Commit()`; `config_changed`: record the config and its approval method as accepted; audit `resume` |
+| lock / panic | any | Locked | end every running request (`Principal.Stop`: not yet sent → 423 `locked`; mid-stream → cancelled upstream, client connection aborted); settle in-flight at their reserved amount; checkpoint to the vault; `passes.SetMACKey(nil)`, `vault.Lock()`, `audit.ClearAnchorKey()`, wipe derived keys; drop pass grants and pending config; panic also revokes all passes |
 
 An **unattended grant** (`keyleash away --budget $X --for D`, step-up
 required) records `{id, amount, until, pass?}`. While it is active, Away uses
@@ -86,7 +86,10 @@ limits, and `away_max` is extended to `until`.
    `401 pass_invalid` (never fall back to unbound).
 5. Away state: passes created after Away began are refused (`403
    away_limit`), except `run` passes with `limits.away.allow_new_run_passes`.
-6. Principal.EntryID = the vault entry for this provider: the pass's
+6. Principal.Stop = the context that ends this request: on lock, or when this
+   pass is revoked. Taken with the state, so a request either sees Locked or is
+   ended by that lock, even if the owner has unlocked again since.
+7. Principal.EntryID = the vault entry for this provider: the pass's
    `entries` mapping if it has one for the provider (mapped entry gone → `403
    no_key`, never redirected); else the provider's active key from the
    daemon-state entry; else its **oldest** `api_key`; none → `403 no_key`.
@@ -94,6 +97,8 @@ limits, and `away_max` is extended to `until`.
 
 ### Gate.Admit
 
+0. The pass again: revoked, expired or bound process gone since Authenticate
+   → `401 pass_invalid` / `pass_expired` (repeated after each approval wait).
 1. Model policy: a request that can reach models outside its `model` field
    (OpenRouter `models` or a preset, spec §7.5) → `403 model_denied`; config
    deny/allow globs, then pass `AllowsModel` → `403 model_denied`.
@@ -134,7 +139,8 @@ limits, and `away_max` is extended to `until`.
    - `ErrTripped` → state Tripped, 423 `tripped`.
    - `ErrPersist`/`ErrClosed` → 503 `internal`.
 6. Ticket.Finish(outcome):
-   - `!Sent` → `Release()`.
+   - `!Sent` → `Release()`; if a lock had already charged it, the audit record
+     shows that charge (`estimated = true`).
    - else, when `UsageOK`: priced model → `meter.Cost`; unpriced model →
      `meter.WorstCaseCost` (maximum rates, `estimated = true`); otherwise the
      reserved amount, `estimated = true`.
@@ -238,7 +244,7 @@ There is no rollback-arming endpoint (the former `POST
 | GET | /v1/audit/tail | ?n= |
 | GET | /v1/config | effective config (TOML) |
 | POST | /v1/vault/recovery | (step-up) new recovery code, re-keys the vault → {code (once), warning?}; audit `rekey` {op: rotate_recovery, ok, requester_pid} / `slot_change` {op}, never the code. Not committed if the caller has disconnected by the time the step-up is decided (audit `rekey` {ok: false, reason: caller_gone}); the CLI checks the audit log (its own requester_pid only) when it gets no answer |
-| DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key |
+| DELETE | /v1/vault/slots/{id} | (step-up) remove a slot and re-key → {warning?} (vault.prev not scrubbed) |
 
 Secrets travel only in request bodies over the ACL-protected channel and are
 wiped after use. Responses never contain provider keys; a pass token is
@@ -252,8 +258,8 @@ Stop accepting proxy connections; wait up to `ShutdownGrace` (30 s) for
 in-flight requests; set the state to Locked (no new reservation can start);
 if it was unlocked, settle every reservation still in flight at
 its reserved amount (`ExpireInFlight(-1)`, while the ledger MAC key is set),
-flush the ledger, write the checkpoint to the vault and state.json, audit
-`lock` and anchor; then `ledger.Close`, `audit.Close`,
+flush the ledger, audit `lock` and anchor, write the checkpoint to the vault
+and state.json; then `ledger.Close`, `audit.Close`,
 `passes.SetMACKey(nil)`, `vault.Lock`; close the run jobs (members end with
 kill-on-close); remove the socket; release the instance lock. The admin
 server is shut down before all this, so `keyleash stop` waits for the

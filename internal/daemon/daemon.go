@@ -68,9 +68,10 @@ var ShutdownGrace = 30 * time.Second
 
 // Tunables of the daemon's background work.
 const (
-	// InFlightMaxAge is how old a reservation may get before it is settled
-	// at its reserved amount (fail closed). It exceeds the proxy's response
-	// header timeout plus its stream idle timeout.
+	// InFlightMaxAge is how long a reservation may go without a sign of life
+	// from its request before it is settled at its reserved amount (fail
+	// closed). It exceeds the proxy's response header and stream idle timeouts,
+	// so it only catches a request stuck on a client that stopped reading.
 	InFlightMaxAge = 30 * time.Minute
 	// StateSaveEvery is how often the ledger checkpoint (vault) and state.json are saved while
 	// unlocked (it is also saved on lock and shutdown).
@@ -182,6 +183,10 @@ type Daemon struct {
 	consoleMu  sync.Mutex
 	console    approval.Approver
 
+	// recoveredFromPrev: the vault was loaded from vault.prev at start. It holds
+	// for this process, while the vault's own flag ends at its first write.
+	recoveredFromPrev bool
+
 	// overrideSHA is the hex SHA-256 of the pricing override file's bytes
 	// as loaded ("" without an override); overridePath its resolved path.
 	overridePath, overrideSHA string
@@ -202,6 +207,11 @@ type Daemon struct {
 	// testBeforeRekey, set only by tests, runs in rekey under unlockMu
 	// just before the caller-gone check.
 	testBeforeRekey func(ctx context.Context)
+	// testResumeApproved, set only by tests, runs in resume once the approval
+	// is in and checked.
+	testResumeApproved func()
+	// testResumeDone, set only by tests, runs as resume is about to return.
+	testResumeDone func()
 
 	// auditMu guards the audit health flag.
 	auditMu     sync.Mutex
@@ -356,6 +366,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 		return nil, fmt.Errorf("keyleash: open vault: %w", err)
 	}
 	cleanup = append(cleanup, d.vault.Lock)
+	d.recoveredFromPrev = d.vault.RecoveredFromPrev()
 	if d.passes, err = pass.OpenStore(filepath.Join(d.dataDir, PassesFile), d.clk); err != nil {
 		return nil, fmt.Errorf("keyleash: open pass store: %w", err)
 	}
@@ -486,7 +497,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	// 7. Audit daemon_start; state Locked. Everything below only starts
 	// goroutines.
 	d.auditEvent("daemon_start", map[string]any{
-		"vault_id": d.vault.ID(), "recovered_from_prev": d.vault.RecoveredFromPrev(),
+		"vault_id": d.vault.ID(), "recovered_from_prev": d.recoveredFromPrev,
 		"proxy": d.proxyLn.Addr().String(), "profile": d.cfg.Profile,
 	})
 	// Run passes from an earlier daemon have no job here, so their processes
@@ -494,7 +505,7 @@ func Start(ctx context.Context, opts Options) (_ *Daemon, err error) {
 	if d.jobs != nil {
 		d.revokeOrphanedRunPasses()
 	}
-	if d.vault.RecoveredFromPrev() {
+	if d.recoveredFromPrev {
 		d.log.Warn("vault was recovered from vault.prev (main file missing or corrupt)")
 	}
 
@@ -625,9 +636,9 @@ func (d *Daemon) Close() error {
 		if err := d.ledger.Flush(); err != nil {
 			errs = append(errs, err)
 		}
-		d.saveState()
 		d.auditEvent("lock", map[string]any{"reason": "shutdown", "session": d.sessionID()})
 		d.anchor()
+		d.saveState()
 	}
 	d.auditEvent("daemon_stop", nil)
 	if err := d.ledger.Close(); err != nil {
