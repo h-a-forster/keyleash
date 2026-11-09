@@ -61,7 +61,7 @@ transitions are audited.
 |---|---|---|---|
 | unlock (slot verified) | Locked | Unlocked | a `vault.prev` left under an older DEK by an interrupted re-key is replaced (audit `prev_scrub` {ok}, spec §5.4); new session id; lease = now + max_lease; `audit.SetAnchorKey(vault.DeriveKey(audit-anchor))`; ledger `SetMACKey` + `VerifyIntegrity` against the checkpoint in the daemon-state entry (failure, or ledger records without a checkpoint → Tripped `integrity`); `audit.Verify` with the anchor key and the head recorded in the daemon-state entry (failure → Tripped `audit_integrity`); `passes.VerifyAgainst(vault baseline)` with the passes MAC key (mismatch or unreadable daemon state → audit `pass_store` with the added/removed/changed ids, Tripped `pass_store`, MAC key left unset; match → `passes.Commit()` re-baselines and folds in revocations made while locked); config hash vs the accepted one (changed → audit `config_change` with the changed keys, Tripped `config_changed`, approvals switch to the accepted method; first unlock records it); `ResetSession("session:<id>")`. Trip priority: integrity, audit_integrity, pass_store, config_changed, velocity, audit, then a trip still held from before (daemon-state `trip`) |
 | presence Idle ≥ idle_after | Unlocked | Away | `ResetSession("away")`; away timer starts |
-| presence ScreenLocked | Unlocked | Away or Locked | per `presence.screen_lock` |
+| presence ScreenLocked | Unlocked | Away or Locked | per `presence.screen_lock`; an unlock while the screen is locked gets the same treatment (with `lock`: 409, Locked) |
 | presence Active | Away | Unlocked | |
 | presence Resumed (sleep/clock gap) | any unlocked | Locked | |
 | away ≥ away_max | Away | Locked | |

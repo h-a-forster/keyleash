@@ -488,7 +488,8 @@ accepted one.
 - **Unlocked**: normal limits. Has a lease (`max_lease`, default 12 h).
 - **Away**: entered after `idle_after` (default 10 min) without keyboard/mouse
   input, or on screen lock (configurable: `screen_lock = "away" | "lock"`,
-  default `away`). Existing passes keep working under **away limits** (default
+  default `away`; with `lock`, an unlock under a locked screen fails and stays
+  Locked). Existing passes keep working under **away limits** (default
   $3 total, concurrency 2, no new passes — `run` passes only with
   `allow_new_run_passes` — no unknown models, no unbounded requests). After
   `away_max` (default 2 h) → Locked.

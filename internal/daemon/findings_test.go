@@ -1013,3 +1013,20 @@ func TestAuditLogCutBackTrips(t *testing.T) {
 		})
 	}
 }
+
+// D15: with screen_lock = "lock", unlocking under a locked screen ends Locked,
+// not Away, and says so.
+func TestUnlockUnderLockedScreenStaysLocked(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Presence.ScreenLock = "lock" })
+	e.pres.set(0, true)
+	e.d.stepPresence()
+	if _, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); !isAPI(err, 409, client.CodeConflict) {
+		t.Fatalf("unlock: %v", err)
+	}
+	if s := e.status(); s.State != client.StateLocked || s.Vault.Unlocked {
+		t.Fatalf("state %s, vault unlocked %v", s.State, s.Vault.Unlocked)
+	}
+	e.pres.set(0, false)
+	e.d.stepPresence()
+	e.unlock()
+}

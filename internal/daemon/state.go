@@ -483,14 +483,11 @@ func (d *Daemon) afterUnlock(method string) error {
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripAudit, "audit log cannot be written"
 	case d.st.heldTrip != nil:
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, d.st.heldTrip.Reason, d.st.heldTrip.Detail
-	case d.st.screenLocked && d.cfg.Presence.ScreenLock == "lock":
-		// Should not happen (the unlock came from this session) but fail
-		// towards the tighter state.
-		d.enterAwayLocked(now, "screen_lock")
 	case d.st.idle || d.st.screenLocked:
 		d.enterAwayLocked(now, "idle")
 	}
 	state := d.st.state
+	relock := d.st.screenLocked && d.cfg.Presence.ScreenLock == "lock"
 	d.mu.Unlock()
 
 	// While a changed config is unaccepted, approvals use the accepted
@@ -549,6 +546,13 @@ func (d *Daemon) afterUnlock(method string) error {
 	}
 	d.anchor()
 	d.saveState()
+	if relock {
+		// A scripted unlock under a locked screen: what ScreenLocked does to
+		// an unlocked daemon applies here too. Not a refusal up front, because
+		// the screen may also lock while the slot is being opened.
+		d.lockHeld("screen_lock")
+		return statusErr(409, client.CodeConflict, "the screen is locked and presence.screen_lock is \"lock\", so keyleash locked again; unlock the screen first")
+	}
 	return nil
 }
 
