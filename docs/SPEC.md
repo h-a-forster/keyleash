@@ -465,7 +465,8 @@ Trip reasons: `velocity`, `integrity` (ledger or checkpoint verification),
 `audit_integrity` (audit chain or anchor verification after unlock),
 `config_changed` (config.toml differs from the last accepted config, §14),
 `audit` (the audit log cannot be written, or a security record was rejected,
-§11). `keyleash resume` (step-up) accepts what the trip reported: the current
+§11). `keyleash resume` (step-up) applies to the session it was asked in: an
+approval that arrives after a lock is refused. It accepts what the trip reported: the current
 ledger becomes the checkpoint; a rejected audit log is moved to
 `audit/rejected-<time>/` and a new chain starts; a changed config becomes the
 accepted one.

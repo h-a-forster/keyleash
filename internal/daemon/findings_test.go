@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/h-a-forster/keyleash/internal/approval"
+	"github.com/h-a-forster/keyleash/internal/audit"
 	"github.com/h-a-forster/keyleash/internal/client"
 	"github.com/h-a-forster/keyleash/internal/config"
 	"github.com/h-a-forster/keyleash/internal/money"
@@ -750,5 +751,98 @@ func TestStopEndsRunningRequests(t *testing.T) {
 				t.Fatal("the stream kept running")
 			}
 		})
+	}
+}
+
+// resumeGate holds resume prompts until the test opens gate; other prompts
+// are approved.
+type resumeGate struct {
+	gate chan struct{}
+	seen chan approval.Request
+}
+
+func (a *resumeGate) Method() string { return "test" }
+
+func (a *resumeGate) Approve(ctx context.Context, req approval.Request) (bool, error) {
+	if req.Kind != "resume" {
+		return true, nil
+	}
+	a.seen <- req
+	select {
+	case <-a.gate:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// D3: a resume prompt opened for a velocity trip and answered after lock and
+// unlock does not clear the audit_integrity trip it never showed.
+func TestStaleResumeApprovalChangesNothing(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	ra := &resumeGate{gate: make(chan struct{}), seen: make(chan approval.Request, 1)}
+	e.approver = ra
+	e.restart()
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.tripBySpend(tok)
+	errc := make(chan error, 1)
+	go func() { _, err := e.c.Resume(e.ctx()); errc <- err }()
+	<-ra.seen
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "audit-*.jsonl"))
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files[0], []byte(strings.Replace(string(raw), "daemon_start", "daemon_stXrt", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+	if err != nil || st.TripReason != TripAuditIntegrity {
+		t.Fatalf("second unlock: %v %s %s", err, st.State, st.TripReason)
+	}
+	close(ra.gate)
+	if err := <-errc; err == nil {
+		t.Fatal("the stale resume succeeded")
+	}
+	s := e.status()
+	arch, _ := filepath.Glob(filepath.Join(e.dir, AuditDir, "rejected-*"))
+	if s.State != client.StateTripped || s.TripReason != TripAuditIntegrity || len(arch) != 0 {
+		t.Fatalf("state %s (%s), %d archived logs", s.State, s.TripReason, len(arch))
+	}
+}
+
+// D16: a lock cannot run between a resume's approval and the end of its work,
+// which installs derived keys read before the lock wiped them.
+func TestLockWaitsForResumeToFinish(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.d.trip(TripAudit, "test")
+	e.appr.approve.Store(true)
+	locked := make(chan struct{})
+	e.d.testResumeApproved = func() {
+		go func() { e.d.lock("test"); close(locked) }()
+		select {
+		case <-locked:
+			t.Error("lock ran in the middle of a resume")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if _, err := e.c.Resume(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("lock did not run after the resume")
+	}
+	var aerr error
+	e.d.withAudit(func(l *audit.Log) { aerr = l.Anchor() })
+	if s := e.status(); s.State != client.StateLocked || !errors.Is(aerr, audit.ErrNoAnchorKey) {
+		t.Fatalf("state %s, anchor: %v", s.State, aerr)
 	}
 }

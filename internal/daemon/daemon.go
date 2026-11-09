@@ -202,6 +202,9 @@ type Daemon struct {
 	// testBeforeRekey, set only by tests, runs in rekey under unlockMu
 	// just before the caller-gone check.
 	testBeforeRekey func(ctx context.Context)
+	// testResumeApproved, set only by tests, runs in resume once the approval
+	// is in and checked.
+	testResumeApproved func()
 
 	// auditMu guards the audit health flag.
 	auditMu     sync.Mutex

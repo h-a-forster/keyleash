@@ -634,7 +634,7 @@ func (d *Daemon) trip(reason, detail string) {
 // becomes the accepted config).
 func (d *Daemon) resume(ctx context.Context) error {
 	d.mu.RLock()
-	state, reason := d.st.state, d.st.tripReason
+	state, reason, session := d.st.state, d.st.tripReason, d.st.session
 	changes := append([]string(nil), d.st.configChanges...)
 	passDiff, accMethod := d.st.passDiff, d.st.acceptedMethod
 	owner := ownerTrip(reason) || passDiff != nil || d.st.configPending != nil || !d.st.integrityOK || d.st.auditBad
@@ -655,6 +655,21 @@ func (d *Daemon) resume(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	// The approval covers the trip it showed, in the session it was shown in:
+	// after a lock and unlock the trip may be a newer one, with another
+	// approver. From here on unlockMu keeps a lock out, so the derived keys
+	// used below cannot be wiped and then reinstalled.
+	d.unlockMu.Lock()
+	defer d.unlockMu.Unlock()
+	d.mu.RLock()
+	same := d.st.state == StateTripped && d.st.session == session
+	d.mu.RUnlock()
+	if !same {
+		return statusErr(409, client.CodeConflict, "keyleash locked during the approval; check `keyleash status` and run `keyleash resume` again if it is tripped")
+	}
+	if d.testResumeApproved != nil {
+		d.testResumeApproved()
 	}
 	if d.isAuditBroken() {
 		if err := d.reopenAudit(); err != nil {
@@ -693,10 +708,6 @@ func (d *Daemon) resume(ctx context.Context) error {
 	d.ledger.ResetTrip()
 	now := d.clk.Now()
 	d.mu.Lock()
-	if d.st.state != StateTripped {
-		d.mu.Unlock()
-		return nil
-	}
 	accepted := !d.st.integrityOK
 	d.st.integrityOK = true
 	if accepted {
