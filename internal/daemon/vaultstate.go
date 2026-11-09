@@ -51,6 +51,11 @@ type vaultState struct {
 	// KeysEverAdded is set once the vault has held an api_key: only before
 	// that may a key be added without a step-up (spec §9).
 	KeysEverAdded bool `json:"keys_ever_added,omitempty"`
+	// Trip is a trip awaiting a resume that the next unlock would not derive
+	// from the files (spec §8). TripReset is when the last resume reset the
+	// tripwire: earlier spend does not count towards it after a restart.
+	Trip      *heldTrip `json:"trip,omitempty"`
+	TripReset time.Time `json:"trip_reset,omitzero"`
 }
 
 func (s *vaultState) clone() *vaultState {

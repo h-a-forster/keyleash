@@ -512,6 +512,13 @@ func TestFindingJ_AcceptRollbackOnUnlock(t *testing.T) {
 	if !auditHas(t, e, "accept_rollback", func(f map[string]any) bool { return f["recorded_seq"] != nil && f["file_seq"] != nil }) {
 		t.Fatal("accepted rollback not audited")
 	}
+	// The warning belongs to that unlock, not to the rest of the process.
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase); err != nil || st.Vault.RollbackAccepted {
+		t.Fatalf("a later unlock: %v, accepted reported: %v", err, st.Vault.RollbackAccepted)
+	}
 }
 
 // K: away grants are capped by limits.away.max_grant; the first-key
@@ -868,4 +875,64 @@ func TestRunPassStepUpWhenTreesCanOutliveTheDaemon(t *testing.T) {
 			t.Fatalf("kill_on_daemon_exit=%v: %v", tc.kill, err)
 		}
 	}
+}
+
+// D6: a trip with nothing left to re-derive it from does not end with a lock
+// and unlock or a restart: only a resume ends it, and then it stays ended.
+func TestTripSurvivesLockAndRestartUntilResume(t *testing.T) {
+	e := newEnv(t, nil)
+	e.unlock()
+	e.d.trip(TripAudit, "a security audit record (x) was rejected")
+	calls := e.appr.calls.Load()
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	unlockState := func(what string) client.Status {
+		t.Helper()
+		st, err := e.c.Unlock(e.ctx(), client.MethodPassphrase, testPassphrase)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		return st
+	}
+	if st := unlockState("lock"); st.State != client.StateTripped || st.TripReason != TripAudit {
+		t.Fatalf("after lock and unlock: %s (%s)", st.State, st.TripReason)
+	}
+	e.restart()
+	if st := unlockState("restart"); st.State != client.StateTripped || st.TripReason != TripAudit {
+		t.Fatalf("after restart and unlock: %s (%s)", st.State, st.TripReason)
+	}
+	if e.appr.calls.Load() != calls {
+		t.Fatal("an approval was asked for without a resume")
+	}
+	e.appr.approve.Store(true)
+	if st, err := e.c.Resume(e.ctx()); err != nil || st.State != client.StateUnlocked || st.TripReason != "" {
+		t.Fatalf("resume: %v %s (%s)", err, st.State, st.TripReason)
+	}
+	if _, err := e.c.Lock(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if st := unlockState("after resume"); st.State != client.StateUnlocked || st.TripReason != "" {
+		t.Fatalf("after resume, lock and unlock: %s (%s)", st.State, st.TripReason)
+	}
+	e.restart()
+	e.unlock()
+}
+
+// D13: an approved tripwire trip stays approved across a restart inside the
+// tripwire window.
+func TestResumedTripwireStaysResumedAfterRestart(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.Tripwire.Threshold = &config.Amount{Micros: 1} })
+	e.unlock()
+	e.addKeys()
+	tok := e.newPass(client.PassCreateRequest{})
+	e.tripBySpend(tok)
+	e.appr.approve.Store(true)
+	if _, err := e.c.Resume(e.ctx()); err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(time.Second)
+	e.restart()
+	e.unlock()
+	wantReason(t, e.anthropic(tok), 200, "")
 }

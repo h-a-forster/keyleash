@@ -65,6 +65,11 @@ type stateData struct {
 	state      State
 	tripReason string
 	tripDetail string
+	// heldTrip is a trip that nothing at the next unlock would derive again
+	// (d.trip's): it survives lock and restart (daemon-state entry) until a
+	// resume. tripReset is when a resume last reset the tripwire.
+	heldTrip  *heldTrip
+	tripReset time.Time
 
 	session    string
 	leaseUntil time.Time
@@ -115,6 +120,12 @@ type stateData struct {
 	concScopes map[string]bool
 	// modelsSeen records provider/model pairs that had no price.
 	modelsSeen map[string]bool
+}
+
+// heldTrip is the reason and detail of a trip awaiting a resume.
+type heldTrip struct {
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // grantInfo is an unattended grant (docs/DAEMON.md).
@@ -242,6 +253,9 @@ func (d *Daemon) unlock(ctx context.Context, method string, secret []byte, accep
 		d.log.Warn("unlock failed", "method", method, "err", err)
 		return statusErr(401, client.CodeWrongSecret, "unlock failed")
 	}
+	d.mu.Lock()
+	d.st.rollbackAccepted = false
+	d.mu.Unlock()
 	if acc := d.vault.AcceptedRollback(); acceptRollback && acc != nil {
 		d.mu.Lock()
 		d.st.rollbackFileSeq, d.st.rollbackRecordedSeq, d.st.rollbackAccepted = acc.FileSeq, acc.RecordedSeq, true
@@ -435,6 +449,13 @@ func (d *Daemon) afterUnlock(method string) error {
 	d.st.configChanges, d.st.configPending = changes, pending
 	d.st.passDiff = passDiff
 	d.st.acceptedMethod = accMethod
+	if d.st.heldTrip == nil && vserr == nil {
+		d.st.heldTrip = vs.Trip
+	}
+	if vserr == nil {
+		d.st.tripReset = vs.TripReset
+		d.ledger.RestoreTripReset(vs.TripReset)
+	}
 	if !d.st.rollbackAccepted {
 		d.st.rollbackFileSeq, d.st.rollbackRecordedSeq = 0, 0
 	}
@@ -460,6 +481,8 @@ func (d *Daemon) afterUnlock(method string) error {
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripVelocity, "tripwire still active"
 	case d.isAuditBroken():
 		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, TripAudit, "audit log cannot be written"
+	case d.st.heldTrip != nil:
+		d.st.state, d.st.tripReason, d.st.tripDetail = StateTripped, d.st.heldTrip.Reason, d.st.heldTrip.Detail
 	case d.st.screenLocked && d.cfg.Presence.ScreenLock == "lock":
 		// Should not happen (the unlock came from this session) but fail
 		// towards the tighter state.
@@ -568,6 +591,7 @@ func (d *Daemon) lockHeld(reason string) {
 	d.st.state = StateLocked
 	d.st.requests.end()
 	d.st.requests = nil
+	d.st.tripReason, d.st.tripDetail = "", ""
 	d.st.session = ""
 	d.st.awaySince = time.Time{}
 	d.st.leaseUntil = time.Time{}
@@ -618,12 +642,14 @@ func (d *Daemon) trip(reason, detail string) {
 	if d.st.state == StateUnlocked || d.st.state == StateAway {
 		d.st.state = StateTripped
 		d.st.tripReason, d.st.tripDetail = reason, detail
+		d.st.heldTrip = &heldTrip{Reason: reason, Detail: detail}
 		changed = true
 	}
 	d.mu.Unlock()
 	if changed {
 		d.log.Warn("tripped", "reason", reason, "detail", detail)
 		d.auditEvent("trip", map[string]any{"reason": reason, "detail": detail})
+		d.saveState() // so a killed daemon does not forget the trip
 	}
 }
 
@@ -720,6 +746,7 @@ func (d *Daemon) resume(ctx context.Context) error {
 		d.st.acceptedMethod = d.cfg.Approval.Method
 	}
 	d.st.state, d.st.tripReason, d.st.tripDetail = StateUnlocked, "", ""
+	d.st.heldTrip, d.st.tripReset = nil, now
 	if d.st.idle || d.st.screenLocked {
 		d.enterAwayLocked(now, "idle")
 	}
@@ -1151,7 +1178,8 @@ func (d *Daemon) saveState() {
 		models = append(models, m)
 	}
 	cp := d.ledger.Checkpoint()
-	if err := d.updateVaultState(func(s *vaultState) { s.Checkpoint = &cp }); err != nil {
+	trip, reset := d.st.heldTrip, d.st.tripReset
+	if err := d.updateVaultState(func(s *vaultState) { s.Checkpoint, s.Trip, s.TripReset = &cp, trip, reset }); err != nil {
 		d.log.Error("saving the ledger checkpoint to the vault failed", "err", err)
 	}
 	body := stateBody{Version: 1, VaultID: d.vault.ID(), Saved: now.UTC(), ModelsSeen: models}

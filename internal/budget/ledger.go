@@ -59,6 +59,7 @@ type Ledger struct {
 	onTrip        func(money.Micros)
 	trip          *agg
 	tripped       bool
+	tripFloor     time.Time // charges up to here do not count towards the tripwire
 
 	closed     bool
 	persistErr error
@@ -208,6 +209,9 @@ func (l *Ledger) SetTripwire(window time.Duration, threshold money.Micros, onTri
 func (l *Ledger) newTripAgg(now time.Time) *agg {
 	a := &agg{matchAll: true, dur: l.tripDur}
 	for _, c := range l.hist[l.histHead:] {
+		if !c.t.After(l.tripFloor) {
+			continue
+		}
 		a.evs = append(a.evs, event{t: c.t, amount: c.amount})
 		a.sum = addSat(a.sum, c.amount)
 	}
@@ -511,6 +515,18 @@ func (l *Ledger) ResetTrip() {
 	l.tripped = false
 	if l.trip != nil {
 		l.trip = &agg{matchAll: true, dur: l.tripDur}
+	}
+}
+
+// RestoreTripReset applies a ResetTrip made at time t by an earlier process:
+// the history replayed at Open counts towards the tripwire only after t. It
+// does not leave a tripped state.
+func (l *Ledger) RestoreTripReset(t time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.tripFloor = t
+	if l.trip != nil {
+		l.trip = l.newTripAgg(l.clock.Now())
 	}
 }
 
