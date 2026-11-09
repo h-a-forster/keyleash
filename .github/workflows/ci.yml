@@ -53,3 +53,7 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+      - name: go test -race
+        if: runner.os == 'Linux'
+        run: go test -race ./...
