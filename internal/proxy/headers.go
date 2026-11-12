@@ -47,10 +47,14 @@ var requestDrop = map[string]bool{
 }
 
 // responseDrop are upstream response headers not relayed to the client.
+// Content-Length is left to net/http, which then ends the body only when the
+// handler returns, after Finish has settled the request; relayed, it let a
+// client see a flushed stream end before its cost was recorded.
 var responseDrop = map[string]bool{
-	"Set-Cookie":  true,
-	"Set-Cookie2": true,
-	"Alt-Svc":     true,
+	"Set-Cookie":     true,
+	"Set-Cookie2":    true,
+	"Alt-Svc":        true,
+	"Content-Length": true,
 }
 
 // connectionTokens returns the canonical header names listed in Connection.

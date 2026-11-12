@@ -662,6 +662,10 @@ client did not ask for usage in an OpenAI stream, the proxy may add
 `stream_options: {include_usage: true}` (on by default; the extra final chunk
 is harmless to standard clients).
 
+The upstream `Content-Length` is not relayed: a response ends for the client
+only after the request is settled, so a status or usage read straight after it
+includes its cost.
+
 ### 10.4 Errors
 
 Proxy-generated errors use the provider's error JSON shape where possible so

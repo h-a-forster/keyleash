@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,9 +68,16 @@ type fakeTicket struct {
 	mu   sync.Mutex
 	out  Outcome
 	done chan struct{}
+	// hold, if set, keeps Finish from returning until it is closed;
+	// finishing is closed when Finish starts.
+	hold, finishing chan struct{}
 }
 
 func (t *fakeTicket) Finish(o Outcome) {
+	if t.hold != nil {
+		close(t.finishing)
+		<-t.hold
+	}
 	t.mu.Lock()
 	t.out = o
 	t.mu.Unlock()
@@ -100,6 +108,8 @@ type fakeGate struct {
 	tickets []*fakeTicket
 	adms    []Admission
 	onAdmit func()
+	// holdFinish, if set, is every new ticket's hold.
+	holdFinish chan struct{}
 }
 
 func (g *fakeGate) Admit(_ context.Context, a Admission) (Ticket, error) {
@@ -112,7 +122,7 @@ func (g *fakeGate) Admit(_ context.Context, a Admission) (Ticket, error) {
 	if g.deny != nil {
 		return nil, g.deny
 	}
-	t := &fakeTicket{done: make(chan struct{})}
+	t := &fakeTicket{done: make(chan struct{}), hold: g.holdFinish, finishing: make(chan struct{})}
 	g.tickets = append(g.tickets, t)
 	return t, nil
 }
@@ -763,6 +773,49 @@ func TestSSEStreamsIncrementally(t *testing.T) {
 	if e.meter.provs[0] != "anthropic" {
 		t.Errorf("parser built for provider %q", e.meter.provs[0])
 	}
+}
+
+// The client must not see the end of a response before Finish has settled
+// it, or a status read straight after a request can miss its cost. An upstream
+// Content-Length relayed to the client let a flushed stream end early.
+func TestResponseEndsAfterFinish(t *testing.T) {
+	body := "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	e := newEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		io.WriteString(w, body)
+	}, nil)
+	hold := make(chan struct{})
+	e.gate.holdFinish = hold
+	req := e.newReq("POST", "/anthropic/v1/messages", `{"model":"m","stream":true}`)
+	req.Header.Set("x-api-key", passTok)
+	resp, err := e.client.Do(req)
+	if err != nil {
+		close(hold)
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	read := make(chan string, 1)
+	go func() { b, _ := io.ReadAll(resp.Body); read <- string(b) }()
+	tk := e.gate.ticket(t)
+	select {
+	case <-tk.finishing:
+	case <-time.After(5 * time.Second):
+		close(hold)
+		t.Fatal("Finish was not called")
+	}
+	// Finish is running and has not returned: the body must not have ended.
+	select {
+	case <-read:
+		close(hold)
+		t.Fatal("client saw the end of the response before Finish returned")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(hold)
+	if got := <-read; got != body {
+		t.Fatalf("body %q", got)
+	}
+	tk.wait(t)
 }
 
 func TestClientAbortFinishesOnce(t *testing.T) {
